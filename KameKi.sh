@@ -55,6 +55,23 @@ ALIVE_TEST="${ALIVE_TEST:-ICMP, TCP-ACK Service & ARP Ping}"
 DEPTH_WARN="${DEPTH_WARN:-3}"      # authenticated findings per host below which we warn
 KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
+# ---- optional LLM annotation layer ----------------------------------
+#  Any OpenAI compatible /v1/chat/completions endpoint: Ollama, vLLM,
+#  LM Studio, llama.cpp server. Local by default and gated otherwise,
+#  because scan data contains a client's internal network topology,
+#  hostnames, patch state and directory structure.
+#
+#    LLM_ENDPOINT=http://localhost:11434/v1 LLM_MODEL=qwen2.5:72b ./kameki.sh run
+#
+#  The layer annotates findings the scanners produced. It never creates
+#  findings, and the deterministic report is always written first.
+LLM_ENDPOINT="${LLM_ENDPOINT:-}"
+LLM_MODEL="${LLM_MODEL:-}"
+LLM_KEY="${LLM_KEY:-}"
+LLM_ALLOW_EXTERNAL="${LLM_ALLOW_EXTERNAL:-0}"
+LLM_MAX_CALLS="${LLM_MAX_CALLS:-60}"
+LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
+
 NUCLEI_VER="${NUCLEI_VER:-3.4.10}"
 NUCLEI_URL="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VER}/nuclei_${NUCLEI_VER}_linux_amd64.zip"
 VULSCAN_REPO="https://github.com/scipag/vulscan"
@@ -75,6 +92,98 @@ is_done(){ [ "$RESUME" = "1" ] && [ -f "$RAW/.done-$1" ]; }
 mark_done(){ touch "$RAW/.done-$1"; }
 
 need_root(){ [ "$(id -u)" -eq 0 ] || { err "this needs root: sudo $0 $*"; exit 1; }; }
+
+# =====================================================================
+#  LLM annotation layer
+# =====================================================================
+#  Design constraints, deliberate:
+#    1. Local endpoints only, unless explicitly overridden. Scan data is
+#       a client's internal topology and must not leave their estate.
+#    2. The model annotates findings. It cannot create them. Every prompt
+#       constrains output to the identifiers supplied.
+#    3. The deterministic report is written first and is the deliverable.
+#       LLM output is a separate, clearly marked section.
+#    4. Responses are cached by content hash, so a rerun on the same data
+#       does not re-query and does not drift.
+
+LLM_ON=0
+LLM_CALLS=0
+LLM_CACHE="$HOME/.kameki-llm-cache"
+
+llm_endpoint_is_local(){
+  local h
+  h=$(printf '%s' "$1" | sed -E 's#^[a-z]+://##; s#[:/].*$##')
+  case "$h" in
+    localhost|127.*|::1|0.0.0.0) return 0 ;;
+    10.*|192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+llm_init(){
+  [ -n "$LLM_ENDPOINT" ] || return 1
+  if [ -z "$LLM_MODEL" ]; then
+    warn "LLM_ENDPOINT set but LLM_MODEL is not, annotation layer disabled"
+    return 1
+  fi
+  have curl || { warn "curl required for the LLM layer"; return 1; }
+
+  if ! llm_endpoint_is_local "$LLM_ENDPOINT"; then
+    if [ "$LLM_ALLOW_EXTERNAL" != "1" ]; then
+      err "LLM_ENDPOINT is not a local address: $LLM_ENDPOINT"
+      dim "scan data contains the client's internal hostnames, addresses,"
+      dim "patch state and directory structure. Sending it to a third party"
+      dim "processor is very likely outside your engagement terms."
+      dim "if you have written authorisation, set LLM_ALLOW_EXTERNAL=1"
+      return 1
+    fi
+    warn "using an EXTERNAL LLM endpoint: $LLM_ENDPOINT"
+    warn "client scan data will leave this machine. confirm this is authorised."
+  fi
+
+  local probe
+  probe=$(curl -s --max-time 15 "${LLM_ENDPOINT%/}/models" \
+            ${LLM_KEY:+-H "Authorization: Bearer $LLM_KEY"} 2>&1)
+  if ! echo "$probe" | grep -q '"'; then
+    warn "LLM endpoint did not respond, annotation layer disabled"
+    dim "tried: ${LLM_ENDPOINT%/}/models"
+    return 1
+  fi
+  mkdir -p "$LLM_CACHE"
+  LLM_ON=1
+  info "LLM annotation layer: $LLM_MODEL at $LLM_ENDPOINT $(llm_endpoint_is_local "$LLM_ENDPOINT" && echo '(local)' || echo '(EXTERNAL)')"
+  return 0
+}
+
+# llm_ask <system_prompt> <user_prompt>  -> model text on stdout, empty on failure
+llm_ask(){
+  [ "$LLM_ON" -eq 1 ] || return 1
+  if [ "$LLM_CALLS" -ge "$LLM_MAX_CALLS" ]; then return 1; fi
+
+  local sys="$1" usr="$2" key resp body
+  key=$(printf '%s\n%s\n%s' "$LLM_MODEL" "$sys" "$usr" | sha256sum | cut -c1-40)
+  if [ -f "$LLM_CACHE/$key" ]; then cat "$LLM_CACHE/$key"; return 0; fi
+
+  body=$(jq -n --arg m "$LLM_MODEL" --arg s "$sys" --arg u "$usr" \
+    '{model:$m, temperature:0, stream:false,
+      messages:[{role:"system",content:$s},{role:"user",content:$u}]}')
+
+  resp=$(curl -s --max-time "$LLM_TIMEOUT" "${LLM_ENDPOINT%/}/chat/completions" \
+           -H 'Content-Type: application/json' \
+           ${LLM_KEY:+-H "Authorization: Bearer $LLM_KEY"} \
+           -d "$body" 2>/dev/null)
+  LLM_CALLS=$((LLM_CALLS+1))
+
+  local out
+  out=$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+  # strip reasoning blocks some models emit
+  out=$(printf '%s' "$out" | sed -E 's/<think>.*<\/think>//g' | sed '/^[[:space:]]*$/d')
+  [ -n "$out" ] || return 1
+  printf '%s' "$out" > "$LLM_CACHE/$key"
+  printf '%s' "$out"
+}
+
 
 # =====================================================================
 #  install
@@ -1149,6 +1258,179 @@ else
 fi
 
 # =====================================================================
+#  LLM annotation  (optional, local by default, never creates findings)
+# =====================================================================
+LLM_FP_COUNT=0; LLM_HOSTS=0
+: > "$RAW/llm-triage.md"; : > "$RAW/llm-narrative.md"; : > "$RAW/llm-paths.md"
+: > "$RAW/llm-fp-candidates.txt"
+
+if llm_init; then
+step "LLM annotation"
+
+# ---- 1. false positive triage on Windows patch findings -------------
+#  This is the highest value use. WES-NG does not model cumulative
+#  update supersedence, so fully patched hosts get flagged. The model
+#  reasons over build, UBR and the installed hotfix list, which no rule
+#  in this script can do. It classifies only the CVEs it is given.
+if [ -s "$RAW/windows-cves.csv" ] && [ "$WIN_CVES" -gt 0 ]; then
+  info "triaging Windows patch findings for supersedence"
+  SYS_PROMPT='You analyse Windows patch data for a vulnerability assessment.
+
+You receive a host OS caption, build number, UBR, the installed hotfix IDs, and a list of CVEs a scanner claims are unpatched. Microsoft ships cumulative updates that supersede individual security updates, so scanners that compare against a per-CVE patch list produce false positives on fully patched hosts.
+
+Classify each supplied CVE. Rules you must follow:
+- Only classify CVE identifiers present in the input. Never introduce another identifier.
+- If a later cumulative update in the installed list plausibly supersedes the fix, classify it likely_false_positive.
+- If the OS build predates the fix and no superseding update is installed, classify it likely_genuine.
+- If you cannot determine it from the data given, classify it uncertain. Prefer uncertain over guessing.
+
+Respond with JSON only, no prose outside it:
+{"likely_false_positive":[],"likely_genuine":[],"uncertain":[],"reasoning":"two sentences"}'
+
+  {
+    echo "## Patch Finding Triage"
+    echo
+    echo "Supersedence analysis per host. This addresses the known WES-NG"
+    echo "limitation where cumulative updates are not modelled."
+    echo
+  } >> "$RAW/llm-triage.md"
+
+  for f in "$RAW"/sysinfo/*.txt; do
+    [ -e "$f" ] || continue
+    [ "$LLM_CALLS" -ge "$LLM_MAX_CALLS" ] && break
+    h=$(basename "$f" .txt)
+    hc=$(grep -c "^$h," "$RAW/windows-cves.csv" 2>/dev/null || echo 0)
+    [ "$hc" -eq 0 ] && continue
+
+    osline=$(grep -i '^OS Name' "$f" | head -1)
+    osver=$(grep -i '^OS Version' "$f" | head -1)
+    kbs=$(grep -oE 'KB[0-9]{6,7}' "$f" | sort -u | tr '\n' ' ')
+    cves=$(grep "^$h," "$RAW/windows-cves.csv" | cut -d',' -f2 | grep '^CVE-' | sort -u | head -40 | tr '\n' ' ')
+    [ -z "$cves" ] && continue
+
+    USR="Host: $h
+$osline
+$osver
+Installed hotfixes: ${kbs:-none listed}
+CVEs the scanner claims are unpatched: $cves"
+
+    printf "    %-18s " "$h"
+    if ANS=$(llm_ask "$SYS_PROMPT" "$USR"); then
+      CLEAN=$(printf '%s' "$ANS" | sed -n '/{/,/}/p')
+      FP=$(printf '%s' "$CLEAN" | jq -r '.likely_false_positive[]?' 2>/dev/null)
+      GEN=$(printf '%s' "$CLEAN" | jq -r '.likely_genuine[]?' 2>/dev/null)
+      UNC=$(printf '%s' "$CLEAN" | jq -r '.uncertain[]?' 2>/dev/null)
+      RSN=$(printf '%s' "$CLEAN" | jq -r '.reasoning // empty' 2>/dev/null)
+
+      # refuse any identifier the model introduced that was not in the input
+      VALID_FP=""
+      for c in $FP; do
+        case " $cves " in *" $c "*) VALID_FP="$VALID_FP $c" ;; esac
+      done
+      NFP=$(printf '%s' "$VALID_FP" | wc -w)
+      LLM_FP_COUNT=$((LLM_FP_COUNT + NFP))
+      LLM_HOSTS=$((LLM_HOSTS + 1))
+      for c in $VALID_FP; do echo "$h,$c" >> "$RAW/llm-fp-candidates.txt"; done
+
+      {
+        echo "### $h"
+        echo
+        [ -n "$osline" ] && echo "\`$(echo "$osline" | tr -s ' ')\`"
+        echo
+        echo "| Class | Count | CVEs |"
+        echo "| --- | ---: | --- |"
+        echo "| Likely false positive | $NFP | $(echo $VALID_FP | tr ' ' ', ') |"
+        echo "| Likely genuine | $(echo $GEN | wc -w) | $(echo $GEN | tr ' ' ', ') |"
+        echo "| Uncertain | $(echo $UNC | wc -w) | $(echo $UNC | tr ' ' ', ') |"
+        echo
+        [ -n "$RSN" ] && { echo "> $RSN"; echo; }
+      } >> "$RAW/llm-triage.md"
+      echo "${GRN}$NFP likely FP${RST} of $hc"
+    else
+      echo "${DIM}skipped${RST}"
+    fi
+  done
+  [ "$LLM_FP_COUNT" -gt 0 ] && warn "$LLM_FP_COUNT finding(s) flagged as likely false positives, verify before reporting"
+fi
+
+# ---- 2. executive narrative -----------------------------------------
+#  Fed metrics only, never raw findings, to keep the hallucination
+#  surface as small as possible.
+if [ "$LLM_CALLS" -lt "$LLM_MAX_CALLS" ]; then
+  info "drafting executive narrative"
+  NAR_SYS='You write the executive summary of a vulnerability assessment for a technical audience such as a CISO or head of infrastructure.
+
+Rules:
+- Use only the figures supplied. Never state a number that is not in the input.
+- If authentication depth is low, say plainly that the assessment did not verify patch level and the findings below it are therefore incomplete. Do not soften this.
+- Three short paragraphs maximum. No headings, no bullet points, no preamble.
+- Plain professional English. No marketing language, no filler.'
+
+  NAR_USR="Hosts in scope: $NTARGETS
+Hosts responding: $LIVE
+Hosts where credentials took effect: $([ "$RUN_NVT" -eq 1 ] && echo "$NVT_AUTH_HOSTS" || echo "$SYSOK")
+Authenticated coverage: ${COVER_PCT:-0}%
+Authenticated findings per authenticated host: ${DEPTH_H}.$(printf '%02d' $((AUTH_DEPTH % 100)))
+Depth verdict: $DEPTH_VERDICT
+Unique CVEs: $ALL_CVES
+CVEs on the CISA actively exploited list: $KEV_HITS
+Confirmed exploitable services: $MOD_VULN
+Attack paths identified: $PATHS
+Hosts without SMB signing: $NOSIGN
+Hosts with SMBv1: $SMBV1
+Kerberoastable accounts: $KERB_H
+AS-REP roastable accounts: $ASREP_H
+ADCS findings: $ADCS_H
+End of life systems: $EOL
+Hosts that failed authentication: $AUTH_FAIL"
+
+  if NAR=$(llm_ask "$NAR_SYS" "$NAR_USR"); then
+    printf '%s\n' "$NAR" > "$RAW/llm-narrative.md"
+    info "narrative drafted"
+  fi
+fi
+
+# ---- 3. attack path expansion ---------------------------------------
+#  The hardcoded rules cover the common chains. This looks for
+#  combinations the rules do not encode.
+if [ "$PATHS" -gt 0 ] && [ "$LLM_CALLS" -lt "$LLM_MAX_CALLS" ]; then
+  info "expanding attack path analysis"
+  PATH_SYS='You are a penetration tester reviewing internal vulnerability assessment output.
+
+Given a list of conditions found on a Windows domain estate, identify realistic attack chains that combine two or more of them. 
+
+Rules:
+- Base every chain only on the conditions listed. Do not assume conditions that are not stated.
+- For each chain give: the conditions it combines, the sequence, and the outcome.
+- Maximum five chains, ordered by likelihood of success.
+- Be specific about technique names where they apply.
+- Markdown bullet points. No preamble.'
+
+  PATH_USR="Conditions found:
+$(cat "$RAW/attack-paths.txt")
+Hosts without SMB signing: $NOSIGN
+Hosts with SMBv1 enabled: $SMBV1
+Hosts allowing null sessions: $NULLS
+Writable shares: $WRITABLE
+Kerberoastable accounts: $KERB_H
+AS-REP roastable accounts: $ASREP_H
+ADCS findings: $ADCS_H
+LDAP signing not enforced: $LDAPSIGN
+GPP credential exposure: $GPP
+Confirmed exploitable services: $MOD_VULN
+Accounts with password not required: $PWDNR
+Hosts where our credentials are local admin: $AUTH_OK"
+
+  if EXP=$(llm_ask "$PATH_SYS" "$PATH_USR"); then
+    printf '%s\n' "$EXP" > "$RAW/llm-paths.md"
+    info "attack path analysis drafted"
+  fi
+fi
+
+info "LLM calls used: $LLM_CALLS of $LLM_MAX_CALLS"
+fi
+
+# =====================================================================
 #  Report
 # =====================================================================
 step "Building report"
@@ -1384,11 +1666,46 @@ if [ "$MULTI" -eq 1 ] && [ -s "$RAW/working-creds.txt" ]; then
 fi
 
 echo "---"; echo
+if [ "$LLM_ON" -eq 1 ]; then
+echo "---"; echo
+echo "## 11B. Machine Assisted Analysis"; echo
+echo "> Everything in this section was produced by a language model"
+echo "> (\`$LLM_MODEL\`) reasoning over the findings above. It annotates"
+echo "> results the scanners produced and cannot introduce findings of its"
+echo "> own. Sections 1 through 11 are deterministic and reproduce"
+echo "> identically on a rerun; this section does not. Treat it as analyst"
+echo "> assistance, verify before it reaches a client."
+echo
+if [ -s "$RAW/llm-narrative.md" ]; then
+  echo "### Executive narrative"; echo
+  cat "$RAW/llm-narrative.md"; echo
+fi
+if [ "$LLM_FP_COUNT" -gt 0 ]; then
+  echo "### Suspected false positives"; echo
+  echo "**$LLM_FP_COUNT finding(s)** across $LLM_HOSTS host(s) may be false"
+  echo "positives caused by cumulative update supersedence, which WES-NG does"
+  echo "not model. Verify each against the host build and UBR before removing"
+  echo "or reporting it."
+  echo
+  echo '```'
+  head -60 "$RAW/llm-fp-candidates.txt" 2>/dev/null
+  echo '```'
+  echo
+  echo "Per host reasoning: \`$RAW/llm-triage.md\`"
+  echo
+fi
+if [ -s "$RAW/llm-paths.md" ]; then
+  echo "### Extended attack path analysis"; echo
+  echo "Chains beyond the rules encoded in section 1."; echo
+  cat "$RAW/llm-paths.md"; echo
+fi
+fi
+
+echo "---"; echo
 echo "## 12. OS Inventory"; echo
 echo '```'; head -250 "$RAW/os-inventory.txt" 2>/dev/null; echo '```'; echo
 
-echo "## 13. Evidence"; echo
-echo "| File | Contents |"; echo "| --- | --- |"
+echo "## 13. Evidence"; echoecho "| File | Contents |"; echo "| --- | --- |"
 echo "| \`$RAW/cve-all.txt\` | Every unique CVE, all sources |"
 echo "| \`$RAW/cve-kev.txt\` | CVEs on the CISA exploited list |"
 echo "| \`$RAW/risk-scores.txt\` | Per host risk score |"
