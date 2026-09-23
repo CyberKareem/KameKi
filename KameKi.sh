@@ -1,512 +1,937 @@
 #!/usr/bin/env bash
 #
-# kameki.sh - Authenticated VA with CVE mapping
+#  kameki.sh  -  Authenticated vulnerability assessment
 #
-# Reads from the current directory:
-#   targets.txt  - one IP or hostname per line
-#   user.txt     - one or more accounts, DOMAIN\user or user@domain
-#   pass.txt     - one or more passwords
+#  Two detection engines, one report.
 #
-# Produces:
-#   kameki-<date>.md     - consolidated report
-#   kameki-raw-<date>/   - raw tool output for evidence
+#    nvt         drives the full Greenbone NVT feed (~100k scripts) over the
+#                gvmd socket. No web UI needed. Used automatically when the
+#                backend is present.
+#    standalone  WES-NG patch mapping, nmap NSE vuln scripts, service CVE
+#                mapping. Used when Greenbone is not installed.
 #
-# CVE coverage:
-#   Windows patch level  - WES-NG against MSRC data (authenticated)
-#   Network services     - nmap vulners or vulscan against service versions
-#   Web applications     - nuclei templates
+#  On top of whichever engine runs, always:
+#    Active Directory assessment, configuration audit, TLS, web, SNMP,
+#    CISA KEV correlation, attack path derivation, per host risk scoring,
+#    and explicit authentication coverage reporting.
 #
-# Known limitation: WES-NG reports missing patches based on installed hotfix
-# list and does not fully model update supersedence. Expect false positives,
-# particularly on fully patched Server 2022 hosts. Validate before reporting.
+#  Input files, current directory:
+#    targets.txt    one IP or hostname per line             required
+#    user.txt       Windows account(s)                      required
+#    pass.txt       password(s)                             required
+#    ssh-user.txt   Linux account                           optional
+#    ssh-pass.txt   Linux password                          optional
+#    gmp-user.txt   gvmd admin user                         nvt engine only
+#    gmp-pass.txt   gvmd admin password                     nvt engine only
+#
+#  Output:
+#    kameki-<date>.md      report
+#    kameki-raw-<date>/    evidence
+#
+#  Usage:
+#    ./kameki.sh                        auto engine, standard profile
+#    ENGINE=nvt ./kameki.sh             require Greenbone
+#    ENGINE=standalone ./kameki.sh      skip Greenbone
+#    ENGINE=both ./kameki.sh            run both, compare coverage
+#    PROFILE=deep JOBS=32 ./kameki.sh
+#    RESUME=1 ./kameki.sh               skip completed stages
+#    ./kameki.sh --setup                print Greenbone install steps
 #
 set -uo pipefail
+
+# =====================================================================
+#  Configuration
+# =====================================================================
+ENGINE="${ENGINE:-auto}"
+PROFILE="${PROFILE:-standard}"
+JOBS="${JOBS:-16}"
+NXC_THREADS="${NXC_THREADS:-32}"
+MIN_CVSS="${MIN_CVSS:-4.0}"
+NMAP_RATE="${NMAP_RATE:-2000}"
+HOST_TIMEOUT="${HOST_TIMEOUT:-20m}"
+RESUME="${RESUME:-0}"
+POLL="${POLL:-60}"
+SCAN_CONFIG="${SCAN_CONFIG:-fast}"
+ALIVE_TEST="${ALIVE_TEST:-ICMP, TCP-ACK Service & ARP Ping}"
+KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+case "$PROFILE" in
+  quick)    PORTSPEC="--top-ports 1000";  NSE_SET="vuln" ;;
+  standard) PORTSPEC="--top-ports 5000";  NSE_SET="vuln,safe" ;;
+  deep)     PORTSPEC="-p-";               NSE_SET="vuln,safe" ;;
+  *) echo "PROFILE must be quick, standard or deep"; exit 1 ;;
+esac
+
+CFG_FAST="daba56c8-73ec-11df-a475-002264764cea"
+CFG_ULTIMATE="698f691e-7489-11df-9d8c-002264764cea"
+CFG_DEEP="708f25c4-7489-11df-8094-002264764cea"
+CFG_DEEPULT="74db13d6-7489-11df-91b9-002264764cea"
+FMT_CSV="c1645568-627a-11e3-a660-406186ea4fc5"
+FMT_XML="a994b278-1f62-11e1-96ac-406186ea4fc5"
+
+case "$SCAN_CONFIG" in
+  fast)     CFG_ID="$CFG_FAST";     CFG_NAME="Full and fast" ;;
+  ultimate) CFG_ID="$CFG_ULTIMATE"; CFG_NAME="Full and fast ultimate" ;;
+  deep)     CFG_ID="$CFG_DEEP";     CFG_NAME="Full and very deep" ;;
+  deepult)  CFG_ID="$CFG_DEEPULT";  CFG_NAME="Full and very deep ultimate" ;;
+  *) echo "SCAN_CONFIG must be fast, ultimate, deep or deepult"; exit 1 ;;
+esac
 
 DATE=$(date +%F)
 STAMP=$(date +"%Y-%m-%d %H:%M:%S %Z")
 RAW="kameki-raw-${DATE}"
 MD="kameki-${DATE}.md"
+RUN_NAME="kameki-${DATE}-$$"
+T0=$(date +%s)
 
-TARGETS="targets.txt"
-USERFILE="user.txt"
-PASSFILE="pass.txt"
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; DIM=$'\e[2m'; RST=$'\e[0m'
+info(){ echo "${GRN}[+]${RST} $*"; }
+warn(){ echo "${YEL}[!]${RST} $*"; }
+err(){  echo "${RED}[-]${RST} $*"; }
+step(){ echo; echo "${CYN}── $* ${RST}"; }
+dim(){  echo "${DIM}    $*${RST}"; }
 
-MIN_CVSS="${MIN_CVSS:-5.0}"
+pool(){ while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.2; done; "$@" & }
+finish(){ wait; }
+is_done(){ [ "$RESUME" = "1" ] && [ -f "$RAW/.done-$1" ]; }
+mark_done(){ touch "$RAW/.done-$1"; }
+cnt(){ [ -f "$1" ] && grep -c . "$1" 2>/dev/null || echo 0; }
 
-RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; RST=$'\e[0m'
-info() { echo "${GRN}[+]${RST} $*"; }
-warn() { echo "${YEL}[!]${RST} $*"; }
-err()  { echo "${RED}[-]${RST} $*"; }
+# =====================================================================
+#  --setup
+# =====================================================================
+if [ "${1:-}" = "--setup" ]; then
+cat <<'SETUP'
 
-# ---------------------------------------------------------------
-# 1. Dependency check
-# ---------------------------------------------------------------
-info "Checking required tools"
+  Greenbone NVT backend, no web UI required
+  =========================================
 
-MISSING=0
-declare -A HINT=(
-  [nmap]="sudo apt install nmap -y"
-  [nxc]="pipx install git+https://github.com/Pennyw0rth/NetExec"
-  [nuclei]="download the binary from github.com/projectdiscovery/nuclei/releases"
-  [awk]="sudo apt install gawk -y"
-  [jq]="sudo apt install jq -y"
-)
+    sudo apt update
+    sudo apt install openvas-scanner ospd-openvas gvmd redis-server -y
+    pipx install gvm-tools
 
-for tool in nmap nxc nuclei awk jq; do
-  if command -v "$tool" >/dev/null 2>&1; then
-    printf "    %-10s %s\n" "$tool" "ok"
-  else
-    printf "    %-10s %s\n" "$tool" "MISSING  ->  ${HINT[$tool]}"
-    MISSING=1
+    sudo gvm-setup                 # save the admin password it prints
+    sudo greenbone-feed-sync       # ~5 GB, 30-60 min, do this at the office
+
+    sudo gvm-check-setup
+    ls /var/lib/openvas/plugins | wc -l        # expect 90,000+
+    sudo systemctl enable --now ospd-openvas gvmd
+
+    echo 'admin'          > gmp-user.txt
+    echo '<the password>' > gmp-pass.txt
+    chmod 600 gmp-user.txt gmp-pass.txt
+
+  The gsad web interface is not needed and is often missing from the
+  Ubuntu package. This script drives gvmd directly over its socket.
+
+  To move a synced scanner to a machine with no internet, snapshot the
+  VM, or archive /var/lib/openvas/plugins, /var/lib/gvm and the gvmd
+  PostgreSQL database.
+
+SETUP
+exit 0
+fi
+
+# =====================================================================
+#  1. Dependency check and engine selection
+# =====================================================================
+step "Dependencies and engine"
+MISS=0
+chk(){ if command -v "$1" >/dev/null 2>&1; then printf "    %-14s ok\n" "$1"; return 0
+       else printf "    %-14s MISSING  ->  %s\n" "$1" "$2"; return 1; fi }
+
+chk nmap   "sudo apt install nmap -y"                               || MISS=1
+chk nxc    "pipx install git+https://github.com/Pennyw0rth/NetExec"  || MISS=1
+chk nuclei "github.com/projectdiscovery/nuclei/releases"             || MISS=1
+chk jq     "sudo apt install jq -y"                                  || MISS=1
+[ "$MISS" -eq 1 ] && { err "Install the core tools above, then re-run."; exit 1; }
+
+# --- nvt engine availability
+NVT_READY=0; SOCK=""; NVT_FILES=0
+if command -v gvm-cli >/dev/null 2>&1; then
+  for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock \
+           /var/run/gvm/gvmd.sock "$HOME/.gvm/gvmd/gvmd.sock"; do
+    [ -S "$s" ] && { SOCK="$s"; break; }
+  done
+  if [ -n "$SOCK" ] && [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
+    NVT_FILES=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
+    [ "$NVT_FILES" -ge 10000 ] && NVT_READY=1
   fi
-done
+fi
+if [ "$NVT_READY" -eq 1 ]; then
+  printf "    %-14s ok  (%s NVTs, %s)\n" "greenbone" "$NVT_FILES" "$SOCK"
+else
+  printf "    %-14s %s\n" "greenbone" "unavailable"
+  [ -z "$SOCK" ] && dim "no gvmd socket, or gvm-cli missing. run: $0 --setup"
+  [ -n "$SOCK" ] && [ "$NVT_FILES" -lt 10000 ] && dim "feed incomplete ($NVT_FILES NVTs). run: sudo greenbone-feed-sync"
+  [ -n "$SOCK" ] && { [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] || dim "gmp-user.txt and gmp-pass.txt not found"; }
+fi
 
-# WES-NG ships as either "wes" or "wes.py" depending on how it was installed
-WES=""
-for candidate in wes wes.py; do
-  if command -v "$candidate" >/dev/null 2>&1; then
-    WES="$candidate"
-    break
+# --- standalone engine components
+WES=""; for c in wes wes.py; do command -v "$c" >/dev/null 2>&1 && { WES="$c"; break; }; done
+SVC_CVE="none"
+[ -d /usr/share/nmap/scripts/vulscan ]     && SVC_CVE="vulscan"
+[ -f /usr/share/nmap/scripts/vulners.nse ] && SVC_CVE="vulners"
+SA_READY=0
+[ -n "$WES" ] && [ "$SVC_CVE" != "none" ] && SA_READY=1
+printf "    %-14s %s\n" "standalone" "$([ $SA_READY -eq 1 ] && echo "ok  (wes: $WES, svc-cve: $SVC_CVE)" || echo "incomplete")"
+[ -z "$WES" ] && dim "wes missing -> pipx install wesng && wes --update"
+[ "$SVC_CVE" = "none" ] && dim "svc-cve missing -> sudo git clone https://github.com/scipag/vulscan /usr/share/nmap/scripts/vulscan && sudo nmap --script-updatedb"
+
+# --- optional
+HAVE_TESTSSL=0; HAVE_SPLOIT=0; HAVE_SNMP=0; HAVE_CURL=0
+command -v testssl.sh   >/dev/null 2>&1 && HAVE_TESTSSL=1
+command -v searchsploit >/dev/null 2>&1 && HAVE_SPLOIT=1
+command -v onesixtyone  >/dev/null 2>&1 && HAVE_SNMP=1
+command -v curl         >/dev/null 2>&1 && HAVE_CURL=1
+echo "    ${DIM}optional: testssl.sh $HAVE_TESTSSL  searchsploit $HAVE_SPLOIT  onesixtyone $HAVE_SNMP${RST}"
+
+# --- resolve engine
+case "$ENGINE" in
+  auto)       if [ "$NVT_READY" -eq 1 ]; then ENGINE=nvt; else ENGINE=standalone; fi ;;
+  nvt)        [ "$NVT_READY" -eq 1 ] || { err "ENGINE=nvt but Greenbone is not available. Run: $0 --setup"; exit 1; } ;;
+  standalone) : ;;
+  both)       [ "$NVT_READY" -eq 1 ] || { err "ENGINE=both requires Greenbone."; exit 1; } ;;
+  *) err "ENGINE must be auto, nvt, standalone or both"; exit 1 ;;
+esac
+RUN_NVT=0; RUN_SA=0
+case "$ENGINE" in
+  nvt)        RUN_NVT=1 ;;
+  standalone) RUN_SA=1 ;;
+  both)       RUN_NVT=1; RUN_SA=1 ;;
+esac
+if [ "$RUN_SA" -eq 1 ] && [ "$SA_READY" -eq 0 ]; then
+  err "standalone engine selected but wes or the service CVE engine is missing"; exit 1
+fi
+info "engine: ${CYN}$ENGINE${RST}"
+
+# =====================================================================
+#  2. Inputs
+# =====================================================================
+for f in targets.txt user.txt pass.txt; do
+  [ -s "$f" ] || { err "Missing or empty: $f"; exit 1; }
+done
+UC=$(grep -cve '^\s*$' user.txt); PC=$(grep -cve '^\s*$' pass.txt)
+NTARGETS=$(grep -cve '^\s*$' targets.txt)
+
+if [ "$UC" -eq 1 ] && [ "$PC" -eq 1 ]; then
+  U=$(head -n1 user.txt | tr -d '\r\n'); P=$(head -n1 pass.txt | tr -d '\r\n')
+  CREDLBL="$U"; MULTI=0
+else
+  U="user.txt"; P="pass.txt"; CREDLBL="$UC user x $PC pass"; MULTI=1
+  [ "$RUN_NVT" -eq 1 ] && { warn "nvt engine takes a single credential pair; using the first line of each"; \
+                            U=$(head -n1 user.txt | tr -d '\r\n'); P=$(head -n1 pass.txt | tr -d '\r\n'); }
+  if [ "$MULTI" -eq 1 ] && [ "$RUN_SA" -eq 1 ]; then
+    echo; warn "Multi-credential: $(( UC * PC * NTARGETS )) attempts. This is a spray and can lock accounts."
+    read -rp "    Type YES to continue: " C; [ "$C" = "YES" ] || { err "Aborted."; exit 1; }
   fi
+fi
+
+SSH_ON=0
+if [ -s ssh-user.txt ] && [ -s ssh-pass.txt ]; then
+  SU=$(head -n1 ssh-user.txt | tr -d '\r\n'); SP=$(head -n1 ssh-pass.txt | tr -d '\r\n')
+  SSH_ON=1
+fi
+for f in user.txt pass.txt ssh-user.txt ssh-pass.txt gmp-user.txt gmp-pass.txt; do
+  [ -f "$f" ] && [ "$(stat -c '%a' "$f")" != "600" ] && warn "$f is mode $(stat -c '%a' "$f"), run: chmod 600 $f"
 done
-if [ -n "$WES" ]; then
-  printf "    %-10s %s\n" "wes" "ok ($WES)"
+
+mkdir -p "$RAW"/{sysinfo,wes,linux,tls,mods,nse,ports,ad,nvt}
+info "profile $PROFILE   jobs $JOBS   targets $NTARGETS   windows creds $CREDLBL"
+[ "$SSH_ON" -eq 1 ] && info "linux creds supplied"
+
+# =====================================================================
+#  3. CISA KEV catalogue
+# =====================================================================
+KEV_FILE="$HOME/.kameki-kev.json"; KEV_OK=0
+if [ "$HAVE_CURL" -eq 1 ]; then
+  if [ ! -f "$KEV_FILE" ] || find "$KEV_FILE" -mtime +7 2>/dev/null | grep -q .; then
+    curl -s --max-time 45 -o "$KEV_FILE.tmp" "$KEV_URL" 2>/dev/null && mv "$KEV_FILE.tmp" "$KEV_FILE" || rm -f "$KEV_FILE.tmp"
+  fi
+fi
+if [ -s "$KEV_FILE" ]; then
+  jq -r '.vulnerabilities[].cveID' "$KEV_FILE" 2>/dev/null | sort -u > "$RAW/kev-all.txt"
+  [ -s "$RAW/kev-all.txt" ] && KEV_OK=1
+fi
+[ "$KEV_OK" -eq 1 ] && info "KEV catalogue: $(cnt "$RAW/kev-all.txt") actively exploited CVEs" \
+                    || warn "KEV catalogue unavailable, exploitation flags disabled"
+
+# =====================================================================
+#  Stage 1  Discovery
+# =====================================================================
+step "Stage 1  Discovery"
+if is_done discovery; then info "skipped (resume)"; else
+  nmap -sn -PE -PP -PM -PS21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,3306,3389,5985,8080 \
+       -PA80,443,3389 -PU161 --min-rate "$NMAP_RATE" \
+       -iL targets.txt -oG "$RAW/discovery.gnmap" -oN "$RAW/discovery.txt" >/dev/null 2>&1
+  awk '/Up$/{print $2}' "$RAW/discovery.gnmap" | sort -uV > "$RAW/live.txt"
+  grep -vxFf "$RAW/live.txt" targets.txt 2>/dev/null | grep -ve '^\s*$' > "$RAW/no-response.txt" || true
+  mark_done discovery
+fi
+LIVE=$(cnt "$RAW/live.txt")
+info "live $LIVE of $NTARGETS"
+[ "$LIVE" -eq 0 ] && { err "No live hosts. Check network position: ip a"; exit 1; }
+
+# =====================================================================
+#  Stage 2  Port and service scan   (single pass, reused everywhere)
+# =====================================================================
+step "Stage 2  Port and service enumeration"
+if is_done portscan; then info "skipped (resume)"; else
+  dim "one pass, $PORTSPEC, results drive every later stage"
+  nmap -sS -sV -O --osscan-guess --version-intensity 5 -Pn $PORTSPEC \
+       --min-rate "$NMAP_RATE" --max-retries 2 --host-timeout "$HOST_TIMEOUT" --open \
+       -iL "$RAW/live.txt" -oN "$RAW/services.txt" -oG "$RAW/services.gnmap" \
+       -oX "$RAW/services.xml" >/dev/null 2>&1
+  mark_done portscan
+fi
+awk '/Ports:/{ip=$2; ports="";
+      for(i=1;i<=NF;i++) if($i ~ /\/open\//){split($i,b,"/"); gsub(/,/,"",b[1]); ports=ports b[1] ","}
+      if(ports!=""){sub(/,$/,"",ports); print ip" "ports}}' \
+    "$RAW/services.gnmap" 2>/dev/null > "$RAW/ports/map.txt" || true
+HOSTS_OPEN=$(cnt "$RAW/ports/map.txt")
+TOTAL_PORTS=$(awk '{n=split($2,a,","); s+=n} END{print s+0}' "$RAW/ports/map.txt" 2>/dev/null)
+grep -E '^Nmap scan report|^Running:|^OS details:|^Service Info:' "$RAW/services.txt" > "$RAW/os-inventory.txt" 2>/dev/null || true
+grep -iE 'Windows (XP|Vista|7|8|2003|2008|2012)|Ubuntu (1[0-6]|18)\.|CentOS [5-7]|Debian [5-9] ' \
+     "$RAW/services.txt" > "$RAW/eol-os.txt" 2>/dev/null || true
+EOL=$(cnt "$RAW/eol-os.txt")
+info "hosts with open ports $HOSTS_OPEN   total open ports $TOTAL_PORTS   possible EOL $EOL"
+
+# =====================================================================
+#  Stage 3A  NVT engine  (Greenbone over the gvmd socket)
+# =====================================================================
+NVT_HIGH=0; NVT_MED=0; NVT_LOW=0; NVT_LOG=0; NVT_CVES=0
+NVT_AUTH_HOSTS=0; NVT_HOSTS_F=0; NVT_UNAUTH=0; NVT_ROWS=0
+NVT_CSV="$RAW/nvt/results.csv"
+: > "$RAW/cve-nvt.txt"
+
+if [ "$RUN_NVT" -eq 1 ]; then
+step "Stage 3A  Greenbone NVT scan  ($NVT_FILES scripts, $CFG_NAME)"
+
+GMPU=$(head -n1 gmp-user.txt | tr -d '\r\n'); GMPP=$(head -n1 gmp-pass.txt | tr -d '\r\n')
+xesc(){ printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
+gmp(){ gvm-cli --gmp-username "$GMPU" --gmp-password "$GMPP" socket --socketpath "$SOCK" --xml "$1" 2>&1; }
+xid(){  sed -n 's/.*id="\([a-f0-9][a-f0-9-]*\)".*/\1/p' | head -1; }
+xtag(){ sed -n "s|.*<$1>\([^<]*\)</$1>.*|\1|p" | head -1; }
+
+V=$(gmp "<get_version/>")
+if ! echo "$V" | grep -q 'status="200"'; then
+  err "GMP authentication failed"; echo "$V" | head -3; RUN_NVT=0
 else
-  printf "    %-10s %s\n" "wes" "MISSING  ->  pipx install wesng   (then: wes --update)"
-  MISSING=1
+info "GMP $(echo "$V" | xtag version) authenticated"
+
+R=$(gmp "<create_credential><name>kameki-smb-$RUN_NAME</name><type>up</type>
+  <allow_insecure>1</allow_insecure><login>$(xesc "$U")</login>
+  <password>$(xesc "$P")</password></create_credential>")
+SMB_CRED=$(echo "$R" | xid)
+[ -n "$SMB_CRED" ] || { err "SMB credential creation failed"; echo "$R" | head -3; }
+
+SSH_CRED=""
+if [ "$SSH_ON" -eq 1 ]; then
+  R=$(gmp "<create_credential><name>kameki-ssh-$RUN_NAME</name><type>up</type>
+    <allow_insecure>1</allow_insecure><login>$(xesc "$SU")</login>
+    <password>$(xesc "$SP")</password></create_credential>")
+  SSH_CRED=$(echo "$R" | xid)
 fi
 
-# CVE engine for network services: vulners needs internet, vulscan is offline
-NSE_DIR=$(nmap --datadir 2>/dev/null; echo "/usr/share/nmap/scripts")
-SERVICE_CVE_ENGINE="none"
-if [ -f /usr/share/nmap/scripts/vulners.nse ] || [ -f "$HOME/.nmap/scripts/vulners.nse" ]; then
-  SERVICE_CVE_ENGINE="vulners"
-elif [ -d /usr/share/nmap/scripts/vulscan ]; then
-  SERVICE_CVE_ENGINE="vulscan"
-fi
-printf "    %-10s %s\n" "svc-cve" "$SERVICE_CVE_ENGINE"
+CREDXML="<smb_credential id=\"$SMB_CRED\"/>"
+[ -n "$SSH_CRED" ] && CREDXML="$CREDXML<ssh_credential id=\"$SSH_CRED\" port=\"22\"/>"
+HOSTS=$(grep -ve '^\s*$' targets.txt | tr '\n' ',' | sed 's/,$//')
+R=$(gmp "<create_target><name>kameki-target-$RUN_NAME</name><hosts>$HOSTS</hosts>
+  <alive_tests>$ALIVE_TEST</alive_tests>$CREDXML</create_target>")
+TARGET=$(echo "$R" | xid)
+[ -n "$TARGET" ] || { err "target creation failed"; echo "$R" | head -3; }
 
-if [ "$SERVICE_CVE_ENGINE" = "none" ]; then
-  warn "No service CVE engine found. Install one of:"
-  echo "        vulners (needs internet at scan time):"
-  echo "          sudo wget -O /usr/share/nmap/scripts/vulners.nse \\"
-  echo "            https://raw.githubusercontent.com/vulnersCom/nmap-vulners/master/vulners.nse"
-  echo "          sudo nmap --script-updatedb"
-  echo "        vulscan (offline CVE database):"
-  echo "          sudo git clone https://github.com/scipag/vulscan /usr/share/nmap/scripts/vulscan"
-  echo "          sudo nmap --script-updatedb"
-  MISSING=1
-fi
+SCANNER=$(gmp "<get_scanners/>" | grep -o 'id="[a-f0-9-]*"[^>]*>[^<]*<name>OpenVAS' | xid)
+[ -n "$SCANNER" ] || SCANNER="08b69003-5fc2-4037-a479-93b440211c73"
 
-if [ "$MISSING" -eq 1 ]; then
-  err "Install the missing components above, then re-run."
-  exit 1
-fi
+R=$(gmp "<create_task><name>$RUN_NAME</name><config id=\"$CFG_ID\"/>
+  <target id=\"$TARGET\"/><scanner id=\"$SCANNER\"/>
+  <preferences>
+    <preference><scanner_name>max_checks</scanner_name><value>5</value></preference>
+    <preference><scanner_name>max_hosts</scanner_name><value>20</value></preference>
+  </preferences></create_task>")
+TASK=$(echo "$R" | xid)
+R=$(gmp "<start_task task_id=\"$TASK\"/>")
+REPORT=$(echo "$R" | xtag report_id)
+echo "task=$TASK target=$TARGET report=$REPORT" > "$RAW/nvt/ids.txt"
+info "task $TASK   report $REPORT"
+dim "polling every ${POLL}s"
 
-# ---------------------------------------------------------------
-# 2. Input validation
-# ---------------------------------------------------------------
-for f in "$TARGETS" "$USERFILE" "$PASSFILE"; do
-  [ -s "$f" ] || { err "Missing or empty: $f (expected in current directory)"; exit 1; }
+LAST=-1
+while true; do
+  S=$(gmp "<get_tasks task_id=\"$TASK\"/>")
+  ST=$(echo "$S" | xtag status); PR=$(echo "$S" | xtag progress); [ -z "$PR" ] && PR=0
+  case "$ST" in
+    Done) echo; info "NVT scan complete"; break ;;
+    Stopped|Interrupted) echo; warn "NVT scan $ST at ${PR}%, exporting partial"; break ;;
+    "") echo; err "lost contact with gvmd"; break ;;
+  esac
+  if [ "$PR" != "$LAST" ]; then
+    printf "\r    %-12s %3s%%   %d min elapsed    " "$ST" "$PR" "$(( ($(date +%s)-T0)/60 ))"
+    LAST="$PR"
+  fi
+  sleep "$POLL"
 done
 
-USER_COUNT=$(grep -cve '^\s*$' "$USERFILE")
-PASS_COUNT=$(grep -cve '^\s*$' "$PASSFILE")
-TARGET_COUNT=$(grep -cve '^\s*$' "$TARGETS")
+gmp "<get_reports report_id=\"$REPORT\" format_id=\"$FMT_CSV\" ignore_pagination=\"1\"
+      details=\"1\" filter=\"levels=hmlg rows=-1\"/>" > "$RAW/nvt/csv.xml" 2>&1
+sed -n 's|.*</report_format>\(.*\)</report>.*|\1|p' "$RAW/nvt/csv.xml" | base64 -d > "$NVT_CSV" 2>/dev/null
+[ -s "$NVT_CSV" ] || grep -oE '[A-Za-z0-9+/=]{200,}' "$RAW/nvt/csv.xml" | head -1 | base64 -d > "$NVT_CSV" 2>/dev/null
+gmp "<get_reports report_id=\"$REPORT\" format_id=\"$FMT_XML\" ignore_pagination=\"1\"
+      details=\"1\" filter=\"levels=hmlg rows=-1\"/>" > "$RAW/nvt/report-full.xml" 2>&1
 
-if [ "$USER_COUNT" -eq 1 ] && [ "$PASS_COUNT" -eq 1 ]; then
-  USER=$(head -n1 "$USERFILE" | tr -d '\r\n')
-  PASS=$(head -n1 "$PASSFILE" | tr -d '\r\n')
-  CRED_LABEL="$USER"
-  MULTI=0
+[ -n "$SMB_CRED" ] && gmp "<delete_credential credential_id=\"$SMB_CRED\" ultimate=\"1\"/>" >/dev/null 2>&1
+[ -n "$SSH_CRED" ] && gmp "<delete_credential credential_id=\"$SSH_CRED\" ultimate=\"1\"/>" >/dev/null 2>&1
+dim "scan credentials removed from gvmd"
+
+if [ -s "$NVT_CSV" ]; then
+  NVT_ROWS=$(( $(wc -l < "$NVT_CSV") - 1 ))
+  NVT_HIGH=$(awk -F'","' 'NR>1 && tolower($6) ~ /high/'   "$NVT_CSV" 2>/dev/null | wc -l)
+  NVT_MED=$(awk  -F'","' 'NR>1 && tolower($6) ~ /medium/' "$NVT_CSV" 2>/dev/null | wc -l)
+  NVT_LOW=$(awk  -F'","' 'NR>1 && tolower($6) ~ /low/'    "$NVT_CSV" 2>/dev/null | wc -l)
+  NVT_LOG=$(awk  -F'","' 'NR>1 && tolower($6) ~ /log/'    "$NVT_CSV" 2>/dev/null | wc -l)
+  grep -oE 'CVE-[0-9]{4}-[0-9]+' "$NVT_CSV" 2>/dev/null | sort -u > "$RAW/cve-nvt.txt" || true
+  NVT_CVES=$(cnt "$RAW/cve-nvt.txt")
+  awk -F'","' 'NR>1{gsub(/^"/,"",$1); print $1}' "$NVT_CSV" 2>/dev/null | sort -uV > "$RAW/nvt/hosts-found.txt"
+  NVT_HOSTS_F=$(cnt "$RAW/nvt/hosts-found.txt")
+  grep -i 'Authenticated \(registry\|package\)-based' "$NVT_CSV" 2>/dev/null \
+    | awk -F'","' '{gsub(/^"/,"",$1); print $1}' | sort -uV > "$RAW/nvt/authenticated-hosts.txt" || : > "$RAW/nvt/authenticated-hosts.txt"
+  NVT_AUTH_HOSTS=$(cnt "$RAW/nvt/authenticated-hosts.txt")
+  if [ -s "$RAW/nvt/authenticated-hosts.txt" ]; then
+    grep -vxFf "$RAW/nvt/authenticated-hosts.txt" "$RAW/nvt/hosts-found.txt" > "$RAW/nvt/unauth-hosts.txt" 2>/dev/null || true
+  else cp "$RAW/nvt/hosts-found.txt" "$RAW/nvt/unauth-hosts.txt" 2>/dev/null || true; fi
+  NVT_UNAUTH=$(cnt "$RAW/nvt/unauth-hosts.txt")
+  info "findings  high $NVT_HIGH  medium $NVT_MED  low $NVT_LOW  log $NVT_LOG   cves $NVT_CVES"
+  info "authenticated checks on $NVT_AUTH_HOSTS of $NVT_HOSTS_F hosts with findings"
 else
-  USER="$USERFILE"
-  PASS="$PASSFILE"
-  CRED_LABEL="$USER_COUNT user(s) x $PASS_COUNT password(s)"
-  MULTI=1
-  COMBOS=$(( USER_COUNT * PASS_COUNT ))
-  echo
-  warn "Multi-credential mode: $COMBOS combinations per host, $(( COMBOS * TARGET_COUNT )) attempts total."
-  warn "This is a password spray. It can lock out accounts and will trigger SOC alerts."
-  read -rp "    Type YES to continue: " CONFIRM
-  [ "$CONFIRM" = "YES" ] || { err "Aborted."; exit 1; }
-  echo
+  err "CSV export failed, raw XML kept in $RAW/nvt/"
+fi
+fi
 fi
 
-for f in "$USERFILE" "$PASSFILE"; do
-  PERM=$(stat -c "%a" "$f")
-  [ "$PERM" = "600" ] || warn "$f is mode $PERM. Run: chmod 600 $f"
-done
+# =====================================================================
+#  Stage 3B  Standalone engine
+# =====================================================================
+NSE_HITS=0; SVC_CVES=0; SPLOIT=0; WIN_CVES=0; WIN_CRIT=0; SYSOK=0
+: > "$RAW/cve-service.txt"; : > "$RAW/cve-windows.txt"; : > "$RAW/nse-all.txt"
 
-mkdir -p "$RAW" "$RAW/systeminfo" "$RAW/wes"
+if [ "$RUN_SA" -eq 1 ]; then
+step "Stage 3B  NSE vulnerability scripts and service CVE mapping"
+if is_done nse; then info "skipped (resume)"; else
+  dim "targeting only discovered ports, $JOBS parallel workers"
+  if [ "$SVC_CVE" = "vulners" ]; then SCRIPTS="$NSE_SET,vulners"; SARGS="--script-args mincvss=$MIN_CVSS"
+  else SCRIPTS="$NSE_SET,vulscan/vulscan.nse"; SARGS="--script-args vulscandb=cve.csv"; fi
+  nse_host(){ nmap -sV -Pn -n -p "$2" --script "$SCRIPTS" $SARGS --script-timeout 90s \
+                   --host-timeout "$HOST_TIMEOUT" "$1" -oN "$RAW/nse/$1.txt" >/dev/null 2>&1; }
+  N=0
+  while read -r ip ports; do
+    [ -z "$ip" ] && continue
+    N=$((N+1)); printf "\r    scanning %d/%d" "$N" "$HOSTS_OPEN"
+    pool nse_host "$ip" "$ports"
+  done < "$RAW/ports/map.txt"
+  finish; echo
+  mark_done nse
+fi
+cat "$RAW"/nse/*.txt > "$RAW/nse-all.txt" 2>/dev/null || : > "$RAW/nse-all.txt"
+NSE_HITS=$(grep -ciE 'VULNERABLE' "$RAW/nse-all.txt" 2>/dev/null || echo 0)
+grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/nse-all.txt" 2>/dev/null | sort -u > "$RAW/cve-service.txt" || true
+SVC_CVES=$(cnt "$RAW/cve-service.txt")
+info "NSE vulnerable states $NSE_HITS   service CVEs $SVC_CVES"
 
-info "Targets: $TARGET_COUNT"
-info "Creds:   $CRED_LABEL"
-info "Output:  $RAW/"
-echo
+if [ "$HAVE_SPLOIT" -eq 1 ] && [ -s "$RAW/services.xml" ]; then
+  searchsploit --nmap "$RAW/services.xml" > "$RAW/searchsploit.txt" 2>&1 || true
+  SPLOIT=$(grep -c 'Exploit Title' "$RAW/searchsploit.txt" 2>/dev/null || echo 0)
+  info "public exploit matches $SPLOIT"
+fi
+fi
 
-# ---------------------------------------------------------------
-# 3. Host discovery
-# ---------------------------------------------------------------
-info "Stage 1/8  Host discovery"
-nmap -sn -PE -PS445,3389,22 -iL "$TARGETS" -oG "$RAW/discovery.gnmap" \
-     -oN "$RAW/discovery.txt" >/dev/null 2>&1
-awk '/Up$/{print $2}' "$RAW/discovery.gnmap" | sort -u > "$RAW/live.txt"
-LIVE_COUNT=$(wc -l < "$RAW/live.txt")
-grep -vxFf "$RAW/live.txt" "$TARGETS" 2>/dev/null | grep -ve '^\s*$' > "$RAW/no-response.txt" || true
-info "    live: $LIVE_COUNT of $TARGET_COUNT"
+# =====================================================================
+#  Stage 4  Authentication across protocols
+# =====================================================================
+step "Stage 4  Authentication"
+ap(){ nxc "$1" "$RAW/live.txt" -u "$U" -p "$P" --continue-on-success -t "$NXC_THREADS" > "$RAW/auth-$1.txt" 2>&1; }
+for pr in smb ldap mssql winrm rdp; do pool ap "$pr"; done
+pool bash -c "nxc smb '$RAW/live.txt' -u '' -p '' --shares > '$RAW/null-session.txt' 2>&1"
+finish
 
-# ---------------------------------------------------------------
-# 4. Authentication check
-# ---------------------------------------------------------------
-info "Stage 2/8  SMB authentication"
-nxc smb "$TARGETS" -u "$USER" -p "$PASS" --continue-on-success \
-    > "$RAW/auth-status.txt" 2>&1
-
-grep '\[+\]' "$RAW/auth-status.txt" | awk '{print $2}' | sort -u > "$RAW/auth-ok.txt" || true
-grep '\[-\]' "$RAW/auth-status.txt" | awk '{print $2}' | sort -u > "$RAW/auth-fail-raw.txt" || true
+grep '\[+\]' "$RAW/auth-smb.txt" | awk '{print $2}' | sort -uV > "$RAW/auth-ok.txt"   || : > "$RAW/auth-ok.txt"
+grep '\[-\]' "$RAW/auth-smb.txt" | awk '{print $2}' | sort -uV > "$RAW/auth-fail-raw.txt" || : > "$RAW/auth-fail-raw.txt"
 if [ -s "$RAW/auth-ok.txt" ]; then
   grep -vxFf "$RAW/auth-ok.txt" "$RAW/auth-fail-raw.txt" > "$RAW/auth-fail.txt" 2>/dev/null || : > "$RAW/auth-fail.txt"
-else
-  cp "$RAW/auth-fail-raw.txt" "$RAW/auth-fail.txt" 2>/dev/null || : > "$RAW/auth-fail.txt"
-fi
-grep '\[+\]' "$RAW/auth-status.txt" | sed -E 's/.*\[\+\][[:space:]]*//' | sort -u > "$RAW/working-creds.txt" || true
+else cp "$RAW/auth-fail-raw.txt" "$RAW/auth-fail.txt" 2>/dev/null || : > "$RAW/auth-fail.txt"; fi
+grep '\[+\]' "$RAW/auth-smb.txt" | sed -E 's/.*\[\+\][[:space:]]*//' | sort -u > "$RAW/working-creds.txt" || true
 
-AUTH_OK=$(wc -l < "$RAW/auth-ok.txt")
-AUTH_FAIL=$(wc -l < "$RAW/auth-fail.txt")
-info "    authenticated: $AUTH_OK   failed: $AUTH_FAIL"
+AUTH_OK=$(cnt "$RAW/auth-ok.txt"); AUTH_FAIL=$(cnt "$RAW/auth-fail.txt")
+NOSIGN=$(grep -c 'signing:False' "$RAW/auth-smb.txt" 2>/dev/null || echo 0)
+SMBV1=$(grep -c 'SMBv1:True' "$RAW/auth-smb.txt" 2>/dev/null || echo 0)
+NULLS=$(grep -c '\[+\]' "$RAW/null-session.txt" 2>/dev/null || echo 0)
+MSSQL_OK=$(grep -c '\[+\]' "$RAW/auth-mssql.txt" 2>/dev/null || echo 0)
+WINRM_OK=$(grep -c '\[+\]' "$RAW/auth-winrm.txt" 2>/dev/null || echo 0)
+info "smb $AUTH_OK ok / $AUTH_FAIL fail   no-signing $NOSIGN   smbv1 $SMBV1   null $NULLS   mssql $MSSQL_OK   winrm $WINRM_OK"
+[ "$AUTH_OK" -eq 0 ] && { warn "No SMB authentication succeeded."; dim "try DOMAIN\\\\user, user@domain, or the NETBIOS name"; }
 
-if [ "$AUTH_OK" -eq 0 ]; then
-  warn "No hosts authenticated. Windows CVE mapping will be skipped."
-  warn "Check credential format (DOMAIN\\\\user vs user@domain) and account rights."
-fi
+# =====================================================================
+#  Stage 5  Exploit modules
+# =====================================================================
+step "Stage 5  Windows exploit modules"
+MODS="ms17-010 zerologon petitpotam nopac smbghost printnightmare spooler webdav coerce_plus"
+runmod(){ nxc smb "$RAW/live.txt" -u "$U" -p "$P" -M "$1" -t "$NXC_THREADS" > "$RAW/mods/$1.txt" 2>&1; }
+for m in $MODS; do pool runmod "$m"; done
+finish
+: > "$RAW/vuln-summary.txt"; : > "$RAW/vuln-detail.txt"
+for m in $MODS; do
+  H=$(grep -ciE 'VULNERABLE|is vulnerable' "$RAW/mods/$m.txt" 2>/dev/null || echo 0)
+  if [ "$H" -gt 0 ]; then
+    printf "    %-16s ${RED}%s vulnerable${RST}\n" "$m" "$H"
+    echo "$m: $H" >> "$RAW/vuln-summary.txt"
+    { echo "--- $m ---"; grep -iE 'VULNERABLE|is vulnerable' "$RAW/mods/$m.txt" | head -25; } >> "$RAW/vuln-detail.txt"
+  else printf "    %-16s clear\n" "$m"; fi
+done
+MOD_VULN=$(awk -F': ' '{s+=$2} END{print s+0}' "$RAW/vuln-summary.txt" 2>/dev/null || echo 0)
 
-# ---------------------------------------------------------------
-# 5. Collect systeminfo per host for CVE mapping
-# ---------------------------------------------------------------
-info "Stage 3/8  Collecting systeminfo from authenticated hosts"
-SYSINFO_OK=0
+# =====================================================================
+#  Stage 6  Active Directory
+# =====================================================================
+step "Stage 6  Active Directory"
+adr(){ nxc "$1" "$RAW/live.txt" -u "$U" -p "$P" $2 > "$RAW/ad/$3.txt" 2>&1; }
+pool adr ldap "-M adcs"                    adcs
+pool adr ldap "-M ldap-checker"            ldap-signing
+pool adr ldap "--kerberoasting $RAW/ad/kerberoast-tickets.txt" kerberoast
+pool adr ldap "--asreproast $RAW/ad/asrep-tickets.txt"         asreproast
+pool adr ldap "-M find-delegation"         delegation
+pool adr ldap "-M maq"                     machine-quota
+pool adr ldap "-M user-desc"               user-descriptions
+pool adr ldap "--password-not-required"    pwd-not-required
+pool adr ldap "--trusted-for-delegation"   trusted-delegation
+finish
+ADCS_H=$(grep -ci 'ESC\|Certificate Authority' "$RAW/ad/adcs.txt" 2>/dev/null || echo 0)
+KERB_H=$(cat "$RAW/ad/kerberoast.txt" "$RAW/ad/kerberoast-tickets.txt" 2>/dev/null | grep -c 'krb5tgs' || echo 0)
+ASREP_H=$(cat "$RAW/ad/asreproast.txt" "$RAW/ad/asrep-tickets.txt" 2>/dev/null | grep -c 'krb5asrep' || echo 0)
+DELEG_H=$(grep -ci 'delegation' "$RAW/ad/delegation.txt" 2>/dev/null || echo 0)
+LDAPSIGN=$(grep -ci 'not enforced\|is not being enforced\|channel binding' "$RAW/ad/ldap-signing.txt" 2>/dev/null || echo 0)
+PWDNR=$(grep -ci 'password not required\|PASSWD_NOTREQD' "$RAW/ad/pwd-not-required.txt" 2>/dev/null || echo 0)
+info "adcs $ADCS_H   kerberoast $KERB_H   asrep $ASREP_H   delegation $DELEG_H   ldap-signing $LDAPSIGN"
+
+# =====================================================================
+#  Stage 7  Configuration audit
+# =====================================================================
+step "Stage 7  Configuration audit"
+cf(){ nxc smb "$RAW/live.txt" -u "$U" -p "$P" $1 -t "$NXC_THREADS" > "$RAW/$2.txt" 2>&1; }
+pool cf "--pass-pol"                     password-policy
+pool cf "--local-groups Administrators"  local-admins
+pool cf "--shares"                       shares
+pool cf "--users"                        domain-users
+pool cf "-M wcc"                         config-check
+pool cf "-M enum_av"                     endpoint-protection
+pool cf "-M gpp_password"                gpp-password
+pool cf "-M gpp_autologin"               gpp-autologin
+pool cf "-M laps"                        laps
+finish
+WCC_FAIL=$(grep -ciE '\bFAIL\b|not compliant' "$RAW/config-check.txt" 2>/dev/null || echo 0)
+GPP=$(grep -ci 'password' "$RAW/gpp-password.txt" 2>/dev/null || echo 0)
+WRITABLE=$(grep -ci 'READ,WRITE' "$RAW/shares.txt" 2>/dev/null || echo 0)
+info "config failures $WCC_FAIL   writable shares $WRITABLE   gpp $GPP"
+
+# =====================================================================
+#  Stage 8  Patch level  (standalone engine only, NVT covers this itself)
+# =====================================================================
+if [ "$RUN_SA" -eq 1 ]; then
+step "Stage 8  Patch level collection and Windows CVE mapping"
 if [ -s "$RAW/auth-ok.txt" ]; then
-  while read -r host; do
-    [ -z "$host" ] && continue
-    out="$RAW/systeminfo/${host}.txt"
-    nxc smb "$host" -u "$USER" -p "$PASS" -x 'systeminfo' 2>/dev/null \
+  grab(){ local h="$1" o="$RAW/sysinfo/$1.txt"
+    nxc smb "$h" -u "$U" -p "$P" -x 'systeminfo' 2>/dev/null \
       | sed -E 's/^SMB[[:space:]]+\S+[[:space:]]+[0-9]+[[:space:]]+\S+[[:space:]]+//' \
-      | grep -v '^\[' > "$out"
-    if grep -qi 'OS Name' "$out" 2>/dev/null; then
-      SYSINFO_OK=$((SYSINFO_OK+1))
-      printf "    %-18s collected\n" "$host"
-    else
-      rm -f "$out"
-      printf "    %-18s no systeminfo (cmd exec blocked?)\n" "$host"
-    fi
+      | grep -v '^\[' > "$o"
+    grep -qi 'OS Name' "$o" 2>/dev/null || rm -f "$o"; }
+  N=0; TOT=$(cnt "$RAW/auth-ok.txt")
+  while read -r h; do [ -z "$h" ] && continue
+    N=$((N+1)); printf "\r    collecting %d/%d" "$N" "$TOT"; pool grab "$h"
   done < "$RAW/auth-ok.txt"
+  finish; echo
+  SYSOK=$(ls -1 "$RAW"/sysinfo/*.txt 2>/dev/null | wc -l)
 fi
-info "    systeminfo collected: $SYSINFO_OK"
-
-# ---------------------------------------------------------------
-# 6. Windows patch-level CVE mapping via WES-NG
-# ---------------------------------------------------------------
-info "Stage 4/8  Windows CVE mapping (WES-NG)"
-WIN_CVE_TOTAL=0
-WIN_CVE_CRIT=0
+info "systeminfo collected $SYSOK of $AUTH_OK authenticated"
 : > "$RAW/windows-cves.csv"
-
-if [ "$SYSINFO_OK" -gt 0 ]; then
-  if [ ! -f definitions.zip ] && [ ! -f "$HOME/definitions.zip" ]; then
-    warn "WES-NG definitions not found. Fetching (needs internet)."
-    "$WES" --update >/dev/null 2>&1 || warn "    definition update failed, results may be stale"
-  fi
-
+if [ "$SYSOK" -gt 0 ]; then
+  { [ -f definitions.zip ] || [ -f "$HOME/definitions.zip" ]; } || { warn "fetching WES-NG definitions"; "$WES" --update >/dev/null 2>&1 || warn "definition update failed"; }
   echo "Host,CVE,Severity,AffectedProduct,MissingKB,Title" > "$RAW/windows-cves.csv"
-  for f in "$RAW"/systeminfo/*.txt; do
-    [ -e "$f" ] || continue
-    h=$(basename "$f" .txt)
-    "$WES" "$f" -o "$RAW/wes/${h}.csv" >/dev/null 2>&1 || continue
-    if [ -s "$RAW/wes/${h}.csv" ]; then
-      tail -n +2 "$RAW/wes/${h}.csv" | awk -F',' -v H="$h" \
-        '{print H","$3","$7","$2","$8","$4}' >> "$RAW/windows-cves.csv" 2>/dev/null || true
-    fi
+  wr(){ "$WES" "$1" -o "$RAW/wes/$(basename "$1" .txt).csv" >/dev/null 2>&1; }
+  for f in "$RAW"/sysinfo/*.txt; do [ -e "$f" ] && pool wr "$f"; done
+  finish
+  for c in "$RAW"/wes/*.csv; do [ -e "$c" ] || continue
+    h=$(basename "$c" .csv)
+    tail -n +2 "$c" | awk -F',' -v H="$h" '{print H","$3","$7","$2","$8","$4}' >> "$RAW/windows-cves.csv" 2>/dev/null || true
   done
+  WIN_CVES=$(( $(wc -l < "$RAW/windows-cves.csv") - 1 )); [ "$WIN_CVES" -lt 0 ] && WIN_CVES=0
+  WIN_CRIT=$(grep -ci 'critical' "$RAW/windows-cves.csv" 2>/dev/null || echo 0)
+  grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/windows-cves.csv" 2>/dev/null | sort -u > "$RAW/cve-windows.txt" || true
+  info "windows CVEs $WIN_CVES   critical $WIN_CRIT"
+fi
+fi
 
-  WIN_CVE_TOTAL=$(( $(wc -l < "$RAW/windows-cves.csv") - 1 ))
-  [ "$WIN_CVE_TOTAL" -lt 0 ] && WIN_CVE_TOTAL=0
-  WIN_CVE_CRIT=$(grep -ci 'critical' "$RAW/windows-cves.csv" 2>/dev/null || echo 0)
-  info "    Windows CVEs: $WIN_CVE_TOTAL   critical: $WIN_CVE_CRIT"
+# =====================================================================
+#  Stage 9  Linux
+# =====================================================================
+step "Stage 9  Linux authenticated collection"
+LINUX_OK=0; LINUX_EOL=0
+if [ "$SSH_ON" -eq 1 ]; then
+  nxc ssh "$RAW/live.txt" -u "$SU" -p "$SP" --continue-on-success -t "$NXC_THREADS" > "$RAW/auth-ssh.txt" 2>&1
+  grep '\[+\]' "$RAW/auth-ssh.txt" | awk '{print $2}' | sort -uV > "$RAW/ssh-ok.txt" || : > "$RAW/ssh-ok.txt"
+  lg(){ nxc ssh "$1" -u "$SU" -p "$SP" -x 'cat /etc/os-release 2>/dev/null; echo ---KERNEL---; uname -r; echo ---SUDO---; sudo -n -l 2>/dev/null; echo ---SUID---; find / -perm -4000 -type f 2>/dev/null | head -40; echo ---PKGS---; (dpkg -l 2>/dev/null || rpm -qa 2>/dev/null)' 2>/dev/null > "$RAW/linux/$1.txt"; }
+  while read -r h; do [ -n "$h" ] && pool lg "$h"; done < "$RAW/ssh-ok.txt"
+  finish
+  LINUX_OK=$(ls -1 "$RAW"/linux/*.txt 2>/dev/null | wc -l)
+  grep -lriE 'VERSION_ID="?(1[0-8]\.|6|7)' "$RAW"/linux/ 2>/dev/null > "$RAW/linux-eol.txt" || : > "$RAW/linux-eol.txt"
+  LINUX_EOL=$(cnt "$RAW/linux-eol.txt")
+  info "linux collected $LINUX_OK   possible EOL $LINUX_EOL"
 else
-  warn "    skipped, no systeminfo output available"
+  warn "no SSH credentials, Linux hosts assessed unauthenticated only"
 fi
 
-# ---------------------------------------------------------------
-# 7. Network service CVE mapping
-# ---------------------------------------------------------------
-info "Stage 5/8  Service version scan and CVE mapping ($SERVICE_CVE_ENGINE)"
-SVC_CVE_COUNT=0
-if [ "$LIVE_COUNT" -gt 0 ]; then
-  if [ "$SERVICE_CVE_ENGINE" = "vulners" ]; then
-    nmap -sV -Pn --script vulners --script-args "mincvss=$MIN_CVSS" \
-         -iL "$RAW/live.txt" -oN "$RAW/service-cves.txt" >/dev/null 2>&1
+# =====================================================================
+#  Stage 10  TLS, SNMP, web
+# =====================================================================
+step "Stage 10  TLS, SNMP and web"
+awk '{split($2,p,","); for(i in p) if(p[i]=="443"||p[i]=="8443"||p[i]=="636"||p[i]=="993"||p[i]=="995"||p[i]=="3389") print $1":"p[i]}' \
+    "$RAW/ports/map.txt" 2>/dev/null | sort -u > "$RAW/tls-endpoints.txt" || : > "$RAW/tls-endpoints.txt"
+TLSN=$(cnt "$RAW/tls-endpoints.txt"); TLS_ISSUES=0
+if [ "$TLSN" -gt 0 ]; then
+  if [ "$HAVE_TESTSSL" -eq 1 ]; then
+    tl(){ testssl.sh --quiet --color 0 --severity MEDIUM --sneaky "$1" > "$RAW/tls/$(echo "$1"|tr ':' '_').txt" 2>&1 || true; }
+    while read -r e; do [ -n "$e" ] && pool tl "$e"; done < "$RAW/tls-endpoints.txt"
+    finish
+    TLS_ISSUES=$(grep -rhE 'VULNERABLE|NOT ok' "$RAW/tls/" 2>/dev/null | wc -l)
   else
-    nmap -sV -Pn --script vulscan/vulscan.nse --script-args vulscandb=cve.csv \
-         -iL "$RAW/live.txt" -oN "$RAW/service-cves.txt" >/dev/null 2>&1
-  fi
-  grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/service-cves.txt" 2>/dev/null | sort -u > "$RAW/service-cve-list.txt" || true
-  SVC_CVE_COUNT=$(wc -l < "$RAW/service-cve-list.txt" 2>/dev/null || echo 0)
-  info "    unique service CVEs: $SVC_CVE_COUNT"
-fi
-
-# ---------------------------------------------------------------
-# 8. Configuration inventory
-# ---------------------------------------------------------------
-info "Stage 6/8  Configuration inventory"
-nxc smb "$TARGETS" -u "$USER" -p "$PASS" --pass-pol > "$RAW/password-policy.txt" 2>&1
-nxc smb "$TARGETS" -u "$USER" -p "$PASS" --local-groups Administrators > "$RAW/local-admins.txt" 2>&1
-nxc smb "$TARGETS" -u "$USER" -p "$PASS" --shares > "$RAW/shares.txt" 2>&1
-
-# ---------------------------------------------------------------
-# 9. SMB security posture
-# ---------------------------------------------------------------
-info "Stage 7/8  SMB signing and protocol"
-if [ "$LIVE_COUNT" -gt 0 ]; then
-  nmap -Pn -p445 --script smb-protocols,smb-security-mode,smb2-security-mode \
-       -iL "$RAW/live.txt" -oN "$RAW/smb-security.txt" >/dev/null 2>&1
-fi
-grep -oP 'signing:\w+' "$RAW/auth-status.txt" 2>/dev/null | sort | uniq -c > "$RAW/signing-summary.txt" || true
-NO_SIGNING=$(grep -c 'signing:False' "$RAW/auth-status.txt" 2>/dev/null || echo 0)
-
-# ---------------------------------------------------------------
-# 10. Web layer
-# ---------------------------------------------------------------
-info "Stage 8/8  Web discovery and nuclei"
-WEB_COUNT=0
-NUC_CRIT=0; NUC_HIGH=0; NUC_MED=0
-if [ "$LIVE_COUNT" -gt 0 ]; then
-  nmap -Pn -p80,443,8000,8080,8443,9443 --open -iL "$RAW/live.txt" \
-       -oG "$RAW/web.gnmap" >/dev/null 2>&1
-  awk '/Ports:/{print $2}' "$RAW/web.gnmap" | sort -u > "$RAW/web-hosts.txt"
-  WEB_COUNT=$(wc -l < "$RAW/web-hosts.txt")
-  info "    web hosts: $WEB_COUNT"
-  if [ "$WEB_COUNT" -gt 0 ]; then
-    nuclei -l "$RAW/web-hosts.txt" -severity critical,high,medium \
-           -j -o "$RAW/nuclei.json" -rl 50 -c 20 -silent >/dev/null 2>&1 || true
-    if [ -s "$RAW/nuclei.json" ]; then
-      NUC_CRIT=$(jq -r 'select(.info.severity=="critical")|.host' "$RAW/nuclei.json" 2>/dev/null | wc -l)
-      NUC_HIGH=$(jq -r 'select(.info.severity=="high")|.host' "$RAW/nuclei.json" 2>/dev/null | wc -l)
-      NUC_MED=$(jq -r 'select(.info.severity=="medium")|.host' "$RAW/nuclei.json" 2>/dev/null | wc -l)
-      jq -r '.info.reference[]? | select(test("CVE-"))' "$RAW/nuclei.json" 2>/dev/null \
-        | grep -oE 'CVE-[0-9]{4}-[0-9]+' | sort -u > "$RAW/web-cve-list.txt" || true
-    fi
+    nmap -Pn -n --script ssl-enum-ciphers,ssl-cert,ssl-dh-params,sslv2,ssl-heartbleed,ssl-poodle,ssl-ccs-injection,rdp-enum-encryption \
+         -p 443,8443,636,993,995,3389 -iL "$RAW/live.txt" -oN "$RAW/tls/nmap-ssl.txt" >/dev/null 2>&1
+    TLS_ISSUES=$(grep -cE 'VULNERABLE|SSLv2|SSLv3|TLSv1\.0|weak' "$RAW/tls/nmap-ssl.txt" 2>/dev/null || echo 0)
   fi
 fi
+SNMPN=0
+if [ "$HAVE_SNMP" -eq 1 ]; then
+  printf 'public\nprivate\ncisco\nmanager\nadmin\ncommunity\nsecret\n' > "$RAW/snmp-strings.txt"
+  onesixtyone -c "$RAW/snmp-strings.txt" -i "$RAW/live.txt" > "$RAW/snmp.txt" 2>&1 || true
+  SNMPN=$(grep -c '^\[' "$RAW/snmp.txt" 2>/dev/null || echo 0)
+fi
+awk '{split($2,p,","); for(i in p) if(p[i]=="80"||p[i]=="443"||p[i]=="8000"||p[i]=="8080"||p[i]=="8443"||p[i]=="9443"){print $1; break}}' \
+    "$RAW/ports/map.txt" 2>/dev/null | sort -u > "$RAW/web-hosts.txt" || : > "$RAW/web-hosts.txt"
+WEBN=$(cnt "$RAW/web-hosts.txt"); NC=0; NH=0; NM=0; NL=0; : > "$RAW/cve-web.txt"
+if [ "$WEBN" -gt 0 ]; then
+  nuclei -l "$RAW/web-hosts.txt" -severity critical,high,medium,low -j -o "$RAW/nuclei.json" \
+         -rl 100 -c "$JOBS" -silent >/dev/null 2>&1 || true
+  if [ -s "$RAW/nuclei.json" ]; then
+    NC=$(jq -r 'select(.info.severity=="critical")|.host' "$RAW/nuclei.json" 2>/dev/null | wc -l)
+    NH=$(jq -r 'select(.info.severity=="high")|.host'     "$RAW/nuclei.json" 2>/dev/null | wc -l)
+    NM=$(jq -r 'select(.info.severity=="medium")|.host'   "$RAW/nuclei.json" 2>/dev/null | wc -l)
+    NL=$(jq -r 'select(.info.severity=="low")|.host'      "$RAW/nuclei.json" 2>/dev/null | wc -l)
+    jq -r '.info.reference[]?' "$RAW/nuclei.json" 2>/dev/null | grep -oE 'CVE-[0-9]{4}-[0-9]+' | sort -u > "$RAW/cve-web.txt" || true
+  fi
+fi
+info "tls $TLSN endpoints / $TLS_ISSUES issues   snmp $SNMPN   web $WEBN hosts  C:$NC H:$NH M:$NM"
 
-# ---------------------------------------------------------------
-# 11. Report
-# ---------------------------------------------------------------
-info "Building $MD"
+# =====================================================================
+#  Correlation
+# =====================================================================
+step "Correlation and scoring"
+cat "$RAW"/cve-*.txt 2>/dev/null | grep -E '^CVE-' | sort -u > "$RAW/cve-all.txt" || : > "$RAW/cve-all.txt"
+ALL_CVES=$(cnt "$RAW/cve-all.txt")
+KEV_HITS=0; : > "$RAW/cve-kev.txt"
+if [ "$KEV_OK" -eq 1 ] && [ -s "$RAW/cve-all.txt" ]; then
+  comm -12 "$RAW/cve-all.txt" "$RAW/kev-all.txt" > "$RAW/cve-kev.txt" 2>/dev/null || true
+  KEV_HITS=$(cnt "$RAW/cve-kev.txt")
+  [ "$KEV_HITS" -gt 0 ] && warn "CVEs on the CISA actively exploited list: $KEV_HITS"
+fi
 
-TOTAL_CVES=$(( WIN_CVE_TOTAL + SVC_CVE_COUNT ))
-WEB_CVE_COUNT=$(wc -l < "$RAW/web-cve-list.txt" 2>/dev/null || echo 0)
+: > "$RAW/risk-scores.txt"
+while read -r ip _; do
+  [ -z "$ip" ] && continue; s=0
+  s=$((s + $(grep -c "^$ip," "$RAW/windows-cves.csv" 2>/dev/null || echo 0) * 2))
+  if [ -s "$NVT_CSV" ]; then
+    s=$((s + $(awk -F'","' -v I="$ip" 'NR>1{gsub(/^"/,"",$1); if($1==I && tolower($6)~/high/) c++} END{print c+0}' "$NVT_CSV") * 60))
+    s=$((s + $(awk -F'","' -v I="$ip" 'NR>1{gsub(/^"/,"",$1); if($1==I && tolower($6)~/medium/) c++} END{print c+0}' "$NVT_CSV") * 15))
+  fi
+  grep -q "$ip" "$RAW/vuln-detail.txt" 2>/dev/null && s=$((s+300))
+  grep -q "$ip.*signing:False" "$RAW/auth-smb.txt" 2>/dev/null && s=$((s+80))
+  grep -q "$ip.*SMBv1:True"    "$RAW/auth-smb.txt" 2>/dev/null && s=$((s+120))
+  grep -q "$ip" "$RAW/null-session.txt" 2>/dev/null && s=$((s+60))
+  grep -q "$ip" "$RAW/eol-os.txt" 2>/dev/null && s=$((s+200))
+  s=$((s + $(grep -ciE 'VULNERABLE' "$RAW/nse/${ip}.txt" 2>/dev/null || echo 0) * 40))
+  s=$((s + $(jq -r --arg h "$ip" 'select(.host|test($h))|select(.info.severity=="critical" or .info.severity=="high")|.host' "$RAW/nuclei.json" 2>/dev/null | wc -l) * 50))
+  [ "$s" -gt 1000 ] && s=1000
+  [ "$s" -gt 0 ] && echo "$s $ip" >> "$RAW/risk-scores.txt"
+done < "$RAW/ports/map.txt"
+sort -rn "$RAW/risk-scores.txt" -o "$RAW/risk-scores.txt" 2>/dev/null || true
 
+: > "$RAW/attack-paths.txt"
+[ "$NOSIGN" -gt 0 ] && [ "$AUTH_OK" -gt 0 ] && echo "NTLM relay: $NOSIGN host(s) without SMB signing plus working domain credentials allows relay to those hosts." >> "$RAW/attack-paths.txt"
+[ "$KERB_H" -gt 0 ]   && echo "Kerberoasting: $KERB_H service ticket(s) retrievable for offline cracking." >> "$RAW/attack-paths.txt"
+[ "$ASREP_H" -gt 0 ]  && echo "AS-REP roasting: $ASREP_H account(s) without Kerberos pre-authentication." >> "$RAW/attack-paths.txt"
+[ "$ADCS_H" -gt 0 ]   && echo "ADCS: certificate template or CA misconfiguration, review for ESC1 to ESC8 escalation." >> "$RAW/attack-paths.txt"
+[ "$GPP" -gt 0 ]      && echo "Group Policy Preferences: credentials recoverable from SYSVOL, decryptable with the public Microsoft key." >> "$RAW/attack-paths.txt"
+[ "$WRITABLE" -gt 0 ] && [ "$NOSIGN" -gt 0 ] && echo "Writable share plus unsigned SMB: enables SCF or LNK planting to coerce authentication." >> "$RAW/attack-paths.txt"
+[ "$LDAPSIGN" -gt 0 ] && echo "LDAP signing or channel binding not enforced: relay to LDAP enables domain object modification." >> "$RAW/attack-paths.txt"
+[ "$MOD_VULN" -gt 0 ] && echo "Confirmed exploitable services identified by module checks, see the exploit module section." >> "$RAW/attack-paths.txt"
+PATHS=$(cnt "$RAW/attack-paths.txt")
+
+T1=$(date +%s); MINS=$(( (T1-T0)/60 ))
+APCT=0; SPCT=0; NVT_APCT=0
+[ "$LIVE" -gt 0 ] && { APCT=$(( AUTH_OK*100/LIVE )); SPCT=$(( SYSOK*100/LIVE )); }
+[ "$NVT_HOSTS_F" -gt 0 ] && NVT_APCT=$(( NVT_AUTH_HOSTS*100/NVT_HOSTS_F ))
+
+# =====================================================================
+#  Report
+# =====================================================================
+step "Building report"
 {
 echo "# Authenticated Vulnerability Assessment"
 echo
 echo "**Generated:** $STAMP  "
-echo "**Credentials:** $CRED_LABEL  "
-echo "**Raw evidence:** \`$RAW/\`"
+echo "**Runtime:** ${MINS} minutes  "
+echo "**Engine:** \`$ENGINE\`$([ "$RUN_NVT" -eq 1 ] && echo "  (Greenbone $NVT_FILES NVTs, $CFG_NAME)")  "
+echo "**Profile:** \`$PROFILE\` ($PORTSPEC, $JOBS workers)  "
+echo "**Windows credentials:** $CREDLBL  "
+echo "**Linux credentials:** $([ "$SSH_ON" -eq 1 ] && echo supplied || echo "not supplied")  "
+echo "**Evidence:** \`$RAW/\`"
 echo
 echo "---"
 echo
-echo "## Coverage"
+echo "## 1. Executive Summary"
 echo
-echo "| Metric | Count |"
+echo "| | |"
 echo "| --- | --- |"
-echo "| Targets supplied | $TARGET_COUNT |"
-echo "| Responded to discovery | $LIVE_COUNT |"
-echo "| SMB authentication succeeded | $AUTH_OK |"
-echo "| SMB authentication failed | $AUTH_FAIL |"
-echo "| systeminfo collected | $SYSINFO_OK |"
-echo "| Web services found | $WEB_COUNT |"
+echo "| Hosts in scope | $NTARGETS |"
+echo "| Hosts responding | $LIVE |"
+echo "| SMB authenticated | $AUTH_OK (${APCT}% of live) |"
+[ "$RUN_NVT" -eq 1 ] && echo "| **NVT authenticated checks** | **$NVT_AUTH_HOSTS of $NVT_HOSTS_F hosts (${NVT_APCT}%)** |"
+[ "$RUN_SA" -eq 1 ]  && echo "| Patch level collected | $SYSOK (${SPCT}% of live) |"
+[ "$RUN_NVT" -eq 1 ] && echo "| NVT findings | high $NVT_HIGH, medium $NVT_MED, low $NVT_LOW |"
+echo "| Unique CVEs | $ALL_CVES |"
+echo "| **Actively exploited (CISA KEV)** | **$KEV_HITS** |"
+echo "| Confirmed exploitable services | $MOD_VULN |"
+echo "| Attack paths identified | $PATHS |"
 echo
-
-if [ "$LIVE_COUNT" -gt 0 ]; then
-  PCT=$(( AUTH_OK * 100 / LIVE_COUNT ))
-  SPCT=$(( SYSINFO_OK * 100 / LIVE_COUNT ))
-  echo "**Authenticated coverage: ${PCT}% of live hosts. Patch-level data: ${SPCT}%.**"
+COVER_PCT=$([ "$RUN_NVT" -eq 1 ] && echo "$NVT_APCT" || echo "$SPCT")
+if [ "$COVER_PCT" -lt 80 ]; then
+  echo "> **Coverage warning.** Authenticated assessment reached ${COVER_PCT}% of hosts."
+  echo "> Patch level was not verified on the remainder. Resolve before this is"
+  echo "> treated as a complete authenticated assessment."
   echo
-  if [ "$SPCT" -lt 80 ]; then
-    echo "> Patch-level coverage is below 80%. Windows CVE results below reflect only"
-    echo "> the $SYSINFO_OK host(s) where systeminfo was collected. The remaining hosts"
-    echo "> have not been assessed at patch level and must be resolved before these"
-    echo "> results are treated as representative of the estate."
-    echo
-  fi
 fi
+if [ "$PATHS" -gt 0 ]; then
+  echo "### Attack paths"; echo
+  while read -r l; do [ -n "$l" ] && echo "- $l"; done < "$RAW/attack-paths.txt"; echo
+fi
+if [ "$KEV_HITS" -gt 0 ]; then
+  echo "### Actively exploited CVEs, remediate first"; echo
+  echo '```'; cat "$RAW/cve-kev.txt"; echo '```'; echo
+fi
+echo "### Highest risk hosts"; echo
+if [ -s "$RAW/risk-scores.txt" ]; then
+  echo "| Risk | Host |"; echo "| --- | --- |"
+  head -20 "$RAW/risk-scores.txt" | while read -r s h; do echo "| $s / 1000 | $h |"; done
+else echo "_No scored hosts._"; fi
+echo
 
-echo "---"
-echo
-echo "## CVE Summary"
-echo
-echo "| Source | Method | CVEs |"
+echo "---"; echo
+echo "## 2. Assessment Coverage"; echo
+echo "| Check | Method | Result |"
 echo "| --- | --- | --- |"
-echo "| Windows patch level | WES-NG against MSRC data | $WIN_CVE_TOTAL |"
-echo "| Network services | nmap $SERVICE_CVE_ENGINE, min CVSS $MIN_CVSS | $SVC_CVE_COUNT |"
-echo "| Web applications | nuclei templates | $WEB_CVE_COUNT |"
-echo "| **Total** | | **$(( TOTAL_CVES + WEB_CVE_COUNT ))** |"
+[ "$RUN_NVT" -eq 1 ] && echo "| Full NVT scan | Greenbone $NVT_FILES scripts | $NVT_ROWS findings, $NVT_CVES CVEs |"
+[ "$RUN_SA" -eq 1 ]  && echo "| Windows patch level | WES-NG vs MSRC | $WIN_CVES CVEs, $WIN_CRIT critical |"
+[ "$RUN_SA" -eq 1 ]  && echo "| NSE vulnerability scripts | nmap \`$NSE_SET\` | $NSE_HITS vulnerable states |"
+[ "$RUN_SA" -eq 1 ]  && echo "| Service version CVEs | nmap $SVC_CVE | $SVC_CVES CVEs |"
+[ "$SPLOIT" -gt 0 ]  && echo "| Public exploits | searchsploit | $SPLOIT matches |"
+echo "| Windows exploit modules | NetExec, 9 modules | $MOD_VULN vulnerable |"
+echo "| ADCS | NetExec adcs | $ADCS_H findings |"
+echo "| Kerberoasting | NetExec | $KERB_H accounts |"
+echo "| AS-REP roasting | NetExec | $ASREP_H accounts |"
+echo "| Delegation | NetExec | $DELEG_H findings |"
+echo "| LDAP signing | NetExec ldap-checker | $LDAPSIGN findings |"
+echo "| SMB signing | NetExec | $NOSIGN unsigned |"
+echo "| SMBv1 | NetExec | $SMBV1 hosts |"
+echo "| Null sessions | NetExec | $NULLS hosts |"
+echo "| GPP credentials | NetExec | $GPP findings |"
+echo "| Config baseline | NetExec wcc | $WCC_FAIL failures |"
+echo "| Writable shares | NetExec | $WRITABLE |"
+echo "| TLS | $([ "$HAVE_TESTSSL" -eq 1 ] && echo testssl.sh || echo "nmap ssl scripts") | $TLS_ISSUES issues, $TLSN endpoints |"
+echo "| Web applications | nuclei | C:$NC H:$NH M:$NM L:$NL |"
+echo "| SNMP | onesixtyone | $SNMPN default strings |"
+echo "| End of life OS | nmap fingerprint | $EOL windows, $LINUX_EOL linux |"
+echo "| Linux inventory | SSH | $LINUX_OK hosts |"
 echo
-echo "> Validation note: WES-NG infers missing patches from the installed hotfix"
-echo "> list and does not fully model cumulative update supersedence. Fully patched"
-echo "> hosts can still be reported as vulnerable. Verify each finding against the"
-echo "> host's build and UBR before it goes into a client report."
-echo
+[ "$RUN_SA" -eq 1 ] && { echo "> **Validation note.** WES-NG infers missing patches from the installed hotfix"; \
+  echo "> list and does not fully model cumulative update supersedence. Fully patched"; \
+  echo "> hosts can be reported as vulnerable. Validate against build and UBR."; echo; }
 
-echo "---"
-echo
-echo "## Windows Patch-Level CVEs"
-echo
-if [ "$WIN_CVE_TOTAL" -gt 0 ]; then
-  echo "Critical severity, first 60 rows. Full set in \`$RAW/windows-cves.csv\`."
-  echo
-  echo '```'
-  head -1 "$RAW/windows-cves.csv"
-  grep -i 'critical' "$RAW/windows-cves.csv" | head -60
-  echo '```'
-  echo
-  echo "Most affected hosts:"
-  echo
-  echo '```'
-  tail -n +2 "$RAW/windows-cves.csv" | cut -d',' -f1 | sort | uniq -c | sort -rn | head -20
-  echo '```'
-else
-  echo "_No data. Either no hosts authenticated, or systeminfo execution was blocked._"
+if [ "$RUN_NVT" -eq 1 ] && [ -s "$NVT_CSV" ]; then
+echo "---"; echo
+echo "## 3. NVT Findings"; echo
+echo "### High severity"; echo
+echo '```'
+awk -F'","' 'NR>1 && tolower($6) ~ /high/ {gsub(/^"/,"",$1); printf "%-16s %-10s %-6s %s\n",$1,$3,$5,substr($9,1,78)}' "$NVT_CSV" 2>/dev/null | head -120
+echo '```'; echo
+echo "### Medium severity"; echo
+echo '```'
+awk -F'","' 'NR>1 && tolower($6) ~ /medium/ {gsub(/^"/,"",$1); printf "%-16s %-10s %-6s %s\n",$1,$3,$5,substr($9,1,78)}' "$NVT_CSV" 2>/dev/null | head -100
+echo '```'; echo
+echo "### Findings per host"; echo
+echo '```'
+awk -F'","' 'NR>1{gsub(/^"/,"",$1); if(tolower($6)~/high|medium/) print $1}' "$NVT_CSV" 2>/dev/null | sort | uniq -c | sort -rn | head -40
+echo '```'; echo
+echo "### Detection method breakdown"; echo
+echo "How each finding was actually determined. Authenticated checks are the ones that verify patch level."; echo
+echo '```'
+grep -oE 'Detection Reliability: [^"]*' "$NVT_CSV" 2>/dev/null | sort | uniq -c | sort -rn | head -12
+echo '```'; echo
+echo "### Hosts with authenticated checks"; echo
+echo '```'; [ -s "$RAW/nvt/authenticated-hosts.txt" ] && cat "$RAW/nvt/authenticated-hosts.txt" || echo "None. Credentials did not take effect."; echo '```'; echo
+echo "### Hosts assessed unauthenticated only"; echo
+echo "Patch level unverified on these."; echo
+echo '```'; [ -s "$RAW/nvt/unauth-hosts.txt" ] && head -80 "$RAW/nvt/unauth-hosts.txt" || echo "None"; echo '```'; echo
+echo "### Top NVTs by frequency"; echo
+echo '```'
+awk -F'","' 'NR>1 && tolower($6)~/high|medium/{print substr($9,1,70)}' "$NVT_CSV" 2>/dev/null | sort | uniq -c | sort -rn | head -40
+echo '```'; echo
 fi
-echo
 
-echo "## Network Service CVEs"
+if [ "$RUN_SA" -eq 1 ]; then
+echo "---"; echo
+echo "## 3B. Windows Patch Level"; echo
+if [ "$WIN_CVES" -gt 0 ]; then
+  echo "### CVE count by host"; echo
+  echo '```'; tail -n +2 "$RAW/windows-cves.csv" | cut -d',' -f1 | sort | uniq -c | sort -rn | head -40; echo '```'; echo
+  echo "### Critical severity"; echo
+  echo '```'; head -1 "$RAW/windows-cves.csv"; grep -i critical "$RAW/windows-cves.csv" | head -50; echo '```'
+else echo "_No data. No hosts authenticated, or remote command execution was blocked._"; fi
 echo
-if [ "$SVC_CVE_COUNT" -gt 0 ]; then
-  echo '```'
-  grep -B3 'CVE-' "$RAW/service-cves.txt" 2>/dev/null | head -80
-  echo '```'
-else
-  echo "_No service-level CVEs above CVSS $MIN_CVSS._"
+echo "## 3C. NSE Vulnerability Findings"; echo
+if [ "$NSE_HITS" -gt 0 ]; then echo '```'; grep -B6 'VULNERABLE' "$RAW/nse-all.txt" 2>/dev/null | head -150; echo '```'
+else echo "_No NSE script reported a vulnerable state._"; fi
+echo
+if [ "$SPLOIT" -gt 0 ]; then echo "### Public exploits"; echo; echo '```'; head -60 "$RAW/searchsploit.txt"; echo '```'; echo; fi
 fi
+
+echo "---"; echo
+echo "## 4. Confirmed Exploitable"; echo
+if [ -s "$RAW/vuln-summary.txt" ]; then
+  echo '```'; cat "$RAW/vuln-summary.txt"; echo '```'; echo
+  echo '```'; head -80 "$RAW/vuln-detail.txt"; echo '```'
+else echo "_No hosts flagged by ms17-010, zerologon, petitpotam, nopac, smbghost, printnightmare, spooler, webdav or coerce_plus._"; fi
 echo
 
-echo "## Web Application Findings"
-echo
-echo "| Severity | Count |"
-echo "| --- | --- |"
-echo "| Critical | $NUC_CRIT |"
-echo "| High | $NUC_HIGH |"
-echo "| Medium | $NUC_MED |"
-echo
+echo "## 5. Active Directory"; echo
+echo "### ADCS"; echo '```'; head -40 "$RAW/ad/adcs.txt" 2>/dev/null || echo "No data"; echo '```'; echo
+echo "### Kerberoastable accounts"; echo '```'; grep -iE 'krb5tgs|sAMAccountName|\[\+\]' "$RAW/ad/kerberoast.txt" 2>/dev/null | head -30 || echo "None"; echo '```'; echo
+echo "### AS-REP roastable accounts"; echo '```'; grep -iE 'krb5asrep|\[\+\]' "$RAW/ad/asreproast.txt" 2>/dev/null | head -30 || echo "None"; echo '```'; echo
+echo "### Delegation"; echo '```'; head -30 "$RAW/ad/delegation.txt" 2>/dev/null || echo "No data"; echo '```'; echo
+echo "### LDAP signing and channel binding"; echo '```'; head -30 "$RAW/ad/ldap-signing.txt" 2>/dev/null || echo "No data"; echo '```'; echo
+echo "### Machine account quota"; echo '```'; grep -i quota "$RAW/ad/machine-quota.txt" 2>/dev/null | head -10 || echo "No data"; echo '```'; echo
+echo "### Password not required"; echo '```'; head -20 "$RAW/ad/pwd-not-required.txt" 2>/dev/null || echo "None"; echo '```'; echo
+echo "### Credentials in user descriptions"; echo '```'; grep -iE 'pass|pwd' "$RAW/ad/user-descriptions.txt" 2>/dev/null | head -20 || echo "None"; echo '```'; echo
+
+echo "## 6. TLS"; echo
+echo '```'
+if [ "$HAVE_TESTSSL" -eq 1 ]; then grep -rhE 'VULNERABLE|NOT ok' "$RAW/tls/" 2>/dev/null | sort | uniq -c | sort -rn | head -60 || echo "No issues"
+else grep -E 'VULNERABLE|SSLv2|SSLv3|TLSv1\.0|weak|expired' "$RAW/tls/nmap-ssl.txt" 2>/dev/null | head -60 || echo "No issues"; fi
+echo '```'; echo
+
+echo "## 7. Web Applications"; echo
+echo "| Severity | Count |"; echo "| --- | --- |"
+echo "| Critical | $NC |"; echo "| High | $NH |"; echo "| Medium | $NM |"; echo "| Low | $NL |"; echo
 if [ -s "$RAW/nuclei.json" ]; then
   echo '```'
-  jq -r 'select(.info.severity=="critical" or .info.severity=="high")
-         | "\(.info.severity|ascii_upcase)  \(.host)  \(.info.name)"' \
-     "$RAW/nuclei.json" 2>/dev/null | head -60
+  jq -r 'select(.info.severity=="critical" or .info.severity=="high" or .info.severity=="medium")|"\(.info.severity|ascii_upcase)  \(.host)  \(.info.name)"' "$RAW/nuclei.json" 2>/dev/null | head -100
   echo '```'
-else
-  echo "_No web findings, or no web services in scope._"
-fi
+else echo "_No web findings._"; fi
 echo
 
-echo "---"
-echo
-echo "## SMB Signing"
-echo
-echo "Hosts without required SMB signing are exposed to NTLM relay: **$NO_SIGNING**"
-echo
-echo '```'
-grep 'signing:False' "$RAW/auth-status.txt" 2>/dev/null | awk '{print $2, $4}' | sort -u | head -60 || echo "None"
-echo '```'
-echo
+echo "---"; echo
+echo "## 8. Configuration"; echo
+echo "SMB signing not required: **$NOSIGN**  "
+echo "SMBv1 enabled: **$SMBV1**  "
+echo "Null sessions permitted: **$NULLS**  "
+echo "Writable shares: **$WRITABLE**"; echo
+echo "### Hosts without SMB signing"; echo
+echo '```'; grep 'signing:False' "$RAW/auth-smb.txt" 2>/dev/null | awk '{print $2,$4}' | sort -u | head -60 || echo "None"; echo '```'; echo
+echo "### Configuration baseline failures"; echo '```'; head -100 "$RAW/config-check.txt" 2>/dev/null || echo "No data"; echo '```'; echo
+echo "### Group Policy credential exposure"; echo '```'; grep -iE 'password|username' "$RAW/gpp-password.txt" "$RAW/gpp-autologin.txt" 2>/dev/null | head -30 || echo "None"; echo '```'; echo
+echo "### Writable shares"; echo '```'; grep -i 'READ,WRITE' "$RAW/shares.txt" 2>/dev/null | head -60 || echo "None"; echo '```'; echo
+echo "### Password policy"; echo '```'; head -60 "$RAW/password-policy.txt" 2>/dev/null; echo '```'; echo
+echo "### Local administrators"; echo '```'; head -80 "$RAW/local-admins.txt" 2>/dev/null; echo '```'; echo
+echo "### Endpoint protection"; echo '```'; head -60 "$RAW/endpoint-protection.txt" 2>/dev/null; echo '```'; echo
 
-echo "## Authentication Failed"
-echo
+echo "## 9. End of Life Systems"; echo
+echo "### Windows"; echo '```'; [ -s "$RAW/eol-os.txt" ] && cat "$RAW/eol-os.txt" || echo "None detected"; echo '```'; echo
+echo "### Linux"; echo '```'; [ -s "$RAW/linux-eol.txt" ] && cat "$RAW/linux-eol.txt" || echo "None detected"; echo '```'; echo
+
+echo "## 10. Other Protocols"; echo
+echo "MSSQL authenticated: **$MSSQL_OK**  "
+echo "WinRM authenticated: **$WINRM_OK**  "
+echo "SNMP default strings: **$SNMPN**"; echo
+[ "$SNMPN" -gt 0 ] && { echo '```'; cat "$RAW/snmp.txt"; echo '```'; echo; }
+
+echo "---"; echo
+echo "## 11. Coverage Gaps"; echo
+echo "### SMB authentication failed"; echo
 if [ -s "$RAW/auth-fail.txt" ]; then
-  echo "These hosts have no patch-level assessment."
-  echo
-  echo '```'
-  cat "$RAW/auth-fail.txt"
-  echo '```'
-else
-  echo "_All reachable hosts authenticated._"
+  echo "No configuration or patch level assessment exists for these hosts."; echo
+  echo '```'; cat "$RAW/auth-fail.txt"; echo '```'
+else echo "_All reachable hosts authenticated._"; fi
+echo
+if [ "$RUN_SA" -eq 1 ] && [ "$AUTH_OK" -gt "$SYSOK" ]; then
+  echo "### Authenticated but command execution blocked"; echo
+  echo "$(( AUTH_OK - SYSOK )) host(s) authenticated but returned no systeminfo, likely EDR or policy restriction. Configuration data exists for them, patch level does not."; echo
 fi
+echo "### No response to discovery"; echo
+if [ -s "$RAW/no-response.txt" ]; then echo '```'; cat "$RAW/no-response.txt"; echo '```'
+else echo "_All targets responded._"; fi
 echo
-
-echo "## No Response to Discovery"
-echo
-if [ -s "$RAW/no-response.txt" ]; then
-  echo '```'
-  cat "$RAW/no-response.txt"
-  echo '```'
-else
-  echo "_All targets responded._"
-fi
-echo
-
 if [ "$MULTI" -eq 1 ] && [ -s "$RAW/working-creds.txt" ]; then
-  echo "## Successful Credential Pairs"
-  echo
-  echo '```'
-  head -100 "$RAW/working-creds.txt"
-  echo '```'
-  echo
+  echo "### Successful credential pairs"; echo; echo '```'; head -100 "$RAW/working-creds.txt"; echo '```'; echo
 fi
 
-echo "## Password Policy"
-echo
-echo '```'
-head -60 "$RAW/password-policy.txt" 2>/dev/null || echo "No data"
-echo '```'
-echo
+echo "---"; echo
+echo "## 12. OS Inventory"; echo
+echo '```'; head -250 "$RAW/os-inventory.txt" 2>/dev/null; echo '```'; echo
 
-echo "## Local Administrators"
-echo
-echo '```'
-head -100 "$RAW/local-admins.txt" 2>/dev/null || echo "No data"
-echo '```'
-echo
-
-echo "## Shares"
-echo
-echo '```'
-head -100 "$RAW/shares.txt" 2>/dev/null || echo "No data"
-echo '```'
-echo
-
-echo "---"
-echo
-echo "## Evidence Files"
-echo
-echo "| File | Contents |"
-echo "| --- | --- |"
-echo "| \`$RAW/windows-cves.csv\` | Windows CVEs per host, WES-NG |"
-echo "| \`$RAW/wes/\` | Per host WES-NG output |"
-echo "| \`$RAW/systeminfo/\` | Raw systeminfo per host |"
-echo "| \`$RAW/service-cves.txt\` | nmap service CVE output |"
+echo "## 13. Evidence"; echo
+echo "| File | Contents |"; echo "| --- | --- |"
+echo "| \`$RAW/cve-all.txt\` | Every unique CVE, all sources |"
+echo "| \`$RAW/cve-kev.txt\` | CVEs on the CISA exploited list |"
+echo "| \`$RAW/risk-scores.txt\` | Per host risk score |"
+echo "| \`$RAW/attack-paths.txt\` | Correlated attack paths |"
+[ "$RUN_NVT" -eq 1 ] && echo "| \`$NVT_CSV\` | Greenbone CSV, all findings |"
+[ "$RUN_NVT" -eq 1 ] && echo "| \`$RAW/nvt/report-full.xml\` | Greenbone XML, every field |"
+[ "$RUN_NVT" -eq 1 ] && echo "| \`$RAW/nvt/authenticated-hosts.txt\` | Hosts where credentials took effect |"
+[ "$RUN_SA" -eq 1 ]  && echo "| \`$RAW/windows-cves.csv\` | WES-NG Windows CVEs per host |"
+[ "$RUN_SA" -eq 1 ]  && echo "| \`$RAW/sysinfo/\` | Raw systeminfo per host |"
+[ "$RUN_SA" -eq 1 ]  && echo "| \`$RAW/nse/\` | NSE output per host |"
+echo "| \`$RAW/mods/\` | Exploit module output |"
+echo "| \`$RAW/ad/\` | Active Directory findings |"
+echo "| \`$RAW/linux/\` | Linux inventory per host |"
+echo "| \`$RAW/tls/\` | TLS assessment per endpoint |"
 echo "| \`$RAW/nuclei.json\` | Web findings, JSON |"
-echo "| \`$RAW/auth-status.txt\` | Per host authentication result |"
-echo "| \`$RAW/auth-fail.txt\` | Hosts that did not authenticate |"
-echo "| \`$RAW/no-response.txt\` | Targets with no response |"
-echo "| \`$RAW/smb-security.txt\` | SMB protocol and signing |"
-echo "| \`$RAW/password-policy.txt\` | Password policy |"
-echo "| \`$RAW/local-admins.txt\` | Local Administrators membership |"
-echo "| \`$RAW/shares.txt\` | Accessible shares |"
+echo "| \`$RAW/services.xml\` | Full nmap XML |"
+echo "| \`$RAW/ports/map.txt\` | Open ports per host |"
 echo
-echo "## Next Steps"
-echo
-echo "1. Validate Windows CVEs against host build and UBR before reporting."
-echo "2. Resolve authentication failures, those hosts are unassessed."
-echo "3. Confirm no-response hosts are genuinely out of service."
+echo "## 14. Recommended Order of Work"; echo
+N=1
+[ "$KEV_HITS" -gt 0 ]  && { echo "$N. Remediate the $KEV_HITS actively exploited CVEs."; N=$((N+1)); }
+[ "$MOD_VULN" -gt 0 ]  && { echo "$N. Patch the confirmed exploitable services."; N=$((N+1)); }
+[ "$PATHS" -gt 0 ]     && { echo "$N. Break the attack paths in section 1."; N=$((N+1)); }
+[ "$AUTH_FAIL" -gt 0 ] && { echo "$N. Resolve authentication on $AUTH_FAIL host(s), they are unassessed."; N=$((N+1)); }
+[ "$RUN_SA" -eq 1 ]    && { echo "$N. Validate WES-NG findings against build and UBR before reporting."; N=$((N+1)); }
+[ "$SSH_ON" -eq 0 ]    && echo "$N. Supply SSH credentials to assess Linux hosts at package level."
 echo
 } > "$MD"
 
 echo
-info "Done"
-echo "    Report: $MD"
-echo "    Raw:    $RAW/"
+info "complete in ${MINS} minutes"
+echo "    report   $MD"
+echo "    evidence $RAW/"
 echo
-echo "    Live $LIVE_COUNT/$TARGET_COUNT   Auth $AUTH_OK   Patch data $SYSINFO_OK"
-echo "    CVEs: windows $WIN_CVE_TOTAL   service $SVC_CVE_COUNT   web $WEB_CVE_COUNT"
+echo "    engine    $ENGINE"
+echo "    coverage  live $LIVE/$NTARGETS   smb-auth $AUTH_OK (${APCT}%)$([ "$RUN_NVT" -eq 1 ] && echo "   nvt-auth $NVT_AUTH_HOSTS/$NVT_HOSTS_F (${NVT_APCT}%)")$([ "$RUN_SA" -eq 1 ] && echo "   patch-data $SYSOK")"
+echo "    findings  cve $ALL_CVES   ${RED}kev $KEV_HITS${RST}   exploitable $MOD_VULN$([ "$RUN_NVT" -eq 1 ] && echo "   nvt high $NVT_HIGH med $NVT_MED")   web $((NC+NH+NM))   tls $TLS_ISSUES"
+echo "    ad        adcs $ADCS_H   kerberoast $KERB_H   asrep $ASREP_H   ldap-sign $LDAPSIGN"
+echo "    paths     $PATHS attack path(s)"
