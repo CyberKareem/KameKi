@@ -69,13 +69,37 @@ for f in "$TARGETS" "$USERFILE" "$PASSFILE"; do
   fi
 done
 
-USER=$(head -n1 "$USERFILE" | tr -d '\r\n')
-PASS=$(head -n1 "$PASSFILE" | tr -d '\r\n')
+USER_COUNT=$(grep -cve '^\s*$' "$USERFILE")
+PASS_COUNT=$(grep -cve '^\s*$' "$PASSFILE")
 TARGET_COUNT=$(grep -cve '^\s*$' "$TARGETS")
 
-if [ -z "$USER" ] || [ -z "$PASS" ]; then
+if [ "$USER_COUNT" -eq 0 ] || [ "$PASS_COUNT" -eq 0 ]; then
   err "user.txt or pass.txt is empty"
   exit 1
+fi
+
+# nxc takes files directly for multi-credential, or bare strings for single
+if [ "$USER_COUNT" -eq 1 ] && [ "$PASS_COUNT" -eq 1 ]; then
+  USER=$(head -n1 "$USERFILE" | tr -d '\r\n')
+  PASS=$(head -n1 "$PASSFILE" | tr -d '\r\n')
+  CRED_LABEL="$USER"
+  MULTI=0
+else
+  USER="$USERFILE"
+  PASS="$PASSFILE"
+  CRED_LABEL="$USER_COUNT user(s) x $PASS_COUNT password(s) from file"
+  MULTI=1
+  COMBOS=$(( USER_COUNT * PASS_COUNT ))
+  echo
+  warn "Multi-credential mode: $COMBOS combinations per host, $(( COMBOS * TARGET_COUNT )) total attempts."
+  warn "This is a password spray. It can lock out domain accounts and will trigger SOC alerts."
+  warn "Confirm this is covered by your rules of engagement and that the SOC has been notified."
+  read -rp "    Type YES to continue: " CONFIRM
+  if [ "$CONFIRM" != "YES" ]; then
+    err "Aborted."
+    exit 1
+  fi
+  echo
 fi
 
 # warn if credential files are world readable
@@ -89,7 +113,7 @@ done
 mkdir -p "$RAW"
 
 info "Targets: $TARGET_COUNT"
-info "User:    $USER"
+info "Creds:   $CRED_LABEL"
 info "Raw output: $RAW/"
 echo
 
@@ -114,7 +138,15 @@ nxc smb "$TARGETS" -u "$USER" -p "$PASS" --continue-on-success \
     > "$RAW/auth-status.txt" 2>&1
 
 grep '\[+\]' "$RAW/auth-status.txt" | awk '{print $2}' | sort -u > "$RAW/auth-ok.txt" || true
-grep '\[-\]' "$RAW/auth-status.txt" | awk '{print $2}' | sort -u > "$RAW/auth-fail.txt" || true
+# a host only counts as failed if it never succeeded with any credential
+grep '\[-\]' "$RAW/auth-status.txt" | awk '{print $2}' | sort -u > "$RAW/auth-fail-raw.txt" || true
+grep -vxFf "$RAW/auth-ok.txt" "$RAW/auth-fail-raw.txt" 2>/dev/null > "$RAW/auth-fail.txt" || \
+  cp "$RAW/auth-fail-raw.txt" "$RAW/auth-fail.txt" 2>/dev/null || true
+
+# which credential worked where
+grep '\[+\]' "$RAW/auth-status.txt" | sed -E 's/.*\[\+\][[:space:]]*//' \
+  | sort -u > "$RAW/working-creds.txt" || true
+
 AUTH_OK=$(wc -l < "$RAW/auth-ok.txt")
 AUTH_FAIL=$(wc -l < "$RAW/auth-fail.txt")
 info "    authenticated: $AUTH_OK   failed: $AUTH_FAIL"
@@ -193,7 +225,7 @@ fi
 echo "# Authenticated VA Inventory"
 echo
 echo "**Generated:** $STAMP  "
-echo "**Scan account:** \`$USER\`  "
+echo "**Credentials used:** $CRED_LABEL  "
 echo "**Raw evidence:** \`$RAW/\`"
 echo
 echo "> Scope note: this document is an asset, patch and configuration inventory"
@@ -226,6 +258,17 @@ if [ "$LIVE_COUNT" -gt 0 ]; then
     echo "> are treated as representative of the estate."
     echo
   fi
+fi
+
+if [ "$MULTI" -eq 1 ] && [ -s "$RAW/working-creds.txt" ]; then
+  echo "## Successful Credential Pairs"
+  echo
+  echo "Which account authenticated on which host."
+  echo
+  echo '```'
+  head -100 "$RAW/working-creds.txt"
+  echo '```'
+  echo
 fi
 
 echo "---"
