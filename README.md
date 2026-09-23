@@ -270,6 +270,67 @@ Environment variables, all optional.
 
 ---
 
+## Machine assisted analysis (optional)
+
+KameKi can annotate its findings with a language model through any
+OpenAI compatible `/v1/chat/completions` endpoint: Ollama, vLLM, LM Studio,
+llama.cpp server.
+
+```bash
+LLM_ENDPOINT=http://localhost:11434/v1 \
+LLM_MODEL=qwen2.5:72b \
+./kameki.sh run
+```
+
+It does three things:
+
+**False positive triage.** The highest value use. WES-NG does not model
+cumulative update supersedence, so fully patched hosts get flagged. The
+model reasons over the OS build, UBR and installed hotfix list, which no
+rule in the script can do, and classifies each claim as likely false
+positive, likely genuine, or uncertain.
+
+**Executive narrative.** Fed the metrics only, never raw findings, so the
+hallucination surface stays small. If authentication depth was low it is
+instructed to say so plainly rather than soften it.
+
+**Extended attack path analysis.** Chains beyond the rules hardcoded in the
+correlation stage.
+
+### Safety design
+
+These constraints are deliberate and not configurable away casually.
+
+**Local endpoints only, by default.** Scan output contains the client's
+internal addresses, hostnames, patch state and directory structure. Sending
+that to a third party processor is very likely outside your engagement
+terms. Non-private addresses are refused unless `LLM_ALLOW_EXTERNAL=1` is
+set explicitly, and the run warns loudly when it is.
+
+**The model cannot create findings.** Every prompt constrains output to
+identifiers supplied in the input, and the script validates the response
+against that input before using it. A CVE the model invents is discarded
+before it reaches the report.
+
+**The deterministic report comes first.** Sections 1 through 11 are produced
+without any model involvement and reproduce identically on a rerun. Model
+output is section 11B, separately marked, with a note that it does not
+reproduce. An auditor needs a report that regenerates the same way twice.
+
+**Responses are cached by content hash.** A rerun on the same data does not
+re-query and does not drift.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `LLM_ENDPOINT` | empty | OpenAI compatible base URL, empty disables the layer |
+| `LLM_MODEL` | empty | model identifier |
+| `LLM_KEY` | empty | bearer token, usually unused locally |
+| `LLM_ALLOW_EXTERNAL` | `0` | set to `1` to permit non-private endpoints |
+| `LLM_MAX_CALLS` | `60` | hard ceiling on requests per run |
+| `LLM_TIMEOUT` | `120` | per request timeout, seconds |
+
+---
+
 ## Output
 
 ```
