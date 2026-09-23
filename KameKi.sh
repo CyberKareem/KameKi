@@ -1,47 +1,46 @@
 #!/usr/bin/env bash
 #
-#  kameki.sh  -  Authenticated vulnerability assessment
+#  kameki.sh  -  Authenticated vulnerability assessment, self provisioning
 #
-#  Two detection engines, one report.
+#  Subcommands
+#    install            install every dependency (needs internet)
+#    install --bundle F install from an offline bundle (no internet)
+#    bundle             build an offline bundle at the office
+#    doctor             diagnose what is missing or broken, including auth
+#    preflight          test credential formats safely against one host
+#    run                run the assessment (default)
+#    cleanup            shred credentials and remove artifacts
 #
-#    nvt         drives the full Greenbone NVT feed (~100k scripts) over the
-#                gvmd socket. No web UI needed. Used automatically when the
-#                backend is present.
-#    standalone  WES-NG patch mapping, nmap NSE vuln scripts, service CVE
-#                mapping. Used when Greenbone is not installed.
+#  Engines
+#    nvt         full Greenbone NVT feed (~100k scripts) over the gvmd
+#                socket. No web UI. Used automatically when available.
+#    standalone  WES-NG patch mapping, nmap NSE, service CVE mapping.
 #
-#  On top of whichever engine runs, always:
-#    Active Directory assessment, configuration audit, TLS, web, SNMP,
-#    CISA KEV correlation, attack path derivation, per host risk scoring,
-#    and explicit authentication coverage reporting.
+#  On top of whichever engine runs, always: Active Directory assessment,
+#  configuration audit, TLS, web, SNMP, CISA KEV correlation, attack path
+#  derivation, risk scoring, and a self check on its own authentication
+#  depth.
 #
-#  Input files, current directory:
-#    targets.txt    one IP or hostname per line             required
-#    user.txt       Windows account(s)                      required
-#    pass.txt       password(s)                             required
-#    ssh-user.txt   Linux account                           optional
-#    ssh-pass.txt   Linux password                          optional
-#    gmp-user.txt   gvmd admin user                         nvt engine only
-#    gmp-pass.txt   gvmd admin password                     nvt engine only
-#
-#  Output:
-#    kameki-<date>.md      report
-#    kameki-raw-<date>/    evidence
-#
-#  Usage:
-#    ./kameki.sh                        auto engine, standard profile
-#    ENGINE=nvt ./kameki.sh             require Greenbone
-#    ENGINE=standalone ./kameki.sh      skip Greenbone
-#    ENGINE=both ./kameki.sh            run both, compare coverage
-#    PROFILE=deep JOBS=32 ./kameki.sh
-#    RESUME=1 ./kameki.sh               skip completed stages
-#    ./kameki.sh --setup                print Greenbone install steps
+#  Typical first use:
+#    ./kameki.sh install                   # at the office, with internet
+#    ./kameki.sh bundle                    # build the portable bundle
+#    # carry bundle to client, then on their machine:
+#    ./kameki.sh install --bundle kameki-bundle-*.tar.zst
+#    ./kameki.sh preflight                 # confirm credential format
+#    ./kameki.sh run
+#    ./kameki.sh cleanup                   # before you leave site
 #
 set -uo pipefail
 
-# =====================================================================
-#  Configuration
-# =====================================================================
+VERSION="2.0"
+DATE=$(date +%F)
+STAMP=$(date +"%Y-%m-%d %H:%M:%S %Z")
+RAW="kameki-raw-${DATE}"
+MD="kameki-${DATE}.md"
+RUN_NAME="kameki-${DATE}-$$"
+T0=$(date +%s)
+
+# ---- tunables -------------------------------------------------------
 ENGINE="${ENGINE:-auto}"
 PROFILE="${PROFILE:-standard}"
 JOBS="${JOBS:-16}"
@@ -53,13 +52,510 @@ RESUME="${RESUME:-0}"
 POLL="${POLL:-60}"
 SCAN_CONFIG="${SCAN_CONFIG:-fast}"
 ALIVE_TEST="${ALIVE_TEST:-ICMP, TCP-ACK Service & ARP Ping}"
+DEPTH_WARN="${DEPTH_WARN:-3}"      # authenticated findings per host below which we warn
 KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
+NUCLEI_VER="${NUCLEI_VER:-3.4.10}"
+NUCLEI_URL="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VER}/nuclei_${NUCLEI_VER}_linux_amd64.zip"
+VULSCAN_REPO="https://github.com/scipag/vulscan"
+TESTSSL_REPO="https://github.com/drwetter/testssl.sh"
+NETEXEC_REPO="git+https://github.com/Pennyw0rth/NetExec"
+
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; DIM=$'\e[2m'; RST=$'\e[0m'
+info(){ echo "${GRN}[+]${RST} $*"; }
+warn(){ echo "${YEL}[!]${RST} $*"; }
+err(){  echo "${RED}[-]${RST} $*"; }
+step(){ echo; echo "${CYN}── $* ${RST}"; }
+dim(){  echo "${DIM}    $*${RST}"; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+cnt(){ [ -f "$1" ] && grep -c . "$1" 2>/dev/null || echo 0; }
+pool(){ while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.2; done; "$@" & }
+finish(){ wait; }
+is_done(){ [ "$RESUME" = "1" ] && [ -f "$RAW/.done-$1" ]; }
+mark_done(){ touch "$RAW/.done-$1"; }
+
+need_root(){ [ "$(id -u)" -eq 0 ] || { err "this needs root: sudo $0 $*"; exit 1; }; }
+
+# =====================================================================
+#  install
+# =====================================================================
+cmd_install(){
+  local BUNDLE="" WITH_NVT=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bundle) BUNDLE="$2"; shift 2 ;;
+      --no-nvt) WITH_NVT=0; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  step "kameki install  (offline bundle: ${BUNDLE:-none})"
+  need_root install
+
+  local OFF=0
+  [ -n "$BUNDLE" ] && OFF=1
+
+  if [ "$OFF" -eq 1 ]; then
+    [ -f "$BUNDLE" ] || { err "bundle not found: $BUNDLE"; exit 1; }
+    local B="/tmp/kameki-bundle-$$"
+    mkdir -p "$B"
+    info "unpacking bundle"
+    if [[ "$BUNDLE" == *.zst ]]; then
+      have zstd || { err "zstd required to unpack. apt install zstd"; exit 1; }
+      tar --zstd -xf "$BUNDLE" -C "$B"
+    else
+      tar -xzf "$BUNDLE" -C "$B"
+    fi
+
+    if [ -d "$B/deb" ]; then
+      info "installing system packages from bundle"
+      dpkg -i "$B"/deb/*.deb >/dev/null 2>&1 || apt-get -f install -y >/dev/null 2>&1
+    fi
+    if [ -d "$B/wheels" ]; then
+      info "installing python tools from bundle"
+      pip3 install --break-system-packages --no-index --find-links "$B/wheels" netexec wesng gvm-tools >/dev/null 2>&1 \
+        || warn "python tool install reported errors"
+    fi
+    [ -f "$B/nuclei" ]        && { install -m755 "$B/nuclei" /usr/local/bin/nuclei; info "nuclei installed"; }
+    [ -d "$B/nuclei-templates" ] && { mkdir -p /root/.local/nuclei-templates; cp -r "$B/nuclei-templates/." /root/.local/nuclei-templates/; info "nuclei templates installed"; }
+    [ -d "$B/vulscan" ]      && { cp -r "$B/vulscan" /usr/share/nmap/scripts/; nmap --script-updatedb >/dev/null 2>&1; info "vulscan installed"; }
+    [ -d "$B/testssl.sh" ]   && { cp -r "$B/testssl.sh" /opt/; ln -sf /opt/testssl.sh/testssl.sh /usr/local/bin/testssl.sh; info "testssl.sh installed"; }
+    [ -f "$B/definitions.zip" ] && { cp "$B/definitions.zip" "${SUDO_USER:+/home/$SUDO_USER/}definitions.zip" 2>/dev/null || cp "$B/definitions.zip" /root/; info "WES-NG definitions installed"; }
+    [ -f "$B/kev.json" ]     && { cp "$B/kev.json" "${SUDO_USER:+/home/$SUDO_USER/}.kameki-kev.json" 2>/dev/null || cp "$B/kev.json" /root/.kameki-kev.json; info "KEV catalogue installed"; }
+
+    if [ -f "$B/openvas-feed.tar.zst" ]; then
+      info "restoring Greenbone NVT feed, this takes a few minutes"
+      mkdir -p /var/lib/openvas
+      tar --zstd -xf "$B/openvas-feed.tar.zst" -C /var/lib/openvas
+      chown -R _gvm:_gvm /var/lib/openvas 2>/dev/null || true
+      info "feed restored: $(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l) NVTs"
+    fi
+    if [ -f "$B/gvm-data.tar.zst" ]; then
+      info "restoring gvmd data"
+      tar --zstd -xf "$B/gvm-data.tar.zst" -C /var/lib
+      chown -R _gvm:_gvm /var/lib/gvm 2>/dev/null || true
+    fi
+    rm -rf "$B"
+    info "offline install complete"
+    dim "run: $0 doctor"
+    return 0
+  fi
+
+  # ---- online install
+  info "updating package lists"
+  apt-get update -qq || warn "apt update had errors"
+
+  info "installing system packages"
+  apt-get install -y -qq nmap jq gawk curl git zstd unzip python3-pip pipx \
+                         exploitdb onesixtyone poppler-utils >/dev/null 2>&1 \
+    || warn "some system packages failed, continuing"
+
+  if [ "$WITH_NVT" -eq 1 ]; then
+    info "installing Greenbone scanner backend"
+    apt-get install -y -qq openvas-scanner ospd-openvas gvmd redis-server >/dev/null 2>&1 \
+      || warn "Greenbone packages unavailable in this repo, standalone engine will be used"
+  fi
+
+  info "installing python tools"
+  local PIPX_HOME_DIR="${SUDO_USER:+/home/$SUDO_USER/.local}"
+  su "${SUDO_USER:-root}" -c "pipx install $NETEXEC_REPO" >/dev/null 2>&1 || \
+    pip3 install --break-system-packages "$NETEXEC_REPO" >/dev/null 2>&1 || warn "netexec install failed"
+  su "${SUDO_USER:-root}" -c "pipx install wesng" >/dev/null 2>&1 || \
+    pip3 install --break-system-packages wesng >/dev/null 2>&1 || warn "wesng install failed"
+  su "${SUDO_USER:-root}" -c "pipx install gvm-tools" >/dev/null 2>&1 || \
+    pip3 install --break-system-packages gvm-tools >/dev/null 2>&1 || warn "gvm-tools install failed"
+  su "${SUDO_USER:-root}" -c "pipx ensurepath" >/dev/null 2>&1 || true
+
+  if ! have nuclei; then
+    info "installing nuclei $NUCLEI_VER"
+    local T; T=$(mktemp -d)
+    if curl -sL --max-time 300 -o "$T/n.zip" "$NUCLEI_URL" && unzip -qo "$T/n.zip" -d "$T"; then
+      install -m755 "$T/nuclei" /usr/local/bin/nuclei && info "nuclei installed"
+    else
+      warn "nuclei download failed, get the binary from github.com/projectdiscovery/nuclei/releases"
+    fi
+    rm -rf "$T"
+  fi
+  have nuclei && { info "updating nuclei templates"; nuclei -update-templates -silent >/dev/null 2>&1 || warn "template update failed"; }
+
+  if [ ! -d /usr/share/nmap/scripts/vulscan ]; then
+    info "installing vulscan offline CVE database"
+    git clone -q --depth 1 "$VULSCAN_REPO" /usr/share/nmap/scripts/vulscan >/dev/null 2>&1 \
+      && nmap --script-updatedb >/dev/null 2>&1 && info "vulscan installed" \
+      || warn "vulscan clone failed"
+  fi
+
+  if [ ! -d /opt/testssl.sh ]; then
+    info "installing testssl.sh"
+    git clone -q --depth 1 "$TESTSSL_REPO" /opt/testssl.sh >/dev/null 2>&1 \
+      && ln -sf /opt/testssl.sh/testssl.sh /usr/local/bin/testssl.sh && info "testssl.sh installed" \
+      || warn "testssl.sh clone failed"
+  fi
+
+  info "fetching WES-NG definitions"
+  local WESBIN=""; for c in wes wes.py; do have "$c" && { WESBIN="$c"; break; }; done
+  [ -n "$WESBIN" ] && { su "${SUDO_USER:-root}" -c "$WESBIN --update" >/dev/null 2>&1 || warn "WES-NG definition update failed"; }
+
+  info "fetching CISA KEV catalogue"
+  curl -s --max-time 60 -o "${SUDO_USER:+/home/$SUDO_USER/}.kameki-kev.json" "$KEV_URL" 2>/dev/null \
+    || curl -s --max-time 60 -o /root/.kameki-kev.json "$KEV_URL" 2>/dev/null || warn "KEV download failed"
+
+  if have gvmd && [ "$WITH_NVT" -eq 1 ]; then
+    echo
+    warn "Greenbone needs one more manual step, it prints a password you must save:"
+    dim "sudo gvm-setup"
+    dim "sudo greenbone-feed-sync        # ~5 GB, do this before leaving the office"
+    dim "then put the admin credentials in gmp-user.txt and gmp-pass.txt"
+  fi
+
+  echo
+  info "install complete"
+  dim "open a new shell for PATH changes, then: $0 doctor"
+}
+
+# =====================================================================
+#  bundle   (build at the office, carry to site)
+# =====================================================================
+cmd_bundle(){
+  step "Building offline bundle"
+  local OUT="kameki-bundle-${DATE}.tar.zst"
+  local B; B=$(mktemp -d)
+  have zstd || { err "zstd required: sudo apt install zstd -y"; exit 1; }
+
+  info "collecting python wheels"
+  mkdir -p "$B/wheels"
+  pip3 download -q -d "$B/wheels" "$NETEXEC_REPO" wesng gvm-tools >/dev/null 2>&1 \
+    || warn "wheel download incomplete"
+
+  info "collecting system packages"
+  mkdir -p "$B/deb"
+  ( cd "$B/deb" && apt-get download nmap jq gawk curl git zstd unzip \
+      exploitdb onesixtyone poppler-utils >/dev/null 2>&1 ) || warn "deb download incomplete"
+
+  if have nuclei; then
+    info "including nuclei binary and templates"
+    cp "$(command -v nuclei)" "$B/nuclei"
+    for d in "$HOME/.local/nuclei-templates" "$HOME/nuclei-templates"; do
+      [ -d "$d" ] && { cp -r "$d" "$B/nuclei-templates"; break; }
+    done
+  fi
+  [ -d /usr/share/nmap/scripts/vulscan ] && { info "including vulscan"; cp -r /usr/share/nmap/scripts/vulscan "$B/"; }
+  [ -d /opt/testssl.sh ] && { info "including testssl.sh"; cp -r /opt/testssl.sh "$B/"; }
+  for f in definitions.zip "$HOME/definitions.zip"; do
+    [ -f "$f" ] && { info "including WES-NG definitions"; cp "$f" "$B/definitions.zip"; break; }
+  done
+  [ -f "$HOME/.kameki-kev.json" ] && cp "$HOME/.kameki-kev.json" "$B/kev.json"
+
+  local NVTN=0
+  [ -d /var/lib/openvas/plugins ] && NVTN=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
+  if [ "$NVTN" -gt 10000 ]; then
+    info "including Greenbone NVT feed ($NVTN scripts), this is the large part"
+    tar --zstd -cf "$B/openvas-feed.tar.zst" -C /var/lib/openvas plugins 2>/dev/null \
+      || warn "feed archive failed, may need sudo"
+    [ -d /var/lib/gvm ] && tar --zstd -cf "$B/gvm-data.tar.zst" -C /var/lib gvm 2>/dev/null || true
+  else
+    warn "NVT feed not present or incomplete ($NVTN scripts), bundle will be standalone only"
+    dim "run: sudo greenbone-feed-sync    then rebuild the bundle"
+  fi
+
+  cp "$0" "$B/kameki.sh"
+  cat > "$B/README.txt" <<EOF
+kameki offline bundle, built $STAMP
+NVT scripts included: $NVTN
+
+On the target machine:
+  sudo ./kameki.sh install --bundle $OUT
+  ./kameki.sh doctor
+EOF
+
+  info "compressing"
+  tar --zstd -cf "$OUT" -C "$B" . && info "bundle: $OUT ($(du -h "$OUT" | cut -f1))"
+  rm -rf "$B"
+  dim "carry this to site, then: sudo ./kameki.sh install --bundle $OUT"
+}
+
+# =====================================================================
+#  doctor
+# =====================================================================
+cmd_doctor(){
+  step "kameki doctor  v$VERSION"
+  local ISSUES=0
+
+  echo "  tools"
+  for t in nmap nxc nuclei jq awk curl; do
+    if have "$t"; then printf "    %-14s ok\n" "$t"
+    else printf "    %-14s ${RED}missing${RST}\n" "$t"; ISSUES=$((ISSUES+1)); fi
+  done
+  local WES=""; for c in wes wes.py; do have "$c" && { WES="$c"; break; }; done
+  [ -n "$WES" ] && printf "    %-14s ok (%s)\n" "wes" "$WES" || { printf "    %-14s ${RED}missing${RST}\n" "wes"; ISSUES=$((ISSUES+1)); }
+  for t in testssl.sh searchsploit onesixtyone gvm-cli; do
+    have "$t" && printf "    %-14s ok\n" "$t" || printf "    %-14s ${YEL}absent (optional)${RST}\n" "$t"
+  done
+
+  echo
+  echo "  data"
+  local NVTN=0
+  [ -d /var/lib/openvas/plugins ] && NVTN=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
+  if [ "$NVTN" -ge 10000 ]; then printf "    %-14s ok (%s scripts)\n" "NVT feed" "$NVTN"
+  else printf "    %-14s ${YEL}%s scripts, run: sudo greenbone-feed-sync${RST}\n" "NVT feed" "$NVTN"; fi
+  [ -d /usr/share/nmap/scripts/vulscan ] && printf "    %-14s ok\n" "vulscan" || printf "    %-14s ${YEL}absent${RST}\n" "vulscan"
+  { [ -f definitions.zip ] || [ -f "$HOME/definitions.zip" ]; } && printf "    %-14s ok\n" "wes defs" || printf "    %-14s ${YEL}run: wes --update${RST}\n" "wes defs"
+  [ -f "$HOME/.kameki-kev.json" ] && printf "    %-14s ok\n" "KEV" || printf "    %-14s ${YEL}absent${RST}\n" "KEV"
+
+  echo
+  echo "  greenbone"
+  local SOCK=""
+  for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock /var/run/gvm/gvmd.sock; do
+    [ -S "$s" ] && { SOCK="$s"; break; }
+  done
+  if [ -n "$SOCK" ]; then
+    printf "    %-14s ok (%s)\n" "gvmd socket" "$SOCK"
+    if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] && have gvm-cli; then
+      local R; R=$(gvm-cli --gmp-username "$(head -n1 gmp-user.txt)" --gmp-password "$(head -n1 gmp-pass.txt)" \
+                   socket --socketpath "$SOCK" --xml "<get_version/>" 2>&1)
+      echo "$R" | grep -q 'status="200"' && printf "    %-14s ok\n" "gmp auth" \
+        || { printf "    %-14s ${RED}failed${RST}\n" "gmp auth"; ISSUES=$((ISSUES+1)); }
+    else
+      printf "    %-14s ${YEL}gmp-user.txt / gmp-pass.txt not set${RST}\n" "gmp auth"
+    fi
+  else
+    printf "    %-14s ${YEL}not running, standalone engine will be used${RST}\n" "gvmd socket"
+  fi
+
+  echo
+  echo "  inputs"
+  for f in targets.txt user.txt pass.txt; do
+    if [ -s "$f" ]; then
+      local m; m=$(stat -c '%a' "$f")
+      if [ "$f" = "targets.txt" ]; then printf "    %-14s ok (%s lines)\n" "$f" "$(cnt "$f")"
+      elif [ "$m" = "600" ]; then printf "    %-14s ok (mode 600)\n" "$f"
+      else printf "    %-14s ${YEL}mode %s, run: chmod 600 %s${RST}\n" "$f" "$m" "$f"; fi
+    else printf "    %-14s ${RED}missing${RST}\n" "$f"; ISSUES=$((ISSUES+1)); fi
+  done
+  for f in ssh-user.txt ssh-pass.txt gmp-user.txt gmp-pass.txt; do
+    [ -s "$f" ] && printf "    %-14s ok\n" "$f" || printf "    %-14s ${DIM}absent (optional)${RST}\n" "$f"
+  done
+
+  echo
+  echo "  network position"
+  local MYIP; MYIP=$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127' | head -3 | tr '\n' ' ')
+  printf "    %-14s %s\n" "local addr" "${MYIP:-unknown}"
+  if [ -s targets.txt ]; then
+    local FIRST; FIRST=$(grep -ve '^\s*$' targets.txt | head -n1)
+    if have nmap; then
+      local OPEN; OPEN=$(nmap -Pn -p445,3389,22 --host-timeout 20s "$FIRST" 2>/dev/null | grep -c '/open/\|open ')
+      printf "    %-14s %s reachable port(s) on %s\n" "reachability" "$OPEN" "$FIRST"
+      [ "$OPEN" -eq 0 ] && { warn "    no common ports reachable on the first target"; ISSUES=$((ISSUES+1)); }
+    fi
+  fi
+
+  echo
+  if [ "$ISSUES" -eq 0 ]; then info "no blocking issues. next: $0 preflight"
+  else warn "$ISSUES issue(s) to resolve. see above."; fi
+  return 0
+}
+
+# =====================================================================
+#  preflight   (find the working credential format without a spray)
+# =====================================================================
+cmd_preflight(){
+  step "Credential preflight"
+  for f in targets.txt user.txt pass.txt; do
+    [ -s "$f" ] || { err "missing: $f"; exit 1; }
+  done
+  have nxc || { err "nxc not installed. run: sudo $0 install"; exit 1; }
+
+  local HOST; HOST=$(grep -ve '^\s*$' targets.txt | head -n1)
+  local BASE; BASE=$(head -n1 user.txt | tr -d '\r\n')
+  local PASS; PASS=$(head -n1 pass.txt | tr -d '\r\n')
+
+  info "probing a single host: $HOST"
+  dim "this tries several credential formats against ONE host only"
+  dim "at most a handful of failed logins, no estate-wide lockout risk"
+  echo
+
+  local BANNER; BANNER=$(nxc smb "$HOST" -u '' -p '' 2>&1 | head -3)
+  local DOM;  DOM=$(echo "$BANNER"  | grep -oP '(?<=domain:)[^)]*' | head -1)
+  local NAME; NAME=$(echo "$BANNER" | grep -oP '(?<=name:)[^)]*'   | head -1)
+  [ -n "$DOM" ]  && info "domain seen on host: $DOM"
+  [ -n "$NAME" ] && info "hostname: $NAME"
+  echo
+
+  local BARE="${BASE##*\\}"; BARE="${BARE%%@*}"
+  local -a FORMATS=("$BASE")
+  [ -n "$DOM" ] && FORMATS+=("$DOM\\$BARE" "$BARE@$DOM")
+  [ -n "$DOM" ] && FORMATS+=("${DOM%%.*}\\$BARE")
+  FORMATS+=("$BARE")
+
+  local WORKING=""
+  local -A SEEN=()
+  for fmt in "${FORMATS[@]}"; do
+    [ -n "${SEEN[$fmt]:-}" ] && continue
+    SEEN[$fmt]=1
+    printf "    %-34s " "$fmt"
+    local OUT; OUT=$(nxc smb "$HOST" -u "$fmt" -p "$PASS" 2>&1)
+    if echo "$OUT" | grep -q '\[+\]'; then
+      local ADMIN=""; echo "$OUT" | grep -q 'Pwn3d' && ADMIN=" ${CYN}(admin)${RST}"
+      echo "${GRN}success${RST}$ADMIN"
+      [ -z "$WORKING" ] && WORKING="$fmt"
+    else
+      local REASON; REASON=$(echo "$OUT" | grep -oE 'STATUS_[A-Z_]+' | head -1)
+      echo "${RED}failed${RST} ${DIM}${REASON:-no response}${RST}"
+    fi
+  done
+
+  echo
+  if [ -z "$WORKING" ]; then
+    err "no credential format authenticated"
+    dim "check the account is enabled and not locked"
+    dim "check it has local admin on the target, standard users cannot read patch level"
+    dim "if STATUS_LOGON_FAILURE on every format, the password is wrong or expired"
+    dim "if STATUS_ACCOUNT_LOCKED_OUT, stop and have the client unlock before retrying"
+    return 1
+  fi
+
+  info "working format: ${CYN}$WORKING${RST}"
+
+  # does remote execution work? this is what patch level depends on
+  printf "    %-34s " "remote command execution"
+  local EX; EX=$(nxc smb "$HOST" -u "$WORKING" -p "$PASS" -x 'echo kameki' 2>&1)
+  if echo "$EX" | grep -q 'kameki'; then
+    echo "${GRN}works${RST}"
+  else
+    echo "${YEL}blocked${RST}"
+    warn "authentication works but remote execution does not"
+    dim "the standalone engine cannot read patch level without it"
+    dim "likely EDR or policy. the Greenbone NVT engine uses registry reads"
+    dim "instead and may still work, so prefer ENGINE=nvt on this estate"
+  fi
+
+  echo
+  if [ "$WORKING" != "$BASE" ]; then
+    read -rp "    write '$WORKING' to user.txt? [y/N] " A
+    if [ "${A,,}" = "y" ]; then
+      printf '%s\n' "$WORKING" > user.txt; chmod 600 user.txt
+      info "user.txt updated"
+    fi
+  fi
+  dim "next: $0 run"
+}
+
+# =====================================================================
+#  cleanup
+# =====================================================================
+cmd_cleanup(){
+  local PURGE=0 KEEP=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge) PURGE=1; shift ;;
+      --keep-evidence) KEEP=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  step "kameki cleanup"
+  local SHRED="rm -f"; have shred && SHRED="shred -u -n3"
+
+  echo "  credentials"
+  for f in user.txt pass.txt ssh-user.txt ssh-pass.txt gmp-user.txt gmp-pass.txt; do
+    if [ -f "$f" ]; then $SHRED "$f" 2>/dev/null && printf "    %-18s shredded\n" "$f"; fi
+  done
+
+  echo
+  echo "  credential traces in evidence"
+  local N=0
+  for d in kameki-raw-*; do
+    [ -d "$d" ] || continue
+    for f in "$d"/working-creds.txt "$d"/ad/kerberoast-tickets.txt "$d"/ad/asrep-tickets.txt; do
+      [ -f "$f" ] && { $SHRED "$f" 2>/dev/null; N=$((N+1)); }
+    done
+    if [ -d "$d/sysinfo" ]; then
+      grep -rl 'Product ID\|Registered Owner' "$d/sysinfo" 2>/dev/null | while read -r x; do
+        sed -i '/Product ID/d;/Registered Owner/d' "$x" 2>/dev/null
+      done
+    fi
+  done
+  printf "    %-18s %s file(s) removed\n" "hashes/tickets" "$N"
+
+  echo
+  echo "  shell history"
+  if [ -f "$HOME/.bash_history" ]; then
+    local H; H=$(grep -ciE 'kameki|nxc |gvm-cli' "$HOME/.bash_history" 2>/dev/null || echo 0)
+    sed -i '/nxc .*-p /d;/gvm-cli.*--gmp-password/d' "$HOME/.bash_history" 2>/dev/null
+    printf "    %-18s %s line(s) scrubbed\n" "bash_history" "$H"
+  fi
+
+  if [ -d /run/gvmd ] && have gvm-cli && [ -s gmp-user.txt ]; then
+    echo
+    echo "  gvmd objects"
+    dim "scan credentials are already deleted at the end of each run"
+  fi
+
+  if [ "$KEEP" -eq 0 ]; then
+    echo
+    echo "  evidence"
+    for d in kameki-raw-*; do
+      [ -d "$d" ] || continue
+      local SZ; SZ=$(du -sh "$d" 2>/dev/null | cut -f1)
+      read -rp "    remove $d ($SZ)? [y/N] " A
+      [ "${A,,}" = "y" ] && { rm -rf "$d"; printf "    %-18s removed\n" "$d"; } \
+                         || printf "    %-18s kept\n" "$d"
+    done
+  else
+    info "evidence retained (--keep-evidence)"
+  fi
+
+  if [ "$PURGE" -eq 1 ]; then
+    echo
+    warn "--purge removes the installed tooling from this machine"
+    read -rp "    proceed? [y/N] " A
+    if [ "${A,,}" = "y" ]; then
+      need_root cleanup --purge
+      apt-get remove -y -qq openvas-scanner ospd-openvas gvmd >/dev/null 2>&1
+      rm -rf /usr/share/nmap/scripts/vulscan /opt/testssl.sh /usr/local/bin/nuclei /usr/local/bin/testssl.sh
+      rm -rf /var/lib/openvas/plugins
+      su "${SUDO_USER:-root}" -c "pipx uninstall netexec; pipx uninstall wesng; pipx uninstall gvm-tools" >/dev/null 2>&1
+      info "tooling removed"
+    fi
+  fi
+
+  echo
+  info "cleanup complete"
+  [ "$KEEP" -eq 1 ] || dim "reports (kameki-*.md) were not touched, remove them manually if needed"
+}
+
+# =====================================================================
+#  usage
+# =====================================================================
+cmd_usage(){
+  sed -n '2,40p' "$0" | sed 's/^#//;s/^ //'
+  exit 0
+}
+
+# =====================================================================
+#  dispatch
+# =====================================================================
+SUB="${1:-run}"
+case "$SUB" in
+  install)   shift; cmd_install "$@"; exit $? ;;
+  bundle)    shift; cmd_bundle "$@"; exit $? ;;
+  doctor)    shift; cmd_doctor "$@"; exit $? ;;
+  preflight) shift; cmd_preflight "$@"; exit $? ;;
+  cleanup)   shift; cmd_cleanup "$@"; exit $? ;;
+  -h|--help|help) cmd_usage ;;
+  run)       shift ;;
+  --setup)   cmd_usage ;;
+  *)         : ;;   # bare invocation means run
+esac
+
+# =====================================================================
+#  R U N
+# =====================================================================
 case "$PROFILE" in
   quick)    PORTSPEC="--top-ports 1000";  NSE_SET="vuln" ;;
   standard) PORTSPEC="--top-ports 5000";  NSE_SET="vuln,safe" ;;
   deep)     PORTSPEC="-p-";               NSE_SET="vuln,safe" ;;
-  *) echo "PROFILE must be quick, standard or deep"; exit 1 ;;
+  *) err "PROFILE must be quick, standard or deep"; exit 1 ;;
 esac
 
 CFG_FAST="daba56c8-73ec-11df-a475-002264764cea"
@@ -68,71 +564,16 @@ CFG_DEEP="708f25c4-7489-11df-8094-002264764cea"
 CFG_DEEPULT="74db13d6-7489-11df-91b9-002264764cea"
 FMT_CSV="c1645568-627a-11e3-a660-406186ea4fc5"
 FMT_XML="a994b278-1f62-11e1-96ac-406186ea4fc5"
-
 case "$SCAN_CONFIG" in
   fast)     CFG_ID="$CFG_FAST";     CFG_NAME="Full and fast" ;;
   ultimate) CFG_ID="$CFG_ULTIMATE"; CFG_NAME="Full and fast ultimate" ;;
   deep)     CFG_ID="$CFG_DEEP";     CFG_NAME="Full and very deep" ;;
   deepult)  CFG_ID="$CFG_DEEPULT";  CFG_NAME="Full and very deep ultimate" ;;
-  *) echo "SCAN_CONFIG must be fast, ultimate, deep or deepult"; exit 1 ;;
+  *) err "SCAN_CONFIG must be fast, ultimate, deep or deepult"; exit 1 ;;
 esac
 
-DATE=$(date +%F)
-STAMP=$(date +"%Y-%m-%d %H:%M:%S %Z")
-RAW="kameki-raw-${DATE}"
-MD="kameki-${DATE}.md"
-RUN_NAME="kameki-${DATE}-$$"
-T0=$(date +%s)
-
-RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; DIM=$'\e[2m'; RST=$'\e[0m'
-info(){ echo "${GRN}[+]${RST} $*"; }
-warn(){ echo "${YEL}[!]${RST} $*"; }
-err(){  echo "${RED}[-]${RST} $*"; }
-step(){ echo; echo "${CYN}── $* ${RST}"; }
-dim(){  echo "${DIM}    $*${RST}"; }
-
-pool(){ while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.2; done; "$@" & }
-finish(){ wait; }
-is_done(){ [ "$RESUME" = "1" ] && [ -f "$RAW/.done-$1" ]; }
-mark_done(){ touch "$RAW/.done-$1"; }
-cnt(){ [ -f "$1" ] && grep -c . "$1" 2>/dev/null || echo 0; }
-
-# =====================================================================
-#  --setup
-# =====================================================================
-if [ "${1:-}" = "--setup" ]; then
-cat <<'SETUP'
-
-  Greenbone NVT backend, no web UI required
-  =========================================
-
-    sudo apt update
-    sudo apt install openvas-scanner ospd-openvas gvmd redis-server -y
-    pipx install gvm-tools
-
-    sudo gvm-setup                 # save the admin password it prints
-    sudo greenbone-feed-sync       # ~5 GB, 30-60 min, do this at the office
-
-    sudo gvm-check-setup
-    ls /var/lib/openvas/plugins | wc -l        # expect 90,000+
-    sudo systemctl enable --now ospd-openvas gvmd
-
-    echo 'admin'          > gmp-user.txt
-    echo '<the password>' > gmp-pass.txt
-    chmod 600 gmp-user.txt gmp-pass.txt
-
-  The gsad web interface is not needed and is often missing from the
-  Ubuntu package. This script drives gvmd directly over its socket.
-
-  To move a synced scanner to a machine with no internet, snapshot the
-  VM, or archive /var/lib/openvas/plugins, /var/lib/gvm and the gvmd
-  PostgreSQL database.
-
-SETUP
-exit 0
-fi
-
-# =====================================================================
+# ===================================================================== 
+=====================================================================
 #  1. Dependency check and engine selection
 # =====================================================================
 step "Dependencies and engine"
@@ -256,7 +697,7 @@ fi
 [ "$KEV_OK" -eq 1 ] && info "KEV catalogue: $(cnt "$RAW/kev-all.txt") actively exploited CVEs" \
                     || warn "KEV catalogue unavailable, exploitation flags disabled"
 
-# =====================================================================
+# # =====================================================================
 #  Stage 1  Discovery
 # =====================================================================
 step "Stage 1  Discovery"
@@ -679,6 +1120,35 @@ APCT=0; SPCT=0; NVT_APCT=0
 [ "$NVT_HOSTS_F" -gt 0 ] && NVT_APCT=$(( NVT_AUTH_HOSTS*100/NVT_HOSTS_F ))
 
 # =====================================================================
+#  Self check: did this scan actually assess anything?
+# =====================================================================
+step "Self check"
+AUTH_FINDINGS=0; AUTH_DEPTH=0; DEPTH_VERDICT="unknown"
+if [ "$RUN_NVT" -eq 1 ] && [ -s "$NVT_CSV" ]; then
+  AUTH_FINDINGS=$(grep -ci 'Authenticated \(registry\|package\)-based' "$NVT_CSV" 2>/dev/null || echo 0)
+  [ "$NVT_AUTH_HOSTS" -gt 0 ] && AUTH_DEPTH=$(( AUTH_FINDINGS * 100 / NVT_AUTH_HOSTS ))
+elif [ "$RUN_SA" -eq 1 ]; then
+  AUTH_FINDINGS="$WIN_CVES"
+  [ "$SYSOK" -gt 0 ] && AUTH_DEPTH=$(( AUTH_FINDINGS * 100 / SYSOK ))
+fi
+DEPTH_H=$(( AUTH_DEPTH / 100 ))
+
+if [ "$AUTH_FINDINGS" -eq 0 ]; then
+  DEPTH_VERDICT="none"
+  err "no authenticated findings were produced"
+  dim "credentials may have authenticated but the authenticated check set did not run"
+  dim "diagnose with: $0 preflight"
+elif [ "$DEPTH_H" -lt "$DEPTH_WARN" ]; then
+  DEPTH_VERDICT="shallow"
+  warn "authentication depth is ${DEPTH_H}.$(printf '%02d' $((AUTH_DEPTH % 100))) findings per authenticated host"
+  dim "a real authenticated assessment of a Windows estate yields many per host"
+  dim "this looks like a scan that logged in but never examined patch level"
+else
+  DEPTH_VERDICT="ok"
+  info "authentication depth ${DEPTH_H}.$(printf '%02d' $((AUTH_DEPTH % 100))) findings per authenticated host"
+fi
+
+# =====================================================================
 #  Report
 # =====================================================================
 step "Building report"
@@ -711,10 +1181,33 @@ echo "| Confirmed exploitable services | $MOD_VULN |"
 echo "| Attack paths identified | $PATHS |"
 echo
 COVER_PCT=$([ "$RUN_NVT" -eq 1 ] && echo "$NVT_APCT" || echo "$SPCT")
+echo "### Did this assessment actually authenticate?"
+echo
+echo "Two axes. Breadth without depth is the failure mode that looks like success."
+echo
+echo '```'
+printf "  breadth  %5s%%   hosts where credentials took effect\n" "$COVER_PCT"
+printf "  depth    %2d.%02d     authenticated findings per such host\n" "$DEPTH_H" "$((AUTH_DEPTH % 100))"
+echo '```'
+echo
+case "$DEPTH_VERDICT" in
+  none)
+    echo "> **No authenticated findings were produced.** Credentials may have been"
+    echo "> accepted, but the authenticated check set did not execute. Patch level"
+    echo "> was not examined on any host. This assessment is unauthenticated in"
+    echo "> substance regardless of how it was configured."
+    echo ;;
+  shallow)
+    echo "> **Authentication was shallow.** Credentials took effect on ${COVER_PCT}% of"
+    echo "> hosts but produced only ${DEPTH_H}.$(printf '%02d' $((AUTH_DEPTH % 100))) authenticated finding(s) per host. A genuine"
+    echo "> authenticated assessment of a Windows estate surfaces missing cumulative"
+    echo "> updates, registry configuration and installed software on every host."
+    echo "> Treat the patch-level conclusions in this report as unverified."
+    echo ;;
+esac
 if [ "$COVER_PCT" -lt 80 ]; then
   echo "> **Coverage warning.** Authenticated assessment reached ${COVER_PCT}% of hosts."
-  echo "> Patch level was not verified on the remainder. Resolve before this is"
-  echo "> treated as a complete authenticated assessment."
+  echo "> Patch level was not verified on the remainder."
   echo
 fi
 if [ "$PATHS" -gt 0 ]; then
