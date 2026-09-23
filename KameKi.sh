@@ -48,12 +48,11 @@ declare -A HINT=(
   [nmap]="sudo apt install nmap -y"
   [nxc]="pipx install git+https://github.com/Pennyw0rth/NetExec"
   [nuclei]="download the binary from github.com/projectdiscovery/nuclei/releases"
-  [wes.py]="pipx install wesng   (then: wes.py --update)"
   [awk]="sudo apt install gawk -y"
   [jq]="sudo apt install jq -y"
 )
 
-for tool in nmap nxc nuclei wes.py awk jq; do
+for tool in nmap nxc nuclei awk jq; do
   if command -v "$tool" >/dev/null 2>&1; then
     printf "    %-10s %s\n" "$tool" "ok"
   else
@@ -61,6 +60,21 @@ for tool in nmap nxc nuclei wes.py awk jq; do
     MISSING=1
   fi
 done
+
+# WES-NG ships as either "wes" or "wes.py" depending on how it was installed
+WES=""
+for candidate in wes wes.py; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    WES="$candidate"
+    break
+  fi
+done
+if [ -n "$WES" ]; then
+  printf "    %-10s %s\n" "wes" "ok ($WES)"
+else
+  printf "    %-10s %s\n" "wes" "MISSING  ->  pipx install wesng   (then: wes --update)"
+  MISSING=1
+fi
 
 # CVE engine for network services: vulners needs internet, vulscan is offline
 NSE_DIR=$(nmap --datadir 2>/dev/null; echo "/usr/share/nmap/scripts")
@@ -201,14 +215,14 @@ WIN_CVE_CRIT=0
 if [ "$SYSINFO_OK" -gt 0 ]; then
   if [ ! -f definitions.zip ] && [ ! -f "$HOME/definitions.zip" ]; then
     warn "WES-NG definitions not found. Fetching (needs internet)."
-    wes.py --update >/dev/null 2>&1 || warn "    definition update failed, results may be stale"
+    "$WES" --update >/dev/null 2>&1 || warn "    definition update failed, results may be stale"
   fi
 
   echo "Host,CVE,Severity,AffectedProduct,MissingKB,Title" > "$RAW/windows-cves.csv"
   for f in "$RAW"/systeminfo/*.txt; do
     [ -e "$f" ] || continue
     h=$(basename "$f" .txt)
-    wes.py "$f" -o "$RAW/wes/${h}.csv" >/dev/null 2>&1 || continue
+    "$WES" "$f" -o "$RAW/wes/${h}.csv" >/dev/null 2>&1 || continue
     if [ -s "$RAW/wes/${h}.csv" ]; then
       tail -n +2 "$RAW/wes/${h}.csv" | awk -F',' -v H="$h" \
         '{print H","$3","$7","$2","$8","$4}' >> "$RAW/windows-cves.csv" 2>/dev/null || true
