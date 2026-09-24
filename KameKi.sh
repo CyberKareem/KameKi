@@ -85,7 +85,16 @@ err(){  echo "${RED}[-]${RST} $*"; }
 step(){ echo; echo "${CYN}── $* ${RST}"; }
 dim(){  echo "${DIM}    $*${RST}"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
-cnt(){ [ -f "$1" ] && grep -c . "$1" 2>/dev/null || echo 0; }
+cnt(){ [ -f "$1" ] && grep -c . "$1" 2>/dev/null | head -1 || echo 0; }
+# count matches safely: always one integer on stdout, never two, never empty.
+# `grep -c` prints 0 AND exits 1 on no match, so a bare `|| echo 0` yields "0\n0"
+# and every downstream $(( )) fails. head -1 collapses it.
+gcnt(){ grep -c "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
+gcnti(){ grep -ci "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
+gcntE(){ grep -cE "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
+gcntiE(){ grep -ciE "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
+# grep -cve counts NON-matching lines; used for 'non-blank line count'
+nblines(){ grep -cve '^[[:space:]]*$' "$1" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
 pool(){ while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.2; done; "$@" & }
 finish(){ wait; }
 is_done(){ [ "$RESUME" = "1" ] && [ -f "$RAW/.done-$1" ]; }
@@ -474,7 +483,7 @@ cmd_preflight(){
   done
   have nxc || { err "nxc not installed. run: sudo $0 install"; exit 1; }
 
-  local HOST; HOST=$(grep -ve '^\s*$' targets.txt | head -n1)
+  local HOST; HOST=$(grep -ve '^[[:space:]]*$' targets.txt | head -n1)
   local BASE; BASE=$(head -n1 user.txt | tr -d '\r\n')
   local PASS; PASS=$(head -n1 pass.txt | tr -d '\r\n')
 
@@ -589,7 +598,7 @@ cmd_cleanup(){
   echo
   echo "  shell history"
   if [ -f "$HOME/.bash_history" ]; then
-    local H; H=$(grep -ciE 'kameki|nxc |gvm-cli' "$HOME/.bash_history" 2>/dev/null || echo 0)
+    local H; H=$(gcntiE 'kameki|nxc |gvm-cli' "$HOME/.bash_history")
     sed -i '/nxc .*-p /d;/gvm-cli.*--gmp-password/d' "$HOME/.bash_history" 2>/dev/null
     printf "    %-18s %s line(s) scrubbed\n" "bash_history" "$H"
   fi
@@ -761,8 +770,8 @@ info "engine: ${CYN}$ENGINE${RST}"
 for f in targets.txt user.txt pass.txt; do
   [ -s "$f" ] || { err "Missing or empty: $f"; exit 1; }
 done
-UC=$(grep -cve '^\s*$' user.txt); PC=$(grep -cve '^\s*$' pass.txt)
-NTARGETS=$(grep -cve '^\s*$' targets.txt)
+UC=$(nblines user.txt); PC=$(nblines pass.txt)
+NTARGETS=$(nblines targets.txt)
 
 if [ "$UC" -eq 1 ] && [ "$PC" -eq 1 ]; then
   U=$(head -n1 user.txt | tr -d '\r\n'); P=$(head -n1 pass.txt | tr -d '\r\n')
@@ -983,14 +992,14 @@ if is_done nse; then info "skipped (resume)"; else
   mark_done nse
 fi
 cat "$RAW"/nse/*.txt > "$RAW/nse-all.txt" 2>/dev/null || : > "$RAW/nse-all.txt"
-NSE_HITS=$(grep -ciE 'VULNERABLE' "$RAW/nse-all.txt" 2>/dev/null || echo 0)
+NSE_HITS=$(gcntiE 'VULNERABLE' "$RAW/nse-all.txt")
 grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/nse-all.txt" 2>/dev/null | sort -u > "$RAW/cve-service.txt" || true
 SVC_CVES=$(cnt "$RAW/cve-service.txt")
 info "NSE vulnerable states $NSE_HITS   service CVEs $SVC_CVES"
 
 if [ "$HAVE_SPLOIT" -eq 1 ] && [ -s "$RAW/services.xml" ]; then
   searchsploit --nmap "$RAW/services.xml" > "$RAW/searchsploit.txt" 2>&1 || true
-  SPLOIT=$(grep -c 'Exploit Title' "$RAW/searchsploit.txt" 2>/dev/null || echo 0)
+  SPLOIT=$(gcnt 'Exploit Title' "$RAW/searchsploit.txt")
   info "public exploit matches $SPLOIT"
 fi
 fi
@@ -1012,11 +1021,11 @@ else cp "$RAW/auth-fail-raw.txt" "$RAW/auth-fail.txt" 2>/dev/null || : > "$RAW/a
 grep '\[+\]' "$RAW/auth-smb.txt" | sed -E 's/.*\[\+\][[:space:]]*//' | sort -u > "$RAW/working-creds.txt" || true
 
 AUTH_OK=$(cnt "$RAW/auth-ok.txt"); AUTH_FAIL=$(cnt "$RAW/auth-fail.txt")
-NOSIGN=$(grep -c 'signing:False' "$RAW/auth-smb.txt" 2>/dev/null || echo 0)
-SMBV1=$(grep -c 'SMBv1:True' "$RAW/auth-smb.txt" 2>/dev/null || echo 0)
-NULLS=$(grep -c '\[+\]' "$RAW/null-session.txt" 2>/dev/null || echo 0)
-MSSQL_OK=$(grep -c '\[+\]' "$RAW/auth-mssql.txt" 2>/dev/null || echo 0)
-WINRM_OK=$(grep -c '\[+\]' "$RAW/auth-winrm.txt" 2>/dev/null || echo 0)
+NOSIGN=$(gcnt 'signing:False' "$RAW/auth-smb.txt")
+SMBV1=$(gcnt 'SMBv1:True' "$RAW/auth-smb.txt")
+NULLS=$(gcnt '\[+\]' "$RAW/null-session.txt")
+MSSQL_OK=$(gcnt '\[+\]' "$RAW/auth-mssql.txt")
+WINRM_OK=$(gcnt '\[+\]' "$RAW/auth-winrm.txt")
 info "smb $AUTH_OK ok / $AUTH_FAIL fail   no-signing $NOSIGN   smbv1 $SMBV1   null $NULLS   mssql $MSSQL_OK   winrm $WINRM_OK"
 [ "$AUTH_OK" -eq 0 ] && { warn "No SMB authentication succeeded."; dim "try DOMAIN\\\\user, user@domain, or the NETBIOS name"; }
 
@@ -1030,7 +1039,7 @@ for m in $MODS; do pool runmod "$m"; done
 finish
 : > "$RAW/vuln-summary.txt"; : > "$RAW/vuln-detail.txt"
 for m in $MODS; do
-  H=$(grep -ciE 'VULNERABLE|is vulnerable' "$RAW/mods/$m.txt" 2>/dev/null || echo 0)
+  H=$(gcntiE 'VULNERABLE|is vulnerable' "$RAW/mods/$m.txt")
   if [ "$H" -gt 0 ]; then
     printf "    %-16s ${RED}%s vulnerable${RST}\n" "$m" "$H"
     echo "$m: $H" >> "$RAW/vuln-summary.txt"
@@ -1054,12 +1063,12 @@ pool adr ldap "-M user-desc"               user-descriptions
 pool adr ldap "--password-not-required"    pwd-not-required
 pool adr ldap "--trusted-for-delegation"   trusted-delegation
 finish
-ADCS_H=$(grep -ci 'ESC\|Certificate Authority' "$RAW/ad/adcs.txt" 2>/dev/null || echo 0)
+ADCS_H=$(gcnti 'ESC\|Certificate Authority' "$RAW/ad/adcs.txt")
 KERB_H=$(cat "$RAW/ad/kerberoast.txt" "$RAW/ad/kerberoast-tickets.txt" 2>/dev/null | grep -c 'krb5tgs' || echo 0)
 ASREP_H=$(cat "$RAW/ad/asreproast.txt" "$RAW/ad/asrep-tickets.txt" 2>/dev/null | grep -c 'krb5asrep' || echo 0)
-DELEG_H=$(grep -ci 'delegation' "$RAW/ad/delegation.txt" 2>/dev/null || echo 0)
-LDAPSIGN=$(grep -ci 'not enforced\|is not being enforced\|channel binding' "$RAW/ad/ldap-signing.txt" 2>/dev/null || echo 0)
-PWDNR=$(grep -ci 'password not required\|PASSWD_NOTREQD' "$RAW/ad/pwd-not-required.txt" 2>/dev/null || echo 0)
+DELEG_H=$(gcnti 'delegation' "$RAW/ad/delegation.txt")
+LDAPSIGN=$(gcnti 'not enforced\|is not being enforced\|channel binding' "$RAW/ad/ldap-signing.txt")
+PWDNR=$(gcnti 'password not required\|PASSWD_NOTREQD' "$RAW/ad/pwd-not-required.txt")
 info "adcs $ADCS_H   kerberoast $KERB_H   asrep $ASREP_H   delegation $DELEG_H   ldap-signing $LDAPSIGN"
 
 # =====================================================================
@@ -1077,9 +1086,9 @@ pool cf "-M gpp_password"                gpp-password
 pool cf "-M gpp_autologin"               gpp-autologin
 pool cf "-M laps"                        laps
 finish
-WCC_FAIL=$(grep -ciE '\bFAIL\b|not compliant' "$RAW/config-check.txt" 2>/dev/null || echo 0)
-GPP=$(grep -ci 'password' "$RAW/gpp-password.txt" 2>/dev/null || echo 0)
-WRITABLE=$(grep -ci 'READ,WRITE' "$RAW/shares.txt" 2>/dev/null || echo 0)
+WCC_FAIL=$(gcntiE '\bFAIL\b|not compliant' "$RAW/config-check.txt")
+GPP=$(gcnti 'password' "$RAW/gpp-password.txt")
+WRITABLE=$(gcnti 'READ,WRITE' "$RAW/shares.txt")
 info "config failures $WCC_FAIL   writable shares $WRITABLE   gpp $GPP"
 
 # =====================================================================
@@ -1113,7 +1122,7 @@ if [ "$SYSOK" -gt 0 ]; then
     tail -n +2 "$c" | awk -F',' -v H="$h" '{print H","$3","$7","$2","$8","$4}' >> "$RAW/windows-cves.csv" 2>/dev/null || true
   done
   WIN_CVES=$(( $(wc -l < "$RAW/windows-cves.csv") - 1 )); [ "$WIN_CVES" -lt 0 ] && WIN_CVES=0
-  WIN_CRIT=$(grep -ci 'critical' "$RAW/windows-cves.csv" 2>/dev/null || echo 0)
+  WIN_CRIT=$(gcnti 'critical' "$RAW/windows-cves.csv")
   grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/windows-cves.csv" 2>/dev/null | sort -u > "$RAW/cve-windows.txt" || true
   info "windows CVEs $WIN_CVES   critical $WIN_CRIT"
 fi
@@ -1154,14 +1163,14 @@ if [ "$TLSN" -gt 0 ]; then
   else
     nmap -Pn -n --script ssl-enum-ciphers,ssl-cert,ssl-dh-params,sslv2,ssl-heartbleed,ssl-poodle,ssl-ccs-injection,rdp-enum-encryption \
          -p 443,8443,636,993,995,3389 -iL "$RAW/live.txt" -oN "$RAW/tls/nmap-ssl.txt" >/dev/null 2>&1
-    TLS_ISSUES=$(grep -cE 'VULNERABLE|SSLv2|SSLv3|TLSv1\.0|weak' "$RAW/tls/nmap-ssl.txt" 2>/dev/null || echo 0)
+    TLS_ISSUES=$(gcntE 'VULNERABLE|SSLv2|SSLv3|TLSv1\.0|weak' "$RAW/tls/nmap-ssl.txt")
   fi
 fi
 SNMPN=0
 if [ "$HAVE_SNMP" -eq 1 ]; then
   printf 'public\nprivate\ncisco\nmanager\nadmin\ncommunity\nsecret\n' > "$RAW/snmp-strings.txt"
   onesixtyone -c "$RAW/snmp-strings.txt" -i "$RAW/live.txt" > "$RAW/snmp.txt" 2>&1 || true
-  SNMPN=$(grep -c '^\[' "$RAW/snmp.txt" 2>/dev/null || echo 0)
+  SNMPN=$(gcnt '^\[' "$RAW/snmp.txt")
 fi
 awk '{split($2,p,","); for(i in p) if(p[i]=="80"||p[i]=="443"||p[i]=="8000"||p[i]=="8080"||p[i]=="8443"||p[i]=="9443"){print $1; break}}' \
     "$RAW/ports/map.txt" 2>/dev/null | sort -u > "$RAW/web-hosts.txt" || : > "$RAW/web-hosts.txt"
@@ -1195,7 +1204,7 @@ fi
 : > "$RAW/risk-scores.txt"
 while read -r ip _; do
   [ -z "$ip" ] && continue; s=0
-  s=$((s + $(grep -c "^$ip," "$RAW/windows-cves.csv" 2>/dev/null || echo 0) * 2))
+  s=$((s + $(gcnt "^$ip," "$RAW/windows-cves.csv") * 2))
   if [ -s "$NVT_CSV" ]; then
     s=$((s + $(awk -F'","' -v I="$ip" 'NR>1{gsub(/^"/,"",$1); if($1==I && tolower($6)~/high/) c++} END{print c+0}' "$NVT_CSV") * 60))
     s=$((s + $(awk -F'","' -v I="$ip" 'NR>1{gsub(/^"/,"",$1); if($1==I && tolower($6)~/medium/) c++} END{print c+0}' "$NVT_CSV") * 15))
@@ -1205,7 +1214,7 @@ while read -r ip _; do
   grep -q "$ip.*SMBv1:True"    "$RAW/auth-smb.txt" 2>/dev/null && s=$((s+120))
   grep -q "$ip" "$RAW/null-session.txt" 2>/dev/null && s=$((s+60))
   grep -q "$ip" "$RAW/eol-os.txt" 2>/dev/null && s=$((s+200))
-  s=$((s + $(grep -ciE 'VULNERABLE' "$RAW/nse/${ip}.txt" 2>/dev/null || echo 0) * 40))
+  s=$((s + $(gcntiE 'VULNERABLE' "$RAW/nse/${ip}.txt") * 40))
   s=$((s + $(jq -r --arg h "$ip" 'select(.host|test($h))|select(.info.severity=="critical" or .info.severity=="high")|.host' "$RAW/nuclei.json" 2>/dev/null | wc -l) * 50))
   [ "$s" -gt 1000 ] && s=1000
   [ "$s" -gt 0 ] && echo "$s $ip" >> "$RAW/risk-scores.txt"
@@ -1224,9 +1233,6 @@ sort -rn "$RAW/risk-scores.txt" -o "$RAW/risk-scores.txt" 2>/dev/null || true
 PATHS=$(cnt "$RAW/attack-paths.txt")
 
 T1=$(date +%s); MINS=$(( (T1-T0)/60 ))
-APCT=0; SPCT=0; NVT_APCT=0
-[ "$LIVE" -gt 0 ] && { APCT=$(( AUTH_OK*100/LIVE )); SPCT=$(( SYSOK*100/LIVE )); }
-[ "$NVT_HOSTS_F" -gt 0 ] && NVT_APCT=$(( NVT_AUTH_HOSTS*100/NVT_HOSTS_F ))
 
 # =====================================================================
 #  Self check: did this scan actually assess anything?
@@ -1234,13 +1240,17 @@ APCT=0; SPCT=0; NVT_APCT=0
 step "Self check"
 AUTH_FINDINGS=0; AUTH_DEPTH=0; DEPTH_VERDICT="unknown"
 if [ "$RUN_NVT" -eq 1 ] && [ -s "$NVT_CSV" ]; then
-  AUTH_FINDINGS=$(grep -ci 'Authenticated \(registry\|package\)-based' "$NVT_CSV" 2>/dev/null || echo 0)
+  AUTH_FINDINGS=$(gcnti 'Authenticated \(registry\|package\)-based' "$NVT_CSV")
   [ "$NVT_AUTH_HOSTS" -gt 0 ] && AUTH_DEPTH=$(( AUTH_FINDINGS * 100 / NVT_AUTH_HOSTS ))
 elif [ "$RUN_SA" -eq 1 ]; then
   AUTH_FINDINGS="$WIN_CVES"
   [ "$SYSOK" -gt 0 ] && AUTH_DEPTH=$(( AUTH_FINDINGS * 100 / SYSOK ))
 fi
 DEPTH_H=$(( AUTH_DEPTH / 100 ))
+APCT=0; SPCT=0; NVT_APCT=0
+[ "$LIVE" -gt 0 ] && { APCT=$(( AUTH_OK*100/LIVE )); SPCT=$(( SYSOK*100/LIVE )); }
+[ "$NVT_HOSTS_F" -gt 0 ] && NVT_APCT=$(( NVT_AUTH_HOSTS*100/NVT_HOSTS_F ))
+COVER_PCT=$([ "$RUN_NVT" -eq 1 ] && echo "$NVT_APCT" || echo "$SPCT")
 
 if [ "$AUTH_FINDINGS" -eq 0 ]; then
   DEPTH_VERDICT="none"
@@ -1299,7 +1309,7 @@ Respond with JSON only, no prose outside it:
     [ -e "$f" ] || continue
     [ "$LLM_CALLS" -ge "$LLM_MAX_CALLS" ] && break
     h=$(basename "$f" .txt)
-    hc=$(grep -c "^$h," "$RAW/windows-cves.csv" 2>/dev/null || echo 0)
+    hc=$(gcnt "^$h," "$RAW/windows-cves.csv")
     [ "$hc" -eq 0 ] && continue
 
     osline=$(grep -i '^OS Name' "$f" | head -1)
@@ -1369,7 +1379,7 @@ Rules:
   NAR_USR="Hosts in scope: $NTARGETS
 Hosts responding: $LIVE
 Hosts where credentials took effect: $([ "$RUN_NVT" -eq 1 ] && echo "$NVT_AUTH_HOSTS" || echo "$SYSOK")
-Authenticated coverage: ${COVER_PCT:-0}%
+Authenticated coverage: ${COVER_PCT}%
 Authenticated findings per authenticated host: ${DEPTH_H}.$(printf '%02d' $((AUTH_DEPTH % 100)))
 Depth verdict: $DEPTH_VERDICT
 Unique CVEs: $ALL_CVES
@@ -1462,7 +1472,6 @@ echo "| **Actively exploited (CISA KEV)** | **$KEV_HITS** |"
 echo "| Confirmed exploitable services | $MOD_VULN |"
 echo "| Attack paths identified | $PATHS |"
 echo
-COVER_PCT=$([ "$RUN_NVT" -eq 1 ] && echo "$NVT_APCT" || echo "$SPCT")
 echo "### Did this assessment actually authenticate?"
 echo
 echo "Two axes. Breadth without depth is the failure mode that looks like success."
