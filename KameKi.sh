@@ -914,6 +914,21 @@ if [ "$RUN_SA" -eq 1 ] && [ "$SA_READY" -eq 0 ]; then
 fi
 info "engine: ${CYN}$ENGINE${RST}"
 
+# nmap needs raw sockets for the ICMP, ACK and UDP probes in Stage 1 and for
+# -sS and -O in Stage 2. Unprivileged it silently falls back to TCP connect,
+# so the run undercounts live hosts and skips OS detection while still looking
+# like it completed. Say so rather than letting it pass unnoticed.
+UNPRIV=0
+if [ "$(id -u)" -ne 0 ]; then
+  UNPRIV=1
+  echo
+  warn "running without root, nmap falls back to TCP connect probes:"
+  dim "Stage 1 loses ICMP, ACK and UDP discovery, so live hosts are undercounted"
+  dim "Stage 2 loses -sS, and OS detection does not run at all"
+  dim "for complete coverage re-run as: sudo $0 run"
+  echo
+fi
+
 # =====================================================================
 #  2. Inputs
 # =====================================================================
@@ -1604,6 +1619,7 @@ echo
 echo "**Generated:** $STAMP  "
 echo "**Runtime:** ${MINS} minutes  "
 echo "**Engine:** \`$ENGINE\`$([ "$RUN_NVT" -eq 1 ] && echo "  (Greenbone $NVT_FILES NVTs, $CFG_NAME)")  "
+[ "$UNPRIV" -eq 1 ] && echo "**Scan privilege:** unprivileged. nmap used TCP connect probes, so live-host discovery undercounts and OS detection did not run.  "
 echo "**Profile:** \`$PROFILE\` ($PORTSPEC, $JOBS workers)  "
 echo "**Windows credentials:** $CREDLBL  "
 echo "**Linux credentials:** $([ "$SSH_ON" -eq 1 ] && echo supplied || echo "not supplied")  "
