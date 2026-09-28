@@ -7,6 +7,7 @@
 #    install --bundle F install from an offline bundle (no internet)
 #    install --no-nvt   install without the Greenbone/NVT backend, the
 #                       standalone engine is used instead
+#    update             refresh templates, CVE data and definitions
 #    bundle             build an offline bundle at the office
 #    doctor             diagnose what is missing or broken, including auth
 #    preflight          test credential formats safely against one host
@@ -300,9 +301,27 @@ cmd_install(){
   apt-get update -qq || { warn "apt update had errors"; DEGRADED=1; }
 
   info "installing system packages"
-  apt-get install -y -qq nmap jq gawk curl git zstd unzip python3-pip pipx \
-                         exploitdb onesixtyone poppler-utils >/dev/null 2>&1 \
-    || { warn "some system packages failed, continuing"; DEGRADED=1; }
+  # One apt-get call for the whole set is all-or-nothing when a name will not
+  # resolve, and returns a single exit code when one download fails. Either way
+  # the old code warned once and moved on, so a missing package was only
+  # discovered later by doctor. Retry individually and name what is missing.
+  local -a SYS_PKGS=(nmap jq gawk curl git zstd unzip python3-pip pipx
+                     exploitdb onesixtyone poppler-utils)
+  local MISSING_PKGS="" pkg
+  if ! apt-get install -y -qq "${SYS_PKGS[@]}" >/dev/null 2>&1; then
+    warn "bulk package install failed, retrying one at a time"
+    for pkg in "${SYS_PKGS[@]}"; do
+      apt-get install -y -qq "$pkg" >/dev/null 2>&1 \
+        || MISSING_PKGS="$MISSING_PKGS $pkg"
+    done
+  fi
+  if [ -n "$MISSING_PKGS" ]; then
+    warn "could not install:$MISSING_PKGS"
+    dim "nmap, jq, gawk and curl are required; the rest are optional"
+    dim "install them by hand, or build a bundle where you have internet:"
+    dim "  sudo $0 bundle    then on site:  sudo $0 install --bundle <file>"
+    DEGRADED=1
+  fi
 
   if [ "$WITH_NVT" -eq 1 ]; then
     info "installing Greenbone scanner backend"
@@ -330,8 +349,6 @@ cmd_install(){
     fi
     rm -rf "$T"
   fi
-  have nuclei && { info "updating nuclei templates"; nuclei -update-templates -silent >/dev/null 2>&1 || warn "template update failed"; }
-
   if [ ! -d /usr/share/nmap/scripts/vulscan ]; then
     info "installing vulscan offline CVE database"
     git clone -q --depth 1 "$VULSCAN_REPO" /usr/share/nmap/scripts/vulscan >/dev/null 2>&1 \
@@ -346,13 +363,9 @@ cmd_install(){
       || warn "testssl.sh clone failed"
   fi
 
-  info "fetching WES-NG definitions"
-  local WESBIN=""; for c in wes wes.py; do have "$c" && { WESBIN="$c"; break; }; done
-  [ -n "$WESBIN" ] && { su "${SUDO_USER:-root}" -c "$WESBIN --update" >/dev/null 2>&1 || warn "WES-NG definition update failed"; }
-
-  info "fetching CISA KEV catalogue"
-  curl -s --max-time 60 -o "${SUDO_USER:+/home/$SUDO_USER/}.kameki-kev.json" "$KEV_URL" 2>/dev/null \
-    || curl -s --max-time 60 -o /root/.kameki-kev.json "$KEV_URL" 2>/dev/null || warn "KEV download failed"
+  # Every data source is refreshed by one pass, so installing and updating
+  # cannot drift apart and each result is reported individually.
+  cmd_update || DEGRADED=1
 
   if have gvmd && [ "$WITH_NVT" -eq 1 ]; then
     echo
@@ -699,6 +712,75 @@ cmd_cleanup(){
 }
 
 # =====================================================================
+#  update   (refresh every data source; run at the end of install too)
+# =====================================================================
+user_home(){
+  local h; h=$(getent passwd "${SUDO_USER:-root}" 2>/dev/null | cut -d: -f6)
+  [ -n "$h" ] && echo "$h" || echo "${HOME:-/root}"
+}
+
+# pipx puts wes in the invoking user's ~/.local/bin, which is not on root's
+# PATH during a sudo install. Resolving it only with `command -v` therefore
+# found nothing and the definition update was skipped without a word.
+find_wes(){
+  local uh c; uh=$(user_home)
+  for c in "$uh/.local/bin/wes" "$uh/.local/bin/wes.py" wes wes.py; do
+    command -v "$c" >/dev/null 2>&1 && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+cmd_update(){
+  local FAILED="" UH WESBIN
+  UH=$(user_home)
+  step "kameki update  (refreshing every data source)"
+
+  if have nuclei; then
+    printf "    %-22s" "nuclei templates"
+    if nuclei -update-templates -silent >/dev/null 2>&1; then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; FAILED="$FAILED nuclei-templates"; fi
+  fi
+
+  if [ -d /usr/share/nmap/scripts/vulscan/.git ]; then
+    printf "    %-22s" "vulscan CVE database"
+    if ( cd /usr/share/nmap/scripts/vulscan && git pull -q ) >/dev/null 2>&1 \
+       && nmap --script-updatedb >/dev/null 2>&1; then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; FAILED="$FAILED vulscan"; fi
+  fi
+
+  if [ -d /opt/testssl.sh/.git ]; then
+    printf "    %-22s" "testssl.sh"
+    if ( cd /opt/testssl.sh && git pull -q ) >/dev/null 2>&1; then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; FAILED="$FAILED testssl.sh"; fi
+  fi
+
+  printf "    %-22s" "WES-NG definitions"
+  if WESBIN=$(find_wes); then
+    # run as the invoking user, from their home, so definitions.zip lands
+    # where doctor and the run stage look for it
+    if ( cd "$UH" && su "${SUDO_USER:-root}" -c "'$WESBIN' --update" ) >/dev/null 2>&1
+    then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; FAILED="$FAILED wes-definitions"; fi
+  else
+    echo "${YEL}wes not installed${RST}"; FAILED="$FAILED wes-definitions"
+  fi
+
+  printf "    %-22s" "CISA KEV catalogue"
+  if curl -s --max-time 60 -o "$UH/.kameki-kev.json" "$KEV_URL" 2>/dev/null \
+     && [ -s "$UH/.kameki-kev.json" ]; then echo "${GRN}ok${RST}"
+  else echo "${YEL}failed${RST}"; FAILED="$FAILED kev"; fi
+
+  echo
+  if [ -n "$FAILED" ]; then
+    warn "not refreshed:$FAILED"
+    dim "re-run when you have internet: sudo $0 update"
+    return 1
+  fi
+  info "all data sources current"
+  return 0
+}
+
+# =====================================================================
 #  usage
 # =====================================================================
 cmd_usage(){
@@ -712,6 +794,7 @@ cmd_usage(){
 SUB="${1:-run}"
 case "$SUB" in
   install)   shift; cmd_install "$@"; exit $? ;;
+  update)    shift; cmd_update "$@"; exit $? ;;
   bundle)    shift; cmd_bundle "$@"; exit $? ;;
   doctor)    shift; cmd_doctor "$@"; exit $? ;;
   preflight) shift; cmd_preflight "$@"; exit $? ;;
