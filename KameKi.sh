@@ -15,8 +15,11 @@
 #
 #  Engines
 #    nvt         full Greenbone NVT feed (~100k scripts) over the gvmd
-#                socket. No web UI. Used automatically when available.
+#                socket. No web UI.
 #    standalone  WES-NG patch mapping, nmap NSE, service CVE mapping.
+#    both        run both. ENGINE=auto picks this whenever Greenbone is
+#                usable, because the two cover different ground and the
+#                standalone results are not reproduced by the NVT feed.
 #
 #  On top of whichever engine runs, always: Active Directory assessment,
 #  configuration audit, TLS, web, SNMP, CISA KEV correlation, attack path
@@ -800,10 +803,21 @@ echo "    ${DIM}optional: testssl.sh $HAVE_TESTSSL  searchsploit $HAVE_SPLOIT  o
 
 # --- resolve engine
 case "$ENGINE" in
-  auto)       if [ "$NVT_READY" -eq 1 ]; then ENGINE=nvt; else ENGINE=standalone; fi ;;
+  auto)
+    # The two engines are complementary, not alternatives. Greenbone's NVTs do
+    # not replace WES-NG patch mapping, the NSE vulnerability scripts or the
+    # service version CVE mapping, so when both are usable, run both.
+    if   [ "$NVT_READY" -eq 1 ] && [ "$SA_READY" -eq 1 ]; then ENGINE=both
+    elif [ "$NVT_READY" -eq 1 ];                          then ENGINE=nvt
+    else                                                       ENGINE=standalone
+    fi ;;
   nvt)        [ "$NVT_READY" -eq 1 ] || { err "ENGINE=nvt but Greenbone is not available. Run: $0 --setup"; exit 1; } ;;
   standalone) : ;;
-  both)       [ "$NVT_READY" -eq 1 ] || { err "ENGINE=both requires Greenbone."; exit 1; } ;;
+  both)
+    if [ "$NVT_READY" -eq 0 ]; then
+      warn "ENGINE=both but Greenbone is not available, running the standalone engine alone"
+      ENGINE=standalone
+    fi ;;
   *) err "ENGINE must be auto, nvt, standalone or both"; exit 1 ;;
 esac
 RUN_NVT=0; RUN_SA=0
@@ -829,10 +843,14 @@ NTARGETS=$(nblines targets.txt)
 if [ "$UC" -eq 1 ] && [ "$PC" -eq 1 ]; then
   U=$(head -n1 user.txt | tr -d '\r\n'); P=$(head -n1 pass.txt | tr -d '\r\n')
   CREDLBL="$U"; MULTI=0
+  NVT_U="$U"; NVT_P="$P"
 else
   U="user.txt"; P="pass.txt"; CREDLBL="$UC user x $PC pass"; MULTI=1
-  [ "$RUN_NVT" -eq 1 ] && { warn "nvt engine takes a single credential pair; using the first line of each"; \
-                            U=$(head -n1 user.txt | tr -d '\r\n'); P=$(head -n1 pass.txt | tr -d '\r\n'); }
+  # A GMP credential object holds exactly one pair, but the standalone engine
+  # iterates the files. Keep them separate so selecting the NVT engine no
+  # longer silently reduces the standalone engine to the first pair.
+  NVT_U=$(head -n1 user.txt | tr -d '\r\n'); NVT_P=$(head -n1 pass.txt | tr -d '\r\n')
+  [ "$RUN_NVT" -eq 1 ] && warn "nvt engine takes one credential pair, using the first line of each; the standalone engine still uses all of them"
   if [ "$MULTI" -eq 1 ] && [ "$RUN_SA" -eq 1 ]; then
     echo; warn "Multi-credential: $(( UC * PC * NTARGETS )) attempts. This is a spray and can lock accounts."
     read -rp "    Type YES to continue: " C; [ "$C" = "YES" ] || { err "Aborted."; exit 1; }
@@ -932,8 +950,8 @@ else
 info "GMP $(echo "$V" | xtag version) authenticated"
 
 R=$(gmp "<create_credential><name>kameki-smb-$RUN_NAME</name><type>up</type>
-  <allow_insecure>1</allow_insecure><login>$(xesc "$U")</login>
-  <password>$(xesc "$P")</password></create_credential>")
+  <allow_insecure>1</allow_insecure><login>$(xesc "$NVT_U")</login>
+  <password>$(xesc "$NVT_P")</password></create_credential>")
 SMB_CRED=$(echo "$R" | xid)
 [ -n "$SMB_CRED" ] || { err "SMB credential creation failed"; echo "$R" | head -3; }
 
