@@ -5,6 +5,8 @@
 #  Subcommands
 #    install            install every dependency (needs internet)
 #    install --bundle F install from an offline bundle (no internet)
+#    install --no-nvt   install without the Greenbone/NVT backend, the
+#                       standalone engine is used instead
 #    bundle             build an offline bundle at the office
 #    doctor             diagnose what is missing or broken, including auth
 #    preflight          test credential formats safely against one host
@@ -85,6 +87,18 @@ err(){  echo "${RED}[-]${RST} $*"; }
 step(){ echo; echo "${CYN}── $* ${RST}"; }
 dim(){  echo "${DIM}    $*${RST}"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
+# net_open HOST PORT -> 0 when a TCP connection succeeds inside five seconds.
+# Client networks routinely block outbound 80 and 873, and finding that out
+# after a long apt run or a 5 GB rsync attempt wastes site time.
+net_open(){
+  # Bounded by timeout(1) because a blackholed address otherwise stalls for
+  # over a minute. Without timeout the probe cannot be bounded, so report
+  # reachable rather than risk the stall this check exists to avoid.
+  have timeout || return 0
+  # /dev/tcp is built into the bash this script already requires, so it needs
+  # no extra package and no nc variant that may or may not support -z.
+  timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2 && exec 3<&-" >/dev/null 2>&1
+}
 cnt(){ [ -f "$1" ] && grep -c . "$1" 2>/dev/null | head -1 || echo 0; }
 # count matches safely: always one integer on stdout, never two, never empty.
 # `grep -c` prints 0 AND exits 1 on no match, so a bare `|| echo 0` yields "0\n0"
@@ -260,13 +274,32 @@ cmd_install(){
   fi
 
   # ---- online install
+  local DEGRADED=0
+
+  # Check the two egress paths the online install needs before using them.
+  if net_open archive.ubuntu.com 80 || net_open deb.debian.org 80 \
+     || net_open security.ubuntu.com 80; then :; else
+    warn "no outbound access to the distribution mirrors on port 80"
+    dim "package installation will fail here. build a bundle where you do"
+    dim "have internet, then carry it in:"
+    dim "  sudo $0 bundle"
+    dim "  sudo $0 install --bundle <file>"
+    DEGRADED=1
+  fi
+  if [ "$WITH_NVT" -eq 1 ] && ! net_open feed.community.greenbone.net 873; then
+    warn "no outbound access to the Greenbone feed on rsync port 873"
+    dim "the NVT feed cannot sync on this network. the standalone engine"
+    dim "needs no feed and produces a full assessment without it:"
+    dim "  sudo $0 install --no-nvt"
+  fi
+
   info "updating package lists"
-  apt-get update -qq || warn "apt update had errors"
+  apt-get update -qq || { warn "apt update had errors"; DEGRADED=1; }
 
   info "installing system packages"
   apt-get install -y -qq nmap jq gawk curl git zstd unzip python3-pip pipx \
                          exploitdb onesixtyone poppler-utils >/dev/null 2>&1 \
-    || warn "some system packages failed, continuing"
+    || { warn "some system packages failed, continuing"; DEGRADED=1; }
 
   if [ "$WITH_NVT" -eq 1 ]; then
     info "installing Greenbone scanner backend"
@@ -320,14 +353,34 @@ cmd_install(){
 
   if have gvmd && [ "$WITH_NVT" -eq 1 ]; then
     echo
-    warn "Greenbone needs one more manual step, it prints a password you must save:"
-    dim "sudo gvm-setup"
-    dim "sudo greenbone-feed-sync        # ~5 GB, do this before leaving the office"
+    warn "Greenbone needs manual steps before the NVT engine can be used:"
+    if have gvm-setup; then
+      dim "sudo gvm-setup                  # save the admin password it prints"
+    else
+      # gvm-setup is a Kali helper shipped in Kali's gvm metapackage. Debian
+      # and Ubuntu install the same daemons without it, so the equivalent
+      # steps have to be run by hand. Checking for gvmd told us the daemon is
+      # present, which is not the same as the helper being present.
+      dim "this distribution installed gvmd but not the gvm-setup helper,"
+      dim "which ships with Kali. the same three steps have to be run by hand:"
+      dim "  1. generate the server certificates   (gvm-manage-certs -a)"
+      dim "  2. start redis, ospd-openvas and gvmd (systemctl enable --now ...)"
+      dim "  3. create the admin user, running gvmd as its own service account"
+      dim "     exact flags vary by gvmd version, check: gvmd --help"
+      dim "unless you specifically need the NVT engine, skip all of it:"
+      dim "  $0 install --no-nvt"
+    fi
+    dim "sudo greenbone-feed-sync        # ~5 GB over rsync/873, do this before leaving the office"
     dim "then put the admin credentials in gmp-user.txt and gmp-pass.txt"
+    dim "if any of that is not possible on site: $0 install --no-nvt"
   fi
 
   echo
-  info "install complete"
+  if [ "$DEGRADED" -eq 1 ]; then
+    warn "install finished with errors, some components are missing"
+  else
+    info "install complete"
+  fi
   dim "open a new shell for PATH changes, then: $0 doctor"
 }
 
