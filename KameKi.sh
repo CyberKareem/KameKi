@@ -863,14 +863,20 @@ chk jq     "sudo apt install jq -y"                                  || MISS=1
 
 # --- nvt engine availability
 NVT_READY=0; SOCK=""; NVT_FILES=0
+# Count the feed unconditionally, the way doctor does. Counting it only when
+# GMP credentials happen to exist left NVT_FILES at 0 and made the diagnostic
+# below report "feed incomplete (0 NVTs)" on machines with a fully synced
+# feed, sending people to re-run a 5 GB greenbone-feed-sync they did not need.
+[ -d /var/lib/openvas/plugins ] \
+  && NVT_FILES=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
 if command -v gvm-cli >/dev/null 2>&1; then
   for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock \
            /var/run/gvm/gvmd.sock "$HOME/.gvm/gvmd/gvmd.sock"; do
     [ -S "$s" ] && { SOCK="$s"; break; }
   done
-  if [ -n "$SOCK" ] && [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
-    NVT_FILES=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
-    [ "$NVT_FILES" -ge 10000 ] && NVT_READY=1
+  if [ -n "$SOCK" ] && [ "$NVT_FILES" -ge 10000 ] \
+     && [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
+    NVT_READY=1
   fi
 fi
 if [ "$NVT_READY" -eq 1 ]; then
