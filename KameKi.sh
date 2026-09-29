@@ -8,6 +8,8 @@
 #    install --no-nvt   install without the Greenbone/NVT backend, the
 #                       standalone engine is used instead
 #    update             refresh templates, CVE data and definitions
+#    setup-greenbone    certificates, services, admin user and GMP
+#                       credentials. run by install automatically
 #    bundle             build an offline bundle at the office
 #    doctor             diagnose what is missing or broken, including auth
 #    preflight          test credential formats safely against one host
@@ -387,26 +389,10 @@ cmd_install(){
 
   if have gvmd && [ "$WITH_NVT" -eq 1 ]; then
     echo
-    warn "Greenbone needs manual steps before the NVT engine can be used:"
-    if have gvm-setup; then
-      dim "sudo gvm-setup                  # save the admin password it prints"
-    else
-      # gvm-setup is a Kali helper shipped in Kali's gvm metapackage. Debian
-      # and Ubuntu install the same daemons without it, so the equivalent
-      # steps have to be run by hand. Checking for gvmd told us the daemon is
-      # present, which is not the same as the helper being present.
-      dim "this distribution installed gvmd but not the gvm-setup helper,"
-      dim "which ships with Kali. the same three steps have to be run by hand:"
-      dim "  1. generate the server certificates   (gvm-manage-certs -a)"
-      dim "  2. start redis, ospd-openvas and gvmd (systemctl enable --now ...)"
-      dim "  3. create the admin user, running gvmd as its own service account"
-      dim "     exact flags vary by gvmd version, check: gvmd --help"
-      dim "unless you specifically need the NVT engine, skip all of it:"
-      dim "  $0 install --no-nvt"
-    fi
-    dim "sudo greenbone-feed-sync        # ~5 GB over rsync/873, do this before leaving the office"
-    dim "then put the admin credentials in gmp-user.txt and gmp-pass.txt"
-    dim "if any of that is not possible on site: $0 install --no-nvt"
+    cmd_setup_greenbone || {
+      warn "Greenbone is not usable yet; the standalone engine is unaffected"
+      dim "retry later with: sudo $0 setup-greenbone"
+    }
   fi
 
   echo
@@ -799,6 +785,156 @@ cmd_update(){
 }
 
 # =====================================================================
+#  setup-greenbone   (certificates, services, admin user, GMP credentials)
+# =====================================================================
+# Everything here is idempotent and fail-soft. Greenbone is optional, so a
+# failure at any step leaves the standalone engine perfectly usable and must
+# never abort the install. The feed itself is deliberately NOT synced here:
+# it is ~5 GB over rsync/873 and routinely blocked on client networks, so it
+# stays an explicit decision.
+GVM_ACCOUNT=""            # the system account gvmd runs as
+gvm_service_account(){
+  local u
+  for u in _gvm gvm; do id -u "$u" >/dev/null 2>&1 && { echo "$u"; return 0; }; done
+  return 1
+}
+
+gvmd_socket(){
+  local s
+  for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock \
+           /var/run/gvm/gvmd.sock "$HOME/.gvm/gvmd/gvmd.sock"; do
+    [ -S "$s" ] && { echo "$s"; return 0; }
+  done
+  return 1
+}
+
+greenbone_ready_report(){
+  local NVTS=0
+  [ -d /var/lib/openvas/plugins ] \
+    && NVTS=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
+  echo
+  if [ "$NVTS" -ge 10000 ]; then
+    info "Greenbone ready, $NVTS NVTs. the next run uses both engines"
+    dim "confirm any time with: $0 doctor"
+  else
+    warn "Greenbone authenticates but the feed holds only $NVTS scripts"
+    dim "the engine needs 10000. sudo greenbone-feed-sync   # ~5 GB, not run for you"
+    dim "blocked on site? the standalone engine needs no feed"
+  fi
+}
+
+gmp_auth_ok(){   # user pass socket -> 0 when gvmd actually accepts them
+  have gvm-cli || return 1
+  gvm-cli --gmp-username "$1" --gmp-password "$2" \
+          socket --socketpath "$3" --xml "<get_version/>" 2>&1 \
+    | grep -q 'status="200"'
+}
+
+cmd_setup_greenbone(){
+  need_root setup-greenbone
+  step "Greenbone setup"
+
+  if ! have gvmd; then
+    warn "gvmd is not installed, nothing to set up"
+    dim "the standalone engine needs none of this: $0 run"
+    return 1
+  fi
+
+  # 1. certificates ---------------------------------------------------
+  if have gvm-manage-certs; then
+    printf "    %-24s" "certificates"
+    if gvm-manage-certs -a >/dev/null 2>&1; then echo "${GRN}ok${RST}"
+    else echo "${YEL}skipped${RST}"; fi
+  fi
+
+  # 2. services -------------------------------------------------------
+  local svc
+  for svc in redis-server@openvas ospd-openvas gvmd; do
+    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || continue
+    printf "    %-24s" "$svc"
+    if systemctl enable --now "$svc" >/dev/null 2>&1; then echo "${GRN}started${RST}"
+    else echo "${YEL}failed${RST}"; fi
+  done
+
+  # 3. wait for the socket --------------------------------------------
+  printf "    %-24s" "gvmd socket"
+  local tries=15 SOCK=""
+  while [ "$tries" -gt 0 ]; do
+    SOCK=$(gvmd_socket) && break
+    tries=$((tries - 1))
+    sleep 2
+  done
+  if [ -z "$SOCK" ]; then
+    echo "${YEL}not present after 30s${RST}"
+    dim "gvmd did not come up. check: systemctl status gvmd"
+    return 1
+  fi
+  echo "${GRN}$SOCK${RST}"
+
+  # 4. admin user and credentials -------------------------------------
+  if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
+    printf "    %-24s" "GMP authentication"
+    if gmp_auth_ok "$(head -n1 gmp-user.txt)" "$(head -n1 gmp-pass.txt)" "$SOCK"; then
+      echo "${GRN}ok, existing credentials${RST}"
+      greenbone_ready_report; return 0
+    fi
+    echo "${YEL}existing credentials rejected, replacing them${RST}"
+  fi
+
+  GVM_ACCOUNT=$(gvm_service_account) || {
+    warn "no _gvm or gvm system account, cannot create the admin user"
+    return 1
+  }
+
+  local GU="kameki-admin" GP
+  GP=$(head -c 32 /dev/urandom | base64 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 24)
+  [ -n "$GP" ] || GP=$(date +%s%N | sha256sum | head -c 24)
+
+  printf "    %-24s" "admin user"
+  # The password flag moved between gvmd versions and the user may already
+  # exist, so each combination is tried and then PROVEN by opening a real GMP
+  # session. An exit code of 0 from gvmd is not evidence the password took.
+  local made=0 f
+  for f in --password --new-password; do
+    runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" "$f=$GP" >/dev/null 2>&1 || true
+    gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
+    runuser -u "$GVM_ACCOUNT" -- gvmd "--user=$GU" "$f=$GP" >/dev/null 2>&1 || true
+    gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
+  done
+  if [ "$made" -eq 0 ]; then
+    echo "${RED}failed${RST}"
+    dim "gvmd accepted no password flag this build understands, or the user"
+    dim "could not be created. do it by hand and re-run this command:"
+    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --help   # find the flag"
+    GP=""
+    return 1
+  fi
+  echo "${GRN}$GU${RST}"
+
+  printf '%s\n' "$GU" > gmp-user.txt
+  printf '%s\n' "$GP" > gmp-pass.txt
+  chmod 600 gmp-user.txt gmp-pass.txt
+  [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" gmp-user.txt gmp-pass.txt 2>/dev/null
+  GP=""
+
+  # 5. prove the files on disk work, not just the ones in memory --------
+  printf "    %-24s" "GMP authentication"
+  if gmp_auth_ok "$(head -n1 gmp-user.txt)" "$(head -n1 gmp-pass.txt)" "$SOCK"; then
+    echo "${GRN}ok${RST}"
+  else
+    echo "${RED}failed${RST}"
+    dim "the credentials did not survive being written, removing them so"
+    dim "nothing later mistakes this for a working configuration"
+    rm -f gmp-user.txt gmp-pass.txt
+    return 1
+  fi
+  printf "    %-24s%s\n" "credential files" "${GRN}gmp-user.txt, gmp-pass.txt, mode 600${RST}"
+
+  greenbone_ready_report
+  return 0
+}
+
+# =====================================================================
 #  usage
 # =====================================================================
 cmd_usage(){
@@ -813,6 +949,7 @@ SUB="${1:-run}"
 case "$SUB" in
   install)   shift; cmd_install "$@"; exit $? ;;
   update)    shift; cmd_update "$@"; exit $? ;;
+  setup-greenbone) shift; cmd_setup_greenbone "$@"; exit $? ;;
   bundle)    shift; cmd_bundle "$@"; exit $? ;;
   doctor)    shift; cmd_doctor "$@"; exit $? ;;
   preflight) shift; cmd_preflight "$@"; exit $? ;;
