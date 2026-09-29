@@ -823,12 +823,15 @@ greenbone_ready_report(){
   fi
 }
 
-gmp_auth_ok(){   # user pass socket -> 0 when gvmd actually accepts them
-  have gvm-cli || return 1
-  gvm-cli --gmp-username "$1" --gmp-password "$2" \
-          socket --socketpath "$3" --xml "<get_version/>" 2>&1 \
-    | grep -q 'status="200"'
+GMP_LAST=""        # whatever gvm-cli said on the most recent check
+gmp_auth_ok(){     # user pass socket -> 0 when gvmd actually accepts them
+  have gvm-cli || { GMP_LAST="gvm-cli is not installed"; return 1; }
+  GMP_LAST=$(gvm-cli --gmp-username "$1" --gmp-password "$2" \
+                     socket --socketpath "$3" --xml "<get_version/>" 2>&1)
+  printf '%s' "$GMP_LAST" | grep -q 'status="200"'
 }
+
+_trim(){ printf '%s' "$1" | tr '\n' ' ' | tr -s ' ' | cut -c1-150; }
 
 cmd_setup_greenbone(){
   need_root setup-greenbone
@@ -899,46 +902,53 @@ cmd_setup_greenbone(){
   [ -n "$GP" ] || GP=$(date +%s%N | sha256sum | head -c 24)
 
   printf "    %-24s" "admin user"
-  # gvmd's documented path is: --create-user on its own creates the account and
-  # PRINTS a generated password, then --user with --new-password changes it.
-  # Pairing --create-user with a password flag is a guess that some builds
-  # reject outright, which is why it is tried last. Every attempt is proven by
-  # opening a real GMP session, and gvmd's output is kept so a failure can say
-  # what actually went wrong instead of guessing.
-  local made=0 f out="" last="" harvest=""
+  # gvmd --help: "--role=<role>  Role for --create-user". Without it the
+  # account is created, authenticates, and holds no permissions, so every GMP
+  # call fails. That, not the password flags, is what broke earlier attempts:
+  # --password and --new-password were valid all along.
+  local made=0 f out="" harvest="" tried=""
 
-  # 1. create bare, then use the password gvmd generated
-  out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" 2>&1); last="$out"
-  harvest=$(printf '%s' "$out" | sed -n "s/.*[Pp]assword[: ]*'\([^']*\)'.*/\1/p" | tail -1)
+  # 1. create with a role, then use the password gvmd prints
+  out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" --role=Admin 2>&1)
+  tried="$tried
+      create --role=Admin  : $(_trim "$out")"
+  harvest=$(printf '%s' "$out" \
+            | sed -n "s/.*[Pp]assword[: ]*['\"]\\([^'\"]*\\)['\"].*/\\1/p" | tail -1)
   if [ -n "$harvest" ] && gmp_auth_ok "$GU" "$harvest" "$SOCK"; then
     GP="$harvest"; made=1
+  else
+    [ -n "$harvest" ] && tried="$tried
+      auth as created      : $(_trim "$GMP_LAST")"
   fi
 
-  # 2. the account exists now, or already did: set a password we control
+  # 2. account already existed: set a password we control
   if [ "$made" -eq 0 ]; then
     for f in --new-password --password; do
-      out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--user=$GU" "$f=$GP" 2>&1); last="$out"
-      gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
+      out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--user=$GU" "$f=$GP" 2>&1)
+      tried="$tried
+      $f            : $(_trim "$out")"
+      if gmp_auth_ok "$GU" "$GP" "$SOCK"; then made=1; break; fi
+      tried="$tried
+      auth after $f : $(_trim "$GMP_LAST")"
     done
   fi
 
-  # 3. last resort, builds that do accept both flags in one call
+  # 3. create and set in one call, for builds that prefer it
   if [ "$made" -eq 0 ]; then
-    for f in --password --new-password; do
-      out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" "$f=$GP" 2>&1); last="$out"
-      gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
-    done
+    out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" --role=Admin \
+                  "--password=$GP" 2>&1)
+    tried="$tried
+      create --password    : $(_trim "$out")"
+    gmp_auth_ok "$GU" "$GP" "$SOCK" && made=1
   fi
 
   if [ "$made" -eq 0 ]; then
     echo "${RED}failed${RST}"
-    if [ -n "$last" ]; then
-      dim "gvmd's last response:"
-      printf '%s\n' "$last" | head -5 | sed 's/^/      /'
-    fi
-    dim "create the account by hand, then re-run this command:"
-    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --create-user=$GU"
-    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --user=$GU --new-password=<choose>"
+    dim "every attempt, in order:"
+    printf '%s\n' "$tried" | sed '/^$/d'
+    dim "recover by hand, then re-run this command:"
+    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --delete-user=$GU"
+    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --create-user=$GU --role=Admin"
     harvest=""; GP=""
     return 1
   fi
