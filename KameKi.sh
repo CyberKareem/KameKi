@@ -824,11 +824,27 @@ greenbone_ready_report(){
 }
 
 GMP_LAST=""        # whatever gvm-cli said on the most recent check
+GMP_BROKEN=0       # 1 when gvm-cli itself failed, as opposed to rejecting us
+# gvm-tools moved its global options behind the connection subcommand at one
+# point, so both orders are tried. A Python traceback means the tool is
+# broken, which is a different problem from gvmd refusing the credentials and
+# must not be reported as a bad password.
 gmp_auth_ok(){     # user pass socket -> 0 when gvmd actually accepts them
-  have gvm-cli || { GMP_LAST="gvm-cli is not installed"; return 1; }
-  GMP_LAST=$(gvm-cli --gmp-username "$1" --gmp-password "$2" \
-                     socket --socketpath "$3" --xml "<get_version/>" 2>&1)
-  printf '%s' "$GMP_LAST" | grep -q 'status="200"'
+  GMP_BROKEN=0
+  have gvm-cli || { GMP_LAST="gvm-cli is not installed"; GMP_BROKEN=1; return 1; }
+  local o
+  o=$(gvm-cli --gmp-username "$1" --gmp-password "$2" \
+              socket --socketpath "$3" --xml "<get_version/>" 2>&1)
+  printf '%s' "$o" | grep -q 'status="200"' && { GMP_LAST="$o"; return 0; }
+  if printf '%s' "$o" | grep -q 'Traceback\|ModuleNotFoundError\|ImportError'; then
+    o=$(gvm-cli socket --socketpath "$3" --gmp-username "$1" \
+                --gmp-password "$2" --xml "<get_version/>" 2>&1)
+    printf '%s' "$o" | grep -q 'status="200"' && { GMP_LAST="$o"; return 0; }
+    printf '%s' "$o" | grep -q 'Traceback\|ModuleNotFoundError\|ImportError' \
+      && GMP_BROKEN=1
+  fi
+  GMP_LAST="$o"
+  return 1
 }
 
 _trim(){ printf '%s' "$1" | tr '\n' ' ' | tr -s ' ' | cut -c1-150; }
@@ -942,6 +958,23 @@ cmd_setup_greenbone(){
     gmp_auth_ok "$GU" "$GP" "$SOCK" && made=1
   fi
 
+  # A crashing gvm-cli is not a bad account. If the credentials could not be
+  # checked because the checking tool is broken, keep them, say so plainly,
+  # and point at the thing that actually needs fixing.
+  if [ "$made" -eq 0 ] && [ "$GMP_BROKEN" -eq 1 ] && [ -n "$harvest" ]; then
+    GP="$harvest"
+    echo "${YEL}created, unverified${RST}"
+    printf '%s\n' "$tried" | sed '/^$/d'
+    echo
+    warn "the account was created, gvm-cli could not be used to check it"
+    dim "gvm-cli crashed rather than refusing the credentials, so the fault is"
+    dim "in gvm-tools, not in gvmd or the password. the NVT engine drives"
+    dim "everything through gvm-cli, so it cannot run until that is repaired:"
+    dim "  pipx reinstall gvm-tools        # or: pipx install --force gvm-tools"
+    dim "the standalone engine does not use gvm-cli and is unaffected"
+    made=1
+  fi
+
   if [ "$made" -eq 0 ]; then
     echo "${RED}failed${RST}"
     dim "every attempt, in order:"
@@ -965,10 +998,14 @@ cmd_setup_greenbone(){
   printf "    %-24s" "GMP authentication"
   if gmp_auth_ok "$(head -n1 gmp-user.txt)" "$(head -n1 gmp-pass.txt)" "$SOCK"; then
     echo "${GRN}ok${RST}"
+  elif [ "$GMP_BROKEN" -eq 1 ]; then
+    echo "${YEL}not checked, gvm-cli is broken${RST}"
+    dim "credentials kept. repair gvm-tools, then: $0 doctor"
   else
     echo "${RED}failed${RST}"
-    dim "the credentials did not survive being written, removing them so"
-    dim "nothing later mistakes this for a working configuration"
+    dim "gvmd refused these credentials:"
+    printf '%s\n' "$GMP_LAST" | head -3 | sed 's/^/      /'
+    dim "removing them so nothing later mistakes this for a working setup"
     rm -f gmp-user.txt gmp-pass.txt
     return 1
   fi
