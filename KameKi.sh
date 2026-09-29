@@ -5,6 +5,9 @@
 #  Subcommands
 #    install            install every dependency (needs internet)
 #    install --bundle F install from an offline bundle (no internet)
+#    install --no-nvt   install without the Greenbone/NVT backend, the
+#                       standalone engine is used instead
+#    update             refresh templates, CVE data and definitions
 #    bundle             build an offline bundle at the office
 #    doctor             diagnose what is missing or broken, including auth
 #    preflight          test credential formats safely against one host
@@ -13,8 +16,11 @@
 #
 #  Engines
 #    nvt         full Greenbone NVT feed (~100k scripts) over the gvmd
-#                socket. No web UI. Used automatically when available.
+#                socket. No web UI.
 #    standalone  WES-NG patch mapping, nmap NSE, service CVE mapping.
+#    both        run both. ENGINE=auto picks this whenever Greenbone is
+#                usable, because the two cover different ground and the
+#                standalone results are not reproduced by the NVT feed.
 #
 #  On top of whichever engine runs, always: Active Directory assessment,
 #  configuration audit, TLS, web, SNMP, CISA KEV correlation, attack path
@@ -85,16 +91,29 @@ err(){  echo "${RED}[-]${RST} $*"; }
 step(){ echo; echo "${CYN}── $* ${RST}"; }
 dim(){  echo "${DIM}    $*${RST}"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
-cnt(){ [ -f "$1" ] && grep -c . "$1" 2>/dev/null | head -1 || echo 0; }
+# net_open HOST PORT -> 0 when a TCP connection succeeds inside five seconds.
+# Client networks routinely block outbound 80 and 873, and finding that out
+# after a long apt run or a 5 GB rsync attempt wastes site time.
+net_open(){
+  # Bounded by timeout(1) because a blackholed address otherwise stalls for
+  # over a minute. Without timeout the probe cannot be bounded, so report
+  # reachable rather than risk the stall this check exists to avoid.
+  have timeout || return 0
+  # /dev/tcp is built into the bash this script already requires, so it needs
+  # no extra package and no nc variant that may or may not support -z.
+  timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2 && exec 3<&-" >/dev/null 2>&1
+}
+cnt(){ [ -f "$1" ] || { echo 0; return 0; }
+       local n; n=$(grep -c . "$1" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
 # count matches safely: always one integer on stdout, never two, never empty.
 # `grep -c` prints 0 AND exits 1 on no match, so a bare `|| echo 0` yields "0\n0"
 # and every downstream $(( )) fails. head -1 collapses it.
-gcnt(){ grep -c "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
-gcnti(){ grep -ci "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
-gcntE(){ grep -cE "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
-gcntiE(){ grep -ciE "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
+gcnt(){ local n; n=$(grep -c "$@" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
+gcnti(){ local n; n=$(grep -ci "$@" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
+gcntE(){ local n; n=$(grep -cE "$@" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
+gcntiE(){ local n; n=$(grep -ciE "$@" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
 # grep -cve counts NON-matching lines; used for 'non-blank line count'
-nblines(){ grep -cve '^[[:space:]]*$' "$1" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
+nblines(){ local n; n=$(grep -cve '^[[:space:]]*$' "$1" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
 pool(){ while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.2; done; "$@" & }
 finish(){ wait; }
 is_done(){ [ "$RESUME" = "1" ] && [ -f "$RAW/.done-$1" ]; }
@@ -260,13 +279,50 @@ cmd_install(){
   fi
 
   # ---- online install
+  local DEGRADED=0
+
+  # Check the two egress paths the online install needs before using them.
+  if net_open archive.ubuntu.com 80 || net_open deb.debian.org 80 \
+     || net_open security.ubuntu.com 80; then :; else
+    warn "no outbound access to the distribution mirrors on port 80"
+    dim "package installation will fail here. build a bundle where you do"
+    dim "have internet, then carry it in:"
+    dim "  sudo $0 bundle"
+    dim "  sudo $0 install --bundle <file>"
+    DEGRADED=1
+  fi
+  if [ "$WITH_NVT" -eq 1 ] && ! net_open feed.community.greenbone.net 873; then
+    warn "no outbound access to the Greenbone feed on rsync port 873"
+    dim "the NVT feed cannot sync on this network. the standalone engine"
+    dim "needs no feed and produces a full assessment without it:"
+    dim "  sudo $0 install --no-nvt"
+  fi
+
   info "updating package lists"
-  apt-get update -qq || warn "apt update had errors"
+  apt-get update -qq || { warn "apt update had errors"; DEGRADED=1; }
 
   info "installing system packages"
-  apt-get install -y -qq nmap jq gawk curl git zstd unzip python3-pip pipx \
-                         exploitdb onesixtyone poppler-utils >/dev/null 2>&1 \
-    || warn "some system packages failed, continuing"
+  # One apt-get call for the whole set is all-or-nothing when a name will not
+  # resolve, and returns a single exit code when one download fails. Either way
+  # the old code warned once and moved on, so a missing package was only
+  # discovered later by doctor. Retry individually and name what is missing.
+  local -a SYS_PKGS=(nmap jq gawk curl git zstd unzip python3-pip pipx
+                     exploitdb onesixtyone poppler-utils)
+  local MISSING_PKGS="" pkg
+  if ! apt-get install -y -qq "${SYS_PKGS[@]}" >/dev/null 2>&1; then
+    warn "bulk package install failed, retrying one at a time"
+    for pkg in "${SYS_PKGS[@]}"; do
+      apt-get install -y -qq "$pkg" >/dev/null 2>&1 \
+        || MISSING_PKGS="$MISSING_PKGS $pkg"
+    done
+  fi
+  if [ -n "$MISSING_PKGS" ]; then
+    warn "could not install:$MISSING_PKGS"
+    dim "nmap, jq, gawk and curl are required; the rest are optional"
+    dim "install them by hand, or build a bundle where you have internet:"
+    dim "  sudo $0 bundle    then on site:  sudo $0 install --bundle <file>"
+    DEGRADED=1
+  fi
 
   if [ "$WITH_NVT" -eq 1 ]; then
     info "installing Greenbone scanner backend"
@@ -294,8 +350,6 @@ cmd_install(){
     fi
     rm -rf "$T"
   fi
-  have nuclei && { info "updating nuclei templates"; nuclei -update-templates -silent >/dev/null 2>&1 || warn "template update failed"; }
-
   if [ ! -d /usr/share/nmap/scripts/vulscan ]; then
     info "installing vulscan offline CVE database"
     git clone -q --depth 1 "$VULSCAN_REPO" /usr/share/nmap/scripts/vulscan >/dev/null 2>&1 \
@@ -310,24 +364,40 @@ cmd_install(){
       || warn "testssl.sh clone failed"
   fi
 
-  info "fetching WES-NG definitions"
-  local WESBIN=""; for c in wes wes.py; do have "$c" && { WESBIN="$c"; break; }; done
-  [ -n "$WESBIN" ] && { su "${SUDO_USER:-root}" -c "$WESBIN --update" >/dev/null 2>&1 || warn "WES-NG definition update failed"; }
-
-  info "fetching CISA KEV catalogue"
-  curl -s --max-time 60 -o "${SUDO_USER:+/home/$SUDO_USER/}.kameki-kev.json" "$KEV_URL" 2>/dev/null \
-    || curl -s --max-time 60 -o /root/.kameki-kev.json "$KEV_URL" 2>/dev/null || warn "KEV download failed"
+  # Every data source is refreshed by one pass, so installing and updating
+  # cannot drift apart and each result is reported individually.
+  cmd_update || DEGRADED=1
 
   if have gvmd && [ "$WITH_NVT" -eq 1 ]; then
     echo
-    warn "Greenbone needs one more manual step, it prints a password you must save:"
-    dim "sudo gvm-setup"
-    dim "sudo greenbone-feed-sync        # ~5 GB, do this before leaving the office"
+    warn "Greenbone needs manual steps before the NVT engine can be used:"
+    if have gvm-setup; then
+      dim "sudo gvm-setup                  # save the admin password it prints"
+    else
+      # gvm-setup is a Kali helper shipped in Kali's gvm metapackage. Debian
+      # and Ubuntu install the same daemons without it, so the equivalent
+      # steps have to be run by hand. Checking for gvmd told us the daemon is
+      # present, which is not the same as the helper being present.
+      dim "this distribution installed gvmd but not the gvm-setup helper,"
+      dim "which ships with Kali. the same three steps have to be run by hand:"
+      dim "  1. generate the server certificates   (gvm-manage-certs -a)"
+      dim "  2. start redis, ospd-openvas and gvmd (systemctl enable --now ...)"
+      dim "  3. create the admin user, running gvmd as its own service account"
+      dim "     exact flags vary by gvmd version, check: gvmd --help"
+      dim "unless you specifically need the NVT engine, skip all of it:"
+      dim "  $0 install --no-nvt"
+    fi
+    dim "sudo greenbone-feed-sync        # ~5 GB over rsync/873, do this before leaving the office"
     dim "then put the admin credentials in gmp-user.txt and gmp-pass.txt"
+    dim "if any of that is not possible on site: $0 install --no-nvt"
   fi
 
   echo
-  info "install complete"
+  if [ "$DEGRADED" -eq 1 ]; then
+    warn "install finished with errors, some components are missing"
+  else
+    info "install complete"
+  fi
   dim "open a new shell for PATH changes, then: $0 doctor"
 }
 
@@ -643,6 +713,75 @@ cmd_cleanup(){
 }
 
 # =====================================================================
+#  update   (refresh every data source; run at the end of install too)
+# =====================================================================
+user_home(){
+  local h; h=$(getent passwd "${SUDO_USER:-root}" 2>/dev/null | cut -d: -f6)
+  [ -n "$h" ] && echo "$h" || echo "${HOME:-/root}"
+}
+
+# pipx puts wes in the invoking user's ~/.local/bin, which is not on root's
+# PATH during a sudo install. Resolving it only with `command -v` therefore
+# found nothing and the definition update was skipped without a word.
+find_wes(){
+  local uh c; uh=$(user_home)
+  for c in "$uh/.local/bin/wes" "$uh/.local/bin/wes.py" wes wes.py; do
+    command -v "$c" >/dev/null 2>&1 && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+cmd_update(){
+  local FAILED="" UH WESBIN
+  UH=$(user_home)
+  step "kameki update  (refreshing every data source)"
+
+  if have nuclei; then
+    printf "    %-22s" "nuclei templates"
+    if nuclei -update-templates -silent >/dev/null 2>&1; then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; FAILED="$FAILED nuclei-templates"; fi
+  fi
+
+  if [ -d /usr/share/nmap/scripts/vulscan/.git ]; then
+    printf "    %-22s" "vulscan CVE database"
+    if ( cd /usr/share/nmap/scripts/vulscan && git pull -q ) >/dev/null 2>&1 \
+       && nmap --script-updatedb >/dev/null 2>&1; then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; FAILED="$FAILED vulscan"; fi
+  fi
+
+  if [ -d /opt/testssl.sh/.git ]; then
+    printf "    %-22s" "testssl.sh"
+    if ( cd /opt/testssl.sh && git pull -q ) >/dev/null 2>&1; then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; FAILED="$FAILED testssl.sh"; fi
+  fi
+
+  printf "    %-22s" "WES-NG definitions"
+  if WESBIN=$(find_wes); then
+    # run as the invoking user, from their home, so definitions.zip lands
+    # where doctor and the run stage look for it
+    if ( cd "$UH" && su "${SUDO_USER:-root}" -c "'$WESBIN' --update" ) >/dev/null 2>&1
+    then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; FAILED="$FAILED wes-definitions"; fi
+  else
+    echo "${YEL}wes not installed${RST}"; FAILED="$FAILED wes-definitions"
+  fi
+
+  printf "    %-22s" "CISA KEV catalogue"
+  if curl -s --max-time 60 -o "$UH/.kameki-kev.json" "$KEV_URL" 2>/dev/null \
+     && [ -s "$UH/.kameki-kev.json" ]; then echo "${GRN}ok${RST}"
+  else echo "${YEL}failed${RST}"; FAILED="$FAILED kev"; fi
+
+  echo
+  if [ -n "$FAILED" ]; then
+    warn "not refreshed:$FAILED"
+    dim "re-run when you have internet: sudo $0 update"
+    return 1
+  fi
+  info "all data sources current"
+  return 0
+}
+
+# =====================================================================
 #  usage
 # =====================================================================
 cmd_usage(){
@@ -656,6 +795,7 @@ cmd_usage(){
 SUB="${1:-run}"
 case "$SUB" in
   install)   shift; cmd_install "$@"; exit $? ;;
+  update)    shift; cmd_update "$@"; exit $? ;;
   bundle)    shift; cmd_bundle "$@"; exit $? ;;
   doctor)    shift; cmd_doctor "$@"; exit $? ;;
   preflight) shift; cmd_preflight "$@"; exit $? ;;
@@ -690,8 +830,7 @@ case "$SCAN_CONFIG" in
   *) err "SCAN_CONFIG must be fast, ultimate, deep or deepult"; exit 1 ;;
 esac
 
-# ===================================================================== 
-=====================================================================
+# =====================================================================
 #  1. Dependency check and engine selection
 # =====================================================================
 step "Dependencies and engine"
@@ -747,10 +886,21 @@ echo "    ${DIM}optional: testssl.sh $HAVE_TESTSSL  searchsploit $HAVE_SPLOIT  o
 
 # --- resolve engine
 case "$ENGINE" in
-  auto)       if [ "$NVT_READY" -eq 1 ]; then ENGINE=nvt; else ENGINE=standalone; fi ;;
+  auto)
+    # The two engines are complementary, not alternatives. Greenbone's NVTs do
+    # not replace WES-NG patch mapping, the NSE vulnerability scripts or the
+    # service version CVE mapping, so when both are usable, run both.
+    if   [ "$NVT_READY" -eq 1 ] && [ "$SA_READY" -eq 1 ]; then ENGINE=both
+    elif [ "$NVT_READY" -eq 1 ];                          then ENGINE=nvt
+    else                                                       ENGINE=standalone
+    fi ;;
   nvt)        [ "$NVT_READY" -eq 1 ] || { err "ENGINE=nvt but Greenbone is not available. Run: $0 --setup"; exit 1; } ;;
   standalone) : ;;
-  both)       [ "$NVT_READY" -eq 1 ] || { err "ENGINE=both requires Greenbone."; exit 1; } ;;
+  both)
+    if [ "$NVT_READY" -eq 0 ]; then
+      warn "ENGINE=both but Greenbone is not available, running the standalone engine alone"
+      ENGINE=standalone
+    fi ;;
   *) err "ENGINE must be auto, nvt, standalone or both"; exit 1 ;;
 esac
 RUN_NVT=0; RUN_SA=0
@@ -764,6 +914,23 @@ if [ "$RUN_SA" -eq 1 ] && [ "$SA_READY" -eq 0 ]; then
 fi
 info "engine: ${CYN}$ENGINE${RST}"
 
+# nmap needs raw sockets for the ICMP, ACK and UDP probes in Stage 1 and for
+# -sS and -O in Stage 2. Unprivileged it silently falls back to TCP connect,
+# so the run undercounts live hosts and skips OS detection while still looking
+# like it completed. Say so rather than letting it pass unnoticed.
+UNPRIV=0
+if [ "$(id -u)" -ne 0 ]; then
+  UNPRIV=1
+  echo
+  err "running without root, the scan cannot proceed:"
+  dim "Stage 1 sends ICMP, ACK and UDP pings, which need raw sockets. nmap"
+  dim "exits without scanning rather than degrading, so nothing is discovered."
+  dim "Stage 2 would also lose -sS and OS detection entirely."
+  dim "re-run as: sudo $0 run"
+  echo
+  exit 1
+fi
+
 # =====================================================================
 #  2. Inputs
 # =====================================================================
@@ -776,10 +943,14 @@ NTARGETS=$(nblines targets.txt)
 if [ "$UC" -eq 1 ] && [ "$PC" -eq 1 ]; then
   U=$(head -n1 user.txt | tr -d '\r\n'); P=$(head -n1 pass.txt | tr -d '\r\n')
   CREDLBL="$U"; MULTI=0
+  NVT_U="$U"; NVT_P="$P"
 else
   U="user.txt"; P="pass.txt"; CREDLBL="$UC user x $PC pass"; MULTI=1
-  [ "$RUN_NVT" -eq 1 ] && { warn "nvt engine takes a single credential pair; using the first line of each"; \
-                            U=$(head -n1 user.txt | tr -d '\r\n'); P=$(head -n1 pass.txt | tr -d '\r\n'); }
+  # A GMP credential object holds exactly one pair, but the standalone engine
+  # iterates the files. Keep them separate so selecting the NVT engine no
+  # longer silently reduces the standalone engine to the first pair.
+  NVT_U=$(head -n1 user.txt | tr -d '\r\n'); NVT_P=$(head -n1 pass.txt | tr -d '\r\n')
+  [ "$RUN_NVT" -eq 1 ] && warn "nvt engine takes one credential pair, using the first line of each; the standalone engine still uses all of them"
   if [ "$MULTI" -eq 1 ] && [ "$RUN_SA" -eq 1 ]; then
     echo; warn "Multi-credential: $(( UC * PC * NTARGETS )) attempts. This is a spray and can lock accounts."
     read -rp "    Type YES to continue: " C; [ "$C" = "YES" ] || { err "Aborted."; exit 1; }
@@ -823,6 +994,11 @@ if is_done discovery; then info "skipped (resume)"; else
   nmap -sn -PE -PP -PM -PS21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,3306,3389,5985,8080 \
        -PA80,443,3389 -PU161 --min-rate "$NMAP_RATE" \
        -iL targets.txt -oG "$RAW/discovery.gnmap" -oN "$RAW/discovery.txt" >/dev/null 2>&1
+  if [ ! -s "$RAW/discovery.gnmap" ]; then
+    err "discovery produced no output, nmap did not run"
+    dim "re-run with: sudo $0 run     and check: ip a"
+    exit 1
+  fi
   awk '/Up$/{print $2}' "$RAW/discovery.gnmap" | sort -uV > "$RAW/live.txt"
   grep -vxFf "$RAW/live.txt" targets.txt 2>/dev/null | grep -ve '^\s*$' > "$RAW/no-response.txt" || true
   mark_done discovery
@@ -879,8 +1055,8 @@ else
 info "GMP $(echo "$V" | xtag version) authenticated"
 
 R=$(gmp "<create_credential><name>kameki-smb-$RUN_NAME</name><type>up</type>
-  <allow_insecure>1</allow_insecure><login>$(xesc "$U")</login>
-  <password>$(xesc "$P")</password></create_credential>")
+  <allow_insecure>1</allow_insecure><login>$(xesc "$NVT_U")</login>
+  <password>$(xesc "$NVT_P")</password></create_credential>")
 SMB_CRED=$(echo "$R" | xid)
 [ -n "$SMB_CRED" ] || { err "SMB credential creation failed"; echo "$R" | head -3; }
 
@@ -1450,6 +1626,7 @@ echo
 echo "**Generated:** $STAMP  "
 echo "**Runtime:** ${MINS} minutes  "
 echo "**Engine:** \`$ENGINE\`$([ "$RUN_NVT" -eq 1 ] && echo "  (Greenbone $NVT_FILES NVTs, $CFG_NAME)")  "
+[ "$UNPRIV" -eq 1 ] && echo "**Scan privilege:** unprivileged. nmap used TCP connect probes, so live-host discovery undercounts and OS detection did not run.  "
 echo "**Profile:** \`$PROFILE\` ($PORTSPEC, $JOBS workers)  "
 echo "**Windows credentials:** $CREDLBL  "
 echo "**Linux credentials:** $([ "$SSH_ON" -eq 1 ] && echo supplied || echo "not supplied")  "
@@ -1714,7 +1891,7 @@ echo "---"; echo
 echo "## 12. OS Inventory"; echo
 echo '```'; head -250 "$RAW/os-inventory.txt" 2>/dev/null; echo '```'; echo
 
-echo "## 13. Evidence"; echoecho "| File | Contents |"; echo "| --- | --- |"
+echo "## 13. Evidence"; echo; echo "| File | Contents |"; echo "| --- | --- |"
 echo "| \`$RAW/cve-all.txt\` | Every unique CVE, all sources |"
 echo "| \`$RAW/cve-kev.txt\` | CVEs on the CISA exploited list |"
 echo "| \`$RAW/risk-scores.txt\` | Per host risk score |"
