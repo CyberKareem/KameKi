@@ -808,6 +808,28 @@ gvmd_socket(){
   return 1
 }
 
+greenbone_ready_report(){
+  local NVTS=0
+  [ -d /var/lib/openvas/plugins ] \
+    && NVTS=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
+  echo
+  if [ "$NVTS" -ge 10000 ]; then
+    info "Greenbone ready, $NVTS NVTs. the next run uses both engines"
+    dim "confirm any time with: $0 doctor"
+  else
+    warn "Greenbone authenticates but the feed holds only $NVTS scripts"
+    dim "the engine needs 10000. sudo greenbone-feed-sync   # ~5 GB, not run for you"
+    dim "blocked on site? the standalone engine needs no feed"
+  fi
+}
+
+gmp_auth_ok(){   # user pass socket -> 0 when gvmd actually accepts them
+  have gvm-cli || return 1
+  gvm-cli --gmp-username "$1" --gmp-password "$2" \
+          socket --socketpath "$3" --xml "<get_version/>" 2>&1 \
+    | grep -q 'status="200"'
+}
+
 cmd_setup_greenbone(){
   need_root setup-greenbone
   step "Greenbone setup"
@@ -851,8 +873,12 @@ cmd_setup_greenbone(){
 
   # 4. admin user and credentials -------------------------------------
   if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
-    printf "    %-24s%s\n" "GMP credentials" "${GRN}already present${RST}"
-    return 0
+    printf "    %-24s" "GMP authentication"
+    if gmp_auth_ok "$(head -n1 gmp-user.txt)" "$(head -n1 gmp-pass.txt)" "$SOCK"; then
+      echo "${GRN}ok, existing credentials${RST}"
+      greenbone_ready_report; return 0
+    fi
+    echo "${YEL}existing credentials rejected, replacing them${RST}"
   fi
 
   GVM_ACCOUNT=$(gvm_service_account) || {
@@ -865,24 +891,22 @@ cmd_setup_greenbone(){
   [ -n "$GP" ] || GP=$(date +%s%N | sha256sum | head -c 24)
 
   printf "    %-24s" "admin user"
-  # The password flag differs between gvmd versions, and the user may already
-  # exist from a previous run, so try create then reset, and accept whichever
-  # combination this build understands.
+  # The password flag moved between gvmd versions and the user may already
+  # exist, so each combination is tried and then PROVEN by opening a real GMP
+  # session. An exit code of 0 from gvmd is not evidence the password took.
   local made=0 f
   for f in --password --new-password; do
-    runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" "$f=$GP" >/dev/null 2>&1 \
-      && { made=1; break; }
+    runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" "$f=$GP" >/dev/null 2>&1 || true
+    gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
+    runuser -u "$GVM_ACCOUNT" -- gvmd "--user=$GU" "$f=$GP" >/dev/null 2>&1 || true
+    gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
   done
   if [ "$made" -eq 0 ]; then
-    for f in --new-password --password; do
-      runuser -u "$GVM_ACCOUNT" -- gvmd "--user=$GU" "$f=$GP" >/dev/null 2>&1 \
-        && { made=1; break; }
-    done
-  fi
-  if [ "$made" -eq 0 ]; then
-    echo "${YEL}failed${RST}"
-    dim "create one by hand, then put it in gmp-user.txt and gmp-pass.txt:"
-    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --help   # check the password flag"
+    echo "${RED}failed${RST}"
+    dim "gvmd accepted no password flag this build understands, or the user"
+    dim "could not be created. do it by hand and re-run this command:"
+    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --help   # find the flag"
+    GP=""
     return 1
   fi
   echo "${GRN}$GU${RST}"
@@ -891,18 +915,22 @@ cmd_setup_greenbone(){
   printf '%s\n' "$GP" > gmp-pass.txt
   chmod 600 gmp-user.txt gmp-pass.txt
   [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" gmp-user.txt gmp-pass.txt 2>/dev/null
-  printf "    %-24s%s\n" "GMP credentials" "${GRN}written, mode 600${RST}"
   GP=""
 
-  local NVTS=0
-  [ -d /var/lib/openvas/plugins ] \
-    && NVTS=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
-  if [ "$NVTS" -lt 10000 ]; then
-    echo
-    warn "the NVT feed holds $NVTS scripts, the engine needs 10000"
-    dim "sudo greenbone-feed-sync     # ~5 GB over rsync/873, not run for you"
-    dim "blocked on site? the standalone engine needs no feed"
+  # 5. prove the files on disk work, not just the ones in memory --------
+  printf "    %-24s" "GMP authentication"
+  if gmp_auth_ok "$(head -n1 gmp-user.txt)" "$(head -n1 gmp-pass.txt)" "$SOCK"; then
+    echo "${GRN}ok${RST}"
+  else
+    echo "${RED}failed${RST}"
+    dim "the credentials did not survive being written, removing them so"
+    dim "nothing later mistakes this for a working configuration"
+    rm -f gmp-user.txt gmp-pass.txt
+    return 1
   fi
+  printf "    %-24s%s\n" "credential files" "${GRN}gmp-user.txt, gmp-pass.txt, mode 600${RST}"
+
+  greenbone_ready_report
   return 0
 }
 
