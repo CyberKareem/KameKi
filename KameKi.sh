@@ -38,6 +38,23 @@
 #
 set -uo pipefail
 
+# The scan needs root for nmap's raw sockets, but pipx installs nxc and wes
+# into the INVOKING user's ~/.local/bin, and the WES definitions, the KEV
+# cache and the shell history all live in that user's home. Under sudo, PATH
+# and HOME point at root, so those tools report missing, the caches look
+# absent, and cleanup scrubs root's history instead of the one where the
+# credentials were actually typed. Re-point both at the invoking user so a
+# privileged run sees exactly what an unprivileged one does.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+  _KAMEKI_UH=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+  if [ -n "${_KAMEKI_UH:-}" ] && [ -d "${_KAMEKI_UH:-/nonexistent}" ]; then
+    [ -d "$_KAMEKI_UH/.local/bin" ] && PATH="$_KAMEKI_UH/.local/bin:$PATH"
+    HOME="$_KAMEKI_UH"
+    export PATH HOME
+  fi
+  unset _KAMEKI_UH
+fi
+
 VERSION="2.0"
 DATE=$(date +%F)
 STAMP=$(date +"%Y-%m-%d %H:%M:%S %Z")
