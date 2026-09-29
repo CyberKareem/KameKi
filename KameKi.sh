@@ -103,16 +103,17 @@ net_open(){
   # no extra package and no nc variant that may or may not support -z.
   timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2 && exec 3<&-" >/dev/null 2>&1
 }
-cnt(){ [ -f "$1" ] && grep -c . "$1" 2>/dev/null | head -1 || echo 0; }
+cnt(){ [ -f "$1" ] || { echo 0; return 0; }
+       local n; n=$(grep -c . "$1" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
 # count matches safely: always one integer on stdout, never two, never empty.
 # `grep -c` prints 0 AND exits 1 on no match, so a bare `|| echo 0` yields "0\n0"
 # and every downstream $(( )) fails. head -1 collapses it.
-gcnt(){ grep -c "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
-gcnti(){ grep -ci "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
-gcntE(){ grep -cE "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
-gcntiE(){ grep -ciE "$@" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
+gcnt(){ local n; n=$(grep -c "$@" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
+gcnti(){ local n; n=$(grep -ci "$@" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
+gcntE(){ local n; n=$(grep -cE "$@" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
+gcntiE(){ local n; n=$(grep -ciE "$@" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
 # grep -cve counts NON-matching lines; used for 'non-blank line count'
-nblines(){ grep -cve '^[[:space:]]*$' "$1" 2>/dev/null | head -1 | tr -cd '0-9' | grep . || echo 0; }
+nblines(){ local n; n=$(grep -cve '^[[:space:]]*$' "$1" 2>/dev/null | head -1 | tr -cd '0-9'); echo "${n:-0}"; }
 pool(){ while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.2; done; "$@" & }
 finish(){ wait; }
 is_done(){ [ "$RESUME" = "1" ] && [ -f "$RAW/.done-$1" ]; }
@@ -829,8 +830,7 @@ case "$SCAN_CONFIG" in
   *) err "SCAN_CONFIG must be fast, ultimate, deep or deepult"; exit 1 ;;
 esac
 
-# ===================================================================== 
-=====================================================================
+# =====================================================================
 #  1. Dependency check and engine selection
 # =====================================================================
 step "Dependencies and engine"
@@ -922,11 +922,13 @@ UNPRIV=0
 if [ "$(id -u)" -ne 0 ]; then
   UNPRIV=1
   echo
-  warn "running without root, nmap falls back to TCP connect probes:"
-  dim "Stage 1 loses ICMP, ACK and UDP discovery, so live hosts are undercounted"
-  dim "Stage 2 loses -sS, and OS detection does not run at all"
-  dim "for complete coverage re-run as: sudo $0 run"
+  err "running without root, the scan cannot proceed:"
+  dim "Stage 1 sends ICMP, ACK and UDP pings, which need raw sockets. nmap"
+  dim "exits without scanning rather than degrading, so nothing is discovered."
+  dim "Stage 2 would also lose -sS and OS detection entirely."
+  dim "re-run as: sudo $0 run"
   echo
+  exit 1
 fi
 
 # =====================================================================
@@ -992,6 +994,11 @@ if is_done discovery; then info "skipped (resume)"; else
   nmap -sn -PE -PP -PM -PS21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,3306,3389,5985,8080 \
        -PA80,443,3389 -PU161 --min-rate "$NMAP_RATE" \
        -iL targets.txt -oG "$RAW/discovery.gnmap" -oN "$RAW/discovery.txt" >/dev/null 2>&1
+  if [ ! -s "$RAW/discovery.gnmap" ]; then
+    err "discovery produced no output, nmap did not run"
+    dim "re-run with: sudo $0 run     and check: ip a"
+    exit 1
+  fi
   awk '/Up$/{print $2}' "$RAW/discovery.gnmap" | sort -uV > "$RAW/live.txt"
   grep -vxFf "$RAW/live.txt" targets.txt 2>/dev/null | grep -ve '^\s*$' > "$RAW/no-response.txt" || true
   mark_done discovery
@@ -1884,7 +1891,7 @@ echo "---"; echo
 echo "## 12. OS Inventory"; echo
 echo '```'; head -250 "$RAW/os-inventory.txt" 2>/dev/null; echo '```'; echo
 
-echo "## 13. Evidence"; echoecho "| File | Contents |"; echo "| --- | --- |"
+echo "## 13. Evidence"; echo; echo "| File | Contents |"; echo "| --- | --- |"
 echo "| \`$RAW/cve-all.txt\` | Every unique CVE, all sources |"
 echo "| \`$RAW/cve-kev.txt\` | CVEs on the CISA exploited list |"
 echo "| \`$RAW/risk-scores.txt\` | Per host risk score |"
