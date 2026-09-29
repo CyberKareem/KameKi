@@ -844,12 +844,20 @@ cmd_setup_greenbone(){
   if have gvm-manage-certs; then
     printf "    %-24s" "certificates"
     if gvm-manage-certs -a >/dev/null 2>&1; then echo "${GRN}ok${RST}"
-    else echo "${YEL}skipped${RST}"; fi
+    else echo "${DIM}already present or not needed${RST}"; fi
   fi
 
   # 2. services -------------------------------------------------------
   local svc
-  for svc in redis-server@openvas ospd-openvas gvmd; do
+  # redis ships under different unit names, and on some builds gvmd is happy
+  # without a dedicated one, so the first that exists is used and a miss is
+  # not an error.
+  local redis_unit=""
+  for svc in redis-server@openvas redis-server redis; do
+    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 \
+      && { redis_unit="$svc"; break; }
+  done
+  for svc in $redis_unit ospd-openvas gvmd; do
     systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || continue
     printf "    %-24s" "$svc"
     if systemctl enable --now "$svc" >/dev/null 2>&1; then echo "${GRN}started${RST}"
@@ -891,24 +899,50 @@ cmd_setup_greenbone(){
   [ -n "$GP" ] || GP=$(date +%s%N | sha256sum | head -c 24)
 
   printf "    %-24s" "admin user"
-  # The password flag moved between gvmd versions and the user may already
-  # exist, so each combination is tried and then PROVEN by opening a real GMP
-  # session. An exit code of 0 from gvmd is not evidence the password took.
-  local made=0 f
-  for f in --password --new-password; do
-    runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" "$f=$GP" >/dev/null 2>&1 || true
-    gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
-    runuser -u "$GVM_ACCOUNT" -- gvmd "--user=$GU" "$f=$GP" >/dev/null 2>&1 || true
-    gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
-  done
+  # gvmd's documented path is: --create-user on its own creates the account and
+  # PRINTS a generated password, then --user with --new-password changes it.
+  # Pairing --create-user with a password flag is a guess that some builds
+  # reject outright, which is why it is tried last. Every attempt is proven by
+  # opening a real GMP session, and gvmd's output is kept so a failure can say
+  # what actually went wrong instead of guessing.
+  local made=0 f out="" last="" harvest=""
+
+  # 1. create bare, then use the password gvmd generated
+  out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" 2>&1); last="$out"
+  harvest=$(printf '%s' "$out" | sed -n "s/.*[Pp]assword[: ]*'\([^']*\)'.*/\1/p" | tail -1)
+  if [ -n "$harvest" ] && gmp_auth_ok "$GU" "$harvest" "$SOCK"; then
+    GP="$harvest"; made=1
+  fi
+
+  # 2. the account exists now, or already did: set a password we control
+  if [ "$made" -eq 0 ]; then
+    for f in --new-password --password; do
+      out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--user=$GU" "$f=$GP" 2>&1); last="$out"
+      gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
+    done
+  fi
+
+  # 3. last resort, builds that do accept both flags in one call
+  if [ "$made" -eq 0 ]; then
+    for f in --password --new-password; do
+      out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" "$f=$GP" 2>&1); last="$out"
+      gmp_auth_ok "$GU" "$GP" "$SOCK" && { made=1; break; }
+    done
+  fi
+
   if [ "$made" -eq 0 ]; then
     echo "${RED}failed${RST}"
-    dim "gvmd accepted no password flag this build understands, or the user"
-    dim "could not be created. do it by hand and re-run this command:"
-    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --help   # find the flag"
-    GP=""
+    if [ -n "$last" ]; then
+      dim "gvmd's last response:"
+      printf '%s\n' "$last" | head -5 | sed 's/^/      /'
+    fi
+    dim "create the account by hand, then re-run this command:"
+    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --create-user=$GU"
+    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --user=$GU --new-password=<choose>"
+    harvest=""; GP=""
     return 1
   fi
+  harvest=""
   echo "${GRN}$GU${RST}"
 
   printf '%s\n' "$GU" > gmp-user.txt
