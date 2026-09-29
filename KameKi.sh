@@ -110,6 +110,28 @@ err(){  echo "${RED}[-]${RST} $*"; }
 step(){ echo; echo "${CYN}── $* ${RST}"; }
 dim(){  echo "${DIM}    $*${RST}"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
+# gvm-cli aborts with "This tool MUST NOT be run as root user."
+# (gvmtools.helper.do_not_run_as_root). The scan needs root for nmap's raw
+# sockets, so every GMP call has to drop back to the invoking user. The gvmd
+# socket is group-owned by the gvm service group, so that group is set
+# explicitly rather than assuming the user is already a member.
+gvm_group(){
+  local g
+  for g in _gvm gvm; do
+    getent group "$g" >/dev/null 2>&1 && { echo "$g"; return 0; }
+  done
+  return 1
+}
+gvmcli(){
+  [ "$(id -u)" -eq 0 ] || { gvm-cli "$@"; return $?; }
+  local u="${SUDO_USER:-}" g
+  [ -n "$u" ] || {
+    echo "gvm-cli must not run as root, and no SUDO_USER is set to drop to" >&2
+    return 1
+  }
+  if g=$(gvm_group); then runuser -u "$u" -g "$g" -- gvm-cli "$@"
+  else                    runuser -u "$u"          -- gvm-cli "$@"; fi
+}
 # net_open HOST PORT -> 0 when a TCP connection succeeds inside five seconds.
 # Client networks routinely block outbound 80 and 873, and finding that out
 # after a long apt run or a 5 GB rsync attempt wastes site time.
@@ -502,7 +524,7 @@ cmd_doctor(){
   if [ -n "$SOCK" ]; then
     printf "    %-14s ok (%s)\n" "gvmd socket" "$SOCK"
     if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] && have gvm-cli; then
-      local R; R=$(gvm-cli --gmp-username "$(head -n1 gmp-user.txt)" --gmp-password "$(head -n1 gmp-pass.txt)" \
+      local R; R=$(gvmcli --gmp-username "$(head -n1 gmp-user.txt)" --gmp-password "$(head -n1 gmp-pass.txt)" \
                    socket --socketpath "$SOCK" --xml "<get_version/>" 2>&1)
       echo "$R" | grep -q 'status="200"' && printf "    %-14s ok\n" "gmp auth" \
         || { printf "    %-14s ${RED}failed${RST}\n" "gmp auth"; ISSUES=$((ISSUES+1)); }
@@ -833,12 +855,12 @@ gmp_auth_ok(){     # user pass socket -> 0 when gvmd actually accepts them
   GMP_BROKEN=0
   have gvm-cli || { GMP_LAST="gvm-cli is not installed"; GMP_BROKEN=1; return 1; }
   local o
-  o=$(gvm-cli --gmp-username "$1" --gmp-password "$2" \
-              socket --socketpath "$3" --xml "<get_version/>" 2>&1)
+  o=$(gvmcli --gmp-username "$1" --gmp-password "$2" \
+             socket --socketpath "$3" --xml "<get_version/>" 2>&1)
   printf '%s' "$o" | grep -q 'status="200"' && { GMP_LAST="$o"; return 0; }
   if printf '%s' "$o" | grep -q 'Traceback\|ModuleNotFoundError\|ImportError'; then
-    o=$(gvm-cli socket --socketpath "$3" --gmp-username "$1" \
-                --gmp-password "$2" --xml "<get_version/>" 2>&1)
+    o=$(gvmcli socket --socketpath "$3" --gmp-username "$1" \
+               --gmp-password "$2" --xml "<get_version/>" 2>&1)
     printf '%s' "$o" | grep -q 'status="200"' && { GMP_LAST="$o"; return 0; }
     printf '%s' "$o" | grep -q 'Traceback\|ModuleNotFoundError\|ImportError' \
       && GMP_BROKEN=1
@@ -967,10 +989,11 @@ cmd_setup_greenbone(){
     printf '%s\n' "$tried" | sed '/^$/d'
     echo
     warn "the account was created, gvm-cli could not be used to check it"
-    dim "gvm-cli crashed rather than refusing the credentials, so the fault is"
-    dim "in gvm-tools, not in gvmd or the password. the NVT engine drives"
-    dim "everything through gvm-cli, so it cannot run until that is repaired:"
-    dim "  pipx reinstall gvm-tools        # or: pipx install --force gvm-tools"
+    dim "gvm-cli failed rather than refusing the credentials, so the fault is"
+    dim "in the tool or how it was invoked, not in gvmd or the password."
+    dim "check it by hand as your own user, never as root:"
+    dim "  gvm-cli --gmp-username $GU --gmp-password <pass> \\"
+    dim "          socket --socketpath $SOCK --xml \"<get_version/>\""
     dim "the standalone engine does not use gvm-cli and is unaffected"
     made=1
   fi
@@ -1285,7 +1308,7 @@ step "Stage 3A  Greenbone NVT scan  ($NVT_FILES scripts, $CFG_NAME)"
 
 GMPU=$(head -n1 gmp-user.txt | tr -d '\r\n'); GMPP=$(head -n1 gmp-pass.txt | tr -d '\r\n')
 xesc(){ printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
-gmp(){ gvm-cli --gmp-username "$GMPU" --gmp-password "$GMPP" socket --socketpath "$SOCK" --xml "$1" 2>&1; }
+gmp(){ gvmcli --gmp-username "$GMPU" --gmp-password "$GMPP" socket --socketpath "$SOCK" --xml "$1" 2>&1; }
 xid(){  sed -n 's/.*id="\([a-f0-9][a-f0-9-]*\)".*/\1/p' | head -1; }
 xtag(){ sed -n "s|.*<$1>\([^<]*\)</$1>.*|\1|p" | head -1; }
 
