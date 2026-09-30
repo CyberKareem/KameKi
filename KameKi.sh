@@ -1376,14 +1376,44 @@ TARGET=$(echo "$R" | xid)
 SCANNER=$(gmp "<get_scanners/>" | grep -o 'id="[a-f0-9-]*"[^>]*>[^<]*<name>OpenVAS' | xid)
 [ -n "$SCANNER" ] || SCANNER="08b69003-5fc2-4037-a479-93b440211c73"
 
+# The hardcoded UUIDs are the stock Greenbone ones, but a machine only has
+# the configs its GVMD data feed delivered, and a partial feed leaves a
+# different set. Resolve by name against what gvmd actually holds, and keep
+# the UUID only as a fallback, so a missing config is named rather than
+# surfacing later as an unexplained create_task failure.
+CFG_AVAIL=$(gmp "<get_configs/>")
+CFG_BYNAME=$(printf '%s' "$CFG_AVAIL" \
+  | tr '>' '>\n' \
+  | grep -A1 -i "<name>$CFG_NAME</name>" >/dev/null 2>&1 && \
+  printf '%s' "$CFG_AVAIL" \
+  | tr '<' '\n' | grep -A2 -i "^config id=" \
+  | awk -v want="name>$CFG_NAME" '
+      /^config id=/ { match($0, /"[a-f0-9-]+"/); id=substr($0, RSTART+1, RLENGTH-2) }
+      $0 == want    { print id; exit }')
+if [ -n "$CFG_BYNAME" ]; then
+  [ "$CFG_BYNAME" != "$CFG_ID" ] && dim "scan config \"$CFG_NAME\" resolved to $CFG_BYNAME"
+  CFG_ID="$CFG_BYNAME"
+elif ! printf '%s' "$CFG_AVAIL" | grep -q "config id=\"$CFG_ID\""; then
+  err "scan config \"$CFG_NAME\" is not present on this gvmd"
+  dim "configs it does have:"
+  printf '%s' "$CFG_AVAIL" | tr '<' '\n' \
+    | sed -n 's|^name>\(.*\)|      \1|p' | sort -u | head -12
+  dim "sync the GVMD data feed, then re-run:"
+  dim "  sudo greenbone-feed-sync --type gvmd-data && sudo systemctl restart gvmd"
+  RUN_NVT=0
+fi
+if [ "$RUN_NVT" -eq 1 ]; then
 R=$(gmp "<create_task><name>$RUN_NAME</name><config id=\"$CFG_ID\"/>
   <target id=\"$TARGET\"/><scanner id=\"$SCANNER\"/>
   <preferences>
     <preference><scanner_name>max_checks</scanner_name><value>5</value></preference>
     <preference><scanner_name>max_hosts</scanner_name><value>20</value></preference>
   </preferences></create_task>")
+else
+R=""
+fi
 TASK=$(echo "$R" | xid)
-if [ -z "$TASK" ]; then
+if [ "$RUN_NVT" -eq 1 ] && [ -z "$TASK" ]; then
   err "task creation failed, the NVT scan cannot run"
   dim "gvmd said:"
   printf '%s\n' "$R" | head -4 | sed 's/^/      /'
