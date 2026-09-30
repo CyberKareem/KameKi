@@ -122,6 +122,35 @@ gvm_group(){
   done
   return 1
 }
+# gvmd returns the whole response on one line, so grep -c counts 1 no matter
+# how many objects there are, and a bare <name> match also picks up
+# <owner><name> and <filters><name>. Both are handled by walking the tags and
+# taking only the name that follows each object id.
+# gvmd answers on one line, so grep -c always says 1 and grep -A2 always
+# lands in <owner><name>admin</name>. The response is split on "<" and the
+# nesting tracked, so only an object's own direct-child <name> is taken.
+gmp_pairs(){    # stdin: a GMP response, $1: element -> "id<TAB>name" a line
+  tr '<' '\n' | awk -v el="$1" '
+    $0 ~ "^" el " id=" {
+      want = 1; nest = 0; id = ""
+      if (match($0, /"[A-Fa-f0-9][A-Fa-f0-9-]*"/))
+        id = substr($0, RSTART + 1, RLENGTH - 2)
+      next
+    }
+    want && /^\// && !/^\/name>/  { if (nest > 0) nest--; next }
+    want && nest > 0              { next }
+    want && /^name>/              { n = $0; sub(/^name>/, "", n)
+                                    print id "\t" n; want = 0; next }
+    want && /^[a-z_]+[ >]/        { nest++; next }
+  '
+}
+gmp_names(){    # stdin: a GMP response, $1: element -> one name a line
+  gmp_pairs "$1" | cut -f2
+}
+gmp_id_for(){   # stdin: a GMP response, $1: element, $2: name -> that id
+  gmp_pairs "$1" | awk -F'\t' -v w="$2" 'tolower($2) == tolower(w) { print $1; exit }'
+}
+
 gvmcli(){
   [ "$(id -u)" -eq 0 ] || { gvm-cli "$@"; return $?; }
   local u="${SUDO_USER:-}" g
@@ -839,46 +868,31 @@ greenbone_ready_report(){
   # which syncs separately from the NVT plugins. A machine can hold a hundred
   # thousand NVTs and still be unable to create a task because that feed never
   # arrived, so it is checked here rather than discovered mid-scan.
-  local CFGS=0 RFMTS=0 SCANNERS=0 U P
-  if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
-    U=$(head -n1 gmp-user.txt); P=$(head -n1 gmp-pass.txt)
-    CFGS=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
-             --socketpath "$SOCK" --xml "<get_configs/>" 2>/dev/null \
-           | grep -c '<config id=' | tr -cd '0-9')
-    RFMTS=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
-              --socketpath "$SOCK" --xml "<get_report_formats/>" 2>/dev/null \
-            | grep -c '<report_format id=' | tr -cd '0-9')
-    SCANNERS=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
-                 --socketpath "$SOCK" --xml "<get_scanners/>" 2>/dev/null \
-               | grep -c '<scanner id=' | tr -cd '0-9')
-    U=""; P=""
-  fi
-  CFGS="${CFGS:-0}"; RFMTS="${RFMTS:-0}"; SCANNERS="${SCANNERS:-0}"
-
-  # A count above zero is not enough. The run needs one specific scan config
-  # and the CSV report format; a partial feed can leave exactly one of each
-  # and neither of them the one required.
+  local CFGS=0 RFMTS=0 SCANNERS=0 U P CFG_LIST="" FMT_LIST=""
   local WANT_CFG="${CFG_NAME:-Full and fast}" HAVE_CFG="" HAVE_CSV=""
   if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
     U=$(head -n1 gmp-user.txt); P=$(head -n1 gmp-pass.txt)
-    HAVE_CFG=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
+    CFG_LIST=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
                  --socketpath "$SOCK" --xml "<get_configs/>" 2>/dev/null \
-               | tr '<' '\n' | sed -n 's|^name>||p' | grep -Fxi "$WANT_CFG")
-    HAVE_CSV=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
+               | gmp_names config)
+    FMT_LIST=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
                  --socketpath "$SOCK" --xml "<get_report_formats/>" 2>/dev/null \
-               | tr '<' '\n' | sed -n 's|^name>||p' | grep -Fxi "CSV Results")
-    printf "    %-24s%s\n" "scan configs"   "$CFGS  ($(gvmcli --gmp-username "$U" \
-      --gmp-password "$P" socket --socketpath "$SOCK" --xml "<get_configs/>" \
-      2>/dev/null | tr '<' '\n' | sed -n 's|^name>||p' | paste -sd, - | cut -c1-70))"
-    printf "    %-24s%s\n" "report formats" "$RFMTS  ($(gvmcli --gmp-username "$U" \
-      --gmp-password "$P" socket --socketpath "$SOCK" --xml "<get_report_formats/>" \
-      2>/dev/null | tr '<' '\n' | sed -n 's|^name>||p' | paste -sd, - | cut -c1-70))"
+               | gmp_names report_format)
+    SCANNERS=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
+                 --socketpath "$SOCK" --xml "<get_scanners/>" 2>/dev/null \
+               | gmp_names scanner | grep -c . | tr -cd '0-9')
     U=""; P=""
-  else
-    printf "    %-24s%s\n" "scan configs"   "$CFGS"
-    printf "    %-24s%s\n" "report formats" "$RFMTS"
+    CFGS=$(printf '%s' "$CFG_LIST" | grep -c . | tr -cd '0-9')
+    RFMTS=$(printf '%s' "$FMT_LIST" | grep -c . | tr -cd '0-9')
+    HAVE_CFG=$(printf '%s\n' "$CFG_LIST" | grep -Fxi "$WANT_CFG")
+    HAVE_CSV=$(printf '%s\n' "$FMT_LIST" | grep -Fxi "CSV Results")
   fi
-  printf "    %-24s%s\n" "scanners"       "$SCANNERS"
+  CFGS="${CFGS:-0}"; RFMTS="${RFMTS:-0}"; SCANNERS="${SCANNERS:-0}"
+  printf "    %-24s%s\n" "scan configs" \
+    "$CFGS  ($(printf '%s' "$CFG_LIST" | paste -sd, - | cut -c1-64))"
+  printf "    %-24s%s\n" "report formats" \
+    "$RFMTS  ($(printf '%s' "$FMT_LIST" | paste -sd, - | cut -c1-64))"
+  printf "    %-24s%s\n" "scanners" "$SCANNERS"
 
   if [ -z "$HAVE_CFG" ] || [ -z "$HAVE_CSV" ]; then
     echo
@@ -1400,8 +1414,18 @@ R=$(gmp "<create_target><name>kameki-target-$RUN_NAME</name><hosts>$HOSTS</hosts
 TARGET=$(echo "$R" | xid)
 [ -n "$TARGET" ] || { err "target creation failed"; echo "$R" | head -3; }
 
-SCANNER=$(gmp "<get_scanners/>" | grep -o 'id="[a-f0-9-]*"[^>]*>[^<]*<name>OpenVAS' | xid)
+SCANNER=$(gmp "<get_scanners/>" | gmp_pairs scanner \
+          | awk -F'\t' 'tolower($2) ~ /^openvas/ { print $1; exit }')
 [ -n "$SCANNER" ] || SCANNER="08b69003-5fc2-4037-a479-93b440211c73"
+
+# Report format UUIDs are stock on most installs but not guaranteed, and an
+# export against a wrong id fails after the scan has already run. Resolve by
+# name, keep the stock UUID when gvmd does not name one.
+FMT_AVAIL=$(gmp "<get_report_formats/>")
+FMT_BYNAME=$(printf '%s' "$FMT_AVAIL" | gmp_id_for report_format "CSV Results")
+[ -n "$FMT_BYNAME" ] && FMT_CSV="$FMT_BYNAME"
+FMT_BYNAME=$(printf '%s' "$FMT_AVAIL" | gmp_id_for report_format "XML")
+[ -n "$FMT_BYNAME" ] && FMT_XML="$FMT_BYNAME"
 
 # The hardcoded UUIDs are the stock Greenbone ones, but a machine only has
 # the configs its GVMD data feed delivered, and a partial feed leaves a
@@ -1409,22 +1433,14 @@ SCANNER=$(gmp "<get_scanners/>" | grep -o 'id="[a-f0-9-]*"[^>]*>[^<]*<name>OpenV
 # the UUID only as a fallback, so a missing config is named rather than
 # surfacing later as an unexplained create_task failure.
 CFG_AVAIL=$(gmp "<get_configs/>")
-CFG_BYNAME=$(printf '%s' "$CFG_AVAIL" \
-  | tr '>' '>\n' \
-  | grep -A1 -i "<name>$CFG_NAME</name>" >/dev/null 2>&1 && \
-  printf '%s' "$CFG_AVAIL" \
-  | tr '<' '\n' | grep -A2 -i "^config id=" \
-  | awk -v want="name>$CFG_NAME" '
-      /^config id=/ { match($0, /"[a-f0-9-]+"/); id=substr($0, RSTART+1, RLENGTH-2) }
-      $0 == want    { print id; exit }')
+CFG_BYNAME=$(printf '%s' "$CFG_AVAIL" | gmp_id_for config "$CFG_NAME")
 if [ -n "$CFG_BYNAME" ]; then
   [ "$CFG_BYNAME" != "$CFG_ID" ] && dim "scan config \"$CFG_NAME\" resolved to $CFG_BYNAME"
   CFG_ID="$CFG_BYNAME"
 elif ! printf '%s' "$CFG_AVAIL" | grep -q "config id=\"$CFG_ID\""; then
   err "scan config \"$CFG_NAME\" is not present on this gvmd"
   dim "configs it does have:"
-  printf '%s' "$CFG_AVAIL" | tr '<' '\n' \
-    | sed -n 's|^name>\(.*\)|      \1|p' | sort -u | head -12
+  printf '%s' "$CFG_AVAIL" | gmp_names config | sort -u | sed 's|^|      |' | head -12
   dim "sync the GVMD data feed, then re-run:"
   dim "  sudo greenbone-feed-sync --type gvmd-data && sudo systemctl restart gvmd"
   RUN_NVT=0
