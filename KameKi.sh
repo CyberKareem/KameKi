@@ -1467,6 +1467,26 @@ NULLS=$(gcnt '\[+\]' "$RAW/null-session.txt")
 MSSQL_OK=$(gcnt '\[+\]' "$RAW/auth-mssql.txt")
 WINRM_OK=$(gcnt '\[+\]' "$RAW/auth-winrm.txt")
 info "smb $AUTH_OK ok / $AUTH_FAIL fail   no-signing $NOSIGN   smbv1 $SMBV1   null $NULLS   mssql $MSSQL_OK   winrm $WINRM_OK"
+# A locked account is not a failed login, it is an incident in progress.
+# Continuing sprays a locked account across the rest of the estate, and every
+# attempt restarts the lockout window, so the run stops here.
+LOCKED=$(gcnt 'STATUS_ACCOUNT_LOCKED_OUT' "$RAW/auth-smb.txt")
+LOCKED_H=$(grep 'STATUS_ACCOUNT_LOCKED_OUT' "$RAW/auth-smb.txt" 2>/dev/null \
+           | awk '{print $2}' | sort -u | wc -l | tr -cd '0-9')
+LOCKED_H="${LOCKED_H:-0}"
+if [ "$LOCKED" -gt 0 ]; then
+  echo
+  err "STOPPING: the account is locked out on ${LOCKED_H} host(s)"
+  dim "$LOCKED lockout response(s) in this stage alone. Every further attempt"
+  dim "extends the lockout window and delays recovery."
+  dim ""
+  dim "1. tell the client now, the account needs unlocking"
+  dim "2. confirm the lockout threshold and observation window before retrying"
+  dim "3. then: $0 preflight    to find the format against ONE host"
+  dim ""
+  dim "partial evidence kept in $RAW/"
+  exit 1
+fi
 [ "$AUTH_OK" -eq 0 ] && { warn "No SMB authentication succeeded."; dim "try DOMAIN\\\\user, user@domain, or the NETBIOS name"; }
 
 # =====================================================================
@@ -1504,8 +1524,10 @@ pool adr ldap "--password-not-required"    pwd-not-required
 pool adr ldap "--trusted-for-delegation"   trusted-delegation
 finish
 ADCS_H=$(gcnti 'ESC\|Certificate Authority' "$RAW/ad/adcs.txt")
-KERB_H=$(cat "$RAW/ad/kerberoast.txt" "$RAW/ad/kerberoast-tickets.txt" 2>/dev/null | grep -c 'krb5tgs' || echo 0)
-ASREP_H=$(cat "$RAW/ad/asreproast.txt" "$RAW/ad/asrep-tickets.txt" 2>/dev/null | grep -c 'krb5asrep' || echo 0)
+KERB_H=$(cat "$RAW/ad/kerberoast.txt" "$RAW/ad/kerberoast-tickets.txt" 2>/dev/null | grep -c 'krb5tgs' | head -1 | tr -cd '0-9')
+KERB_H="${KERB_H:-0}"
+ASREP_H=$(cat "$RAW/ad/asreproast.txt" "$RAW/ad/asrep-tickets.txt" 2>/dev/null | grep -c 'krb5asrep' | head -1 | tr -cd '0-9')
+ASREP_H="${ASREP_H:-0}"
 DELEG_H=$(gcnti 'delegation' "$RAW/ad/delegation.txt")
 LDAPSIGN=$(gcnti 'not enforced\|is not being enforced\|channel binding' "$RAW/ad/ldap-signing.txt")
 PWDNR=$(gcnti 'password not required\|PASSWD_NOTREQD' "$RAW/ad/pwd-not-required.txt")
