@@ -834,6 +834,39 @@ greenbone_ready_report(){
   local NVTS=0
   [ -d /var/lib/openvas/plugins ] \
     && NVTS=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
+
+  # Scan configs, report formats and port lists come from the GVMD data feed,
+  # which syncs separately from the NVT plugins. A machine can hold a hundred
+  # thousand NVTs and still be unable to create a task because that feed never
+  # arrived, so it is checked here rather than discovered mid-scan.
+  local CFGS=0 RFMTS=0 SCANNERS=0 U P
+  if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
+    U=$(head -n1 gmp-user.txt); P=$(head -n1 gmp-pass.txt)
+    CFGS=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
+             --socketpath "$SOCK" --xml "<get_configs/>" 2>/dev/null \
+           | grep -c '<config id=' | tr -cd '0-9')
+    RFMTS=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
+              --socketpath "$SOCK" --xml "<get_report_formats/>" 2>/dev/null \
+            | grep -c '<report_format id=' | tr -cd '0-9')
+    SCANNERS=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
+                 --socketpath "$SOCK" --xml "<get_scanners/>" 2>/dev/null \
+               | grep -c '<scanner id=' | tr -cd '0-9')
+    U=""; P=""
+  fi
+  CFGS="${CFGS:-0}"; RFMTS="${RFMTS:-0}"; SCANNERS="${SCANNERS:-0}"
+  printf "    %-24s%s\n" "scan configs"   "$CFGS"
+  printf "    %-24s%s\n" "report formats" "$RFMTS"
+  printf "    %-24s%s\n" "scanners"       "$SCANNERS"
+  if [ "$CFGS" -eq 0 ] || [ "$RFMTS" -eq 0 ]; then
+    echo
+    warn "the GVMD data feed is missing, so no scan can be created"
+    dim "the NVT plugins and the GVMD data objects are separate feeds."
+    dim "$NVTS plugins are present but there are $CFGS scan configs and"
+    dim "$RFMTS report formats, so create_task and CSV export both fail."
+    dim "  sudo greenbone-feed-sync --type gvmd-data"
+    dim "needs rsync/873 outbound, same as the plugin feed"
+    return 1
+  fi
   echo
   if [ "$NVTS" -ge 10000 ]; then
     info "Greenbone ready, $NVTS NVTs. the next run uses both engines"
@@ -1350,20 +1383,41 @@ R=$(gmp "<create_task><name>$RUN_NAME</name><config id=\"$CFG_ID\"/>
     <preference><scanner_name>max_hosts</scanner_name><value>20</value></preference>
   </preferences></create_task>")
 TASK=$(echo "$R" | xid)
+if [ -z "$TASK" ]; then
+  err "task creation failed, the NVT scan cannot run"
+  dim "gvmd said:"
+  printf '%s\n' "$R" | head -4 | sed 's/^/      /'
+  dim ""
+  dim "the usual cause is a missing GVMD data feed. Scan configs, report"
+  dim "formats and port lists come from data-objects/gvmd, which syncs"
+  dim "separately from the NVT plugins. Check with:"
+  dim "  $0 doctor        and:  sudo greenbone-feed-sync --type gvmd-data"
+  RUN_NVT=0
+fi
+if [ "$RUN_NVT" -eq 1 ]; then
 R=$(gmp "<start_task task_id=\"$TASK\"/>")
 REPORT=$(echo "$R" | xtag report_id)
+if [ -z "$REPORT" ]; then
+  err "the task was created but would not start"
+  printf '%s\n' "$R" | head -4 | sed 's/^/      /'
+  RUN_NVT=0
+fi
+fi
 echo "task=$TASK target=$TARGET report=$REPORT" > "$RAW/nvt/ids.txt"
 info "task $TASK   report $REPORT"
 dim "polling every ${POLL}s"
 
 LAST=-1
-while true; do
+while [ "$RUN_NVT" -eq 1 ]; do
   S=$(gmp "<get_tasks task_id=\"$TASK\"/>")
   ST=$(echo "$S" | xtag status); PR=$(echo "$S" | xtag progress); [ -z "$PR" ] && PR=0
   case "$ST" in
     Done) echo; info "NVT scan complete"; break ;;
     Stopped|Interrupted) echo; warn "NVT scan $ST at ${PR}%, exporting partial"; break ;;
-    "") echo; err "lost contact with gvmd"; break ;;
+    "") echo; err "gvmd returned no status for this task"
+        dim "the task may have been removed, or gvmd restarted mid-scan"
+        dim "check: journalctl -u gvmd --since '1 hour ago'"
+        break ;;
   esac
   if [ "$PR" != "$LAST" ]; then
     printf "\r    %-12s %3s%%   %d min elapsed    " "$ST" "$PR" "$(( ($(date +%s)-T0)/60 ))"
