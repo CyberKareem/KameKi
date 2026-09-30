@@ -1374,6 +1374,11 @@ info "hosts with open ports $HOSTS_OPEN   total open ports $TOTAL_PORTS   possib
 # =====================================================================
 NVT_HIGH=0; NVT_MED=0; NVT_LOW=0; NVT_LOG=0; NVT_CVES=0
 NVT_AUTH_HOSTS=0; NVT_HOSTS_F=0; NVT_UNAUTH=0; NVT_ROWS=0
+# Every gvmd object id is declared here. Stage 3A can abandon at four
+# separate points, and each one leaves a later reference pointing at a
+# variable that was never assigned. Under set -u that is fatal, so a failed
+# create_task took stages 3B to 10 and the final report down with it.
+TASK=""; REPORT=""; TARGET=""; SMB_CRED=""; SSH_CRED=""
 NVT_CSV="$RAW/nvt/results.csv"
 : > "$RAW/cve-nvt.txt"
 
@@ -1477,8 +1482,10 @@ if [ -z "$REPORT" ]; then
 fi
 fi
 echo "task=$TASK target=$TARGET report=$REPORT" > "$RAW/nvt/ids.txt"
-info "task $TASK   report $REPORT"
-dim "polling every ${POLL}s"
+if [ "$RUN_NVT" -eq 1 ]; then
+  info "task $TASK   report $REPORT"
+  dim "polling every ${POLL}s"
+fi
 
 LAST=-1
 while [ "$RUN_NVT" -eq 1 ]; do
@@ -1499,12 +1506,14 @@ while [ "$RUN_NVT" -eq 1 ]; do
   sleep "$POLL"
 done
 
-gmp "<get_reports report_id=\"$REPORT\" format_id=\"$FMT_CSV\" ignore_pagination=\"1\"
-      details=\"1\" filter=\"levels=hmlg rows=-1\"/>" > "$RAW/nvt/csv.xml" 2>&1
-sed -n 's|.*</report_format>\(.*\)</report>.*|\1|p' "$RAW/nvt/csv.xml" | base64 -d > "$NVT_CSV" 2>/dev/null
-[ -s "$NVT_CSV" ] || grep -oE '[A-Za-z0-9+/=]{200,}' "$RAW/nvt/csv.xml" | head -1 | base64 -d > "$NVT_CSV" 2>/dev/null
-gmp "<get_reports report_id=\"$REPORT\" format_id=\"$FMT_XML\" ignore_pagination=\"1\"
-      details=\"1\" filter=\"levels=hmlg rows=-1\"/>" > "$RAW/nvt/report-full.xml" 2>&1
+if [ -n "$REPORT" ]; then
+  gmp "<get_reports report_id=\"$REPORT\" format_id=\"$FMT_CSV\" ignore_pagination=\"1\"
+        details=\"1\" filter=\"levels=hmlg rows=-1\"/>" > "$RAW/nvt/csv.xml" 2>&1
+  sed -n 's|.*</report_format>\(.*\)</report>.*|\1|p' "$RAW/nvt/csv.xml" | base64 -d > "$NVT_CSV" 2>/dev/null
+  [ -s "$NVT_CSV" ] || grep -oE '[A-Za-z0-9+/=]{200,}' "$RAW/nvt/csv.xml" | head -1 | base64 -d > "$NVT_CSV" 2>/dev/null
+  gmp "<get_reports report_id=\"$REPORT\" format_id=\"$FMT_XML\" ignore_pagination=\"1\"
+        details=\"1\" filter=\"levels=hmlg rows=-1\"/>" > "$RAW/nvt/report-full.xml" 2>&1
+fi
 
 [ -n "$SMB_CRED" ] && gmp "<delete_credential credential_id=\"$SMB_CRED\" ultimate=\"1\"/>" >/dev/null 2>&1
 [ -n "$SSH_CRED" ] && gmp "<delete_credential credential_id=\"$SSH_CRED\" ultimate=\"1\"/>" >/dev/null 2>&1
