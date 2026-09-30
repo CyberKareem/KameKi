@@ -854,17 +854,44 @@ greenbone_ready_report(){
     U=""; P=""
   fi
   CFGS="${CFGS:-0}"; RFMTS="${RFMTS:-0}"; SCANNERS="${SCANNERS:-0}"
-  printf "    %-24s%s\n" "scan configs"   "$CFGS"
-  printf "    %-24s%s\n" "report formats" "$RFMTS"
+
+  # A count above zero is not enough. The run needs one specific scan config
+  # and the CSV report format; a partial feed can leave exactly one of each
+  # and neither of them the one required.
+  local WANT_CFG="${CFG_NAME:-Full and fast}" HAVE_CFG="" HAVE_CSV=""
+  if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
+    U=$(head -n1 gmp-user.txt); P=$(head -n1 gmp-pass.txt)
+    HAVE_CFG=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
+                 --socketpath "$SOCK" --xml "<get_configs/>" 2>/dev/null \
+               | tr '<' '\n' | sed -n 's|^name>||p' | grep -Fxi "$WANT_CFG")
+    HAVE_CSV=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
+                 --socketpath "$SOCK" --xml "<get_report_formats/>" 2>/dev/null \
+               | tr '<' '\n' | sed -n 's|^name>||p' | grep -Fxi "CSV Results")
+    printf "    %-24s%s\n" "scan configs"   "$CFGS  ($(gvmcli --gmp-username "$U" \
+      --gmp-password "$P" socket --socketpath "$SOCK" --xml "<get_configs/>" \
+      2>/dev/null | tr '<' '\n' | sed -n 's|^name>||p' | paste -sd, - | cut -c1-70))"
+    printf "    %-24s%s\n" "report formats" "$RFMTS  ($(gvmcli --gmp-username "$U" \
+      --gmp-password "$P" socket --socketpath "$SOCK" --xml "<get_report_formats/>" \
+      2>/dev/null | tr '<' '\n' | sed -n 's|^name>||p' | paste -sd, - | cut -c1-70))"
+    U=""; P=""
+  else
+    printf "    %-24s%s\n" "scan configs"   "$CFGS"
+    printf "    %-24s%s\n" "report formats" "$RFMTS"
+  fi
   printf "    %-24s%s\n" "scanners"       "$SCANNERS"
-  if [ "$CFGS" -eq 0 ] || [ "$RFMTS" -eq 0 ]; then
+
+  if [ -z "$HAVE_CFG" ] || [ -z "$HAVE_CSV" ]; then
     echo
-    warn "the GVMD data feed is missing, so no scan can be created"
-    dim "the NVT plugins and the GVMD data objects are separate feeds."
-    dim "$NVTS plugins are present but there are $CFGS scan configs and"
-    dim "$RFMTS report formats, so create_task and CSV export both fail."
+    warn "the GVMD data feed has not been imported, the NVT scan cannot run"
+    [ -z "$HAVE_CFG" ] && dim "missing scan config:   \"$WANT_CFG\""
+    [ -z "$HAVE_CSV" ] && dim "missing report format: \"CSV Results\""
+    dim "$NVTS NVT plugins are present, but those come from a different feed."
+    dim "scan configs, report formats and port lists live in"
+    dim "/var/lib/gvm/data-objects/gvmd and sync separately:"
     dim "  sudo greenbone-feed-sync --type gvmd-data"
-    dim "needs rsync/873 outbound, same as the plugin feed"
+    dim "  sudo systemctl restart gvmd     # gvmd imports on start"
+    dim "if the counts stay at 1 after both, gvmd downloaded but did not"
+    dim "import. check: journalctl -u gvmd --since '10 min ago'"
     return 1
   fi
   echo
