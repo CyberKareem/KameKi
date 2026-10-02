@@ -191,6 +191,48 @@ mark_done(){ touch "$RAW/.done-$1"; }
 
 need_root(){ [ "$(id -u)" -eq 0 ] || { err "this needs root: sudo $0 $*"; exit 1; }; }
 
+# ---------------------------------------------------------------------
+#  Bounded nxc, and per-protocol target lists
+#
+#  A TCP connect to a filtered port does not fail, it blocks on SYN
+#  retries, which is over two minutes per host on a default Linux. nxc has
+#  no overall wall-clock cap of its own, so pointing five protocols at
+#  every live host turns one firewalled segment into a stall of hours with
+#  nothing printed. Both halves of that are fixed here: every call is
+#  bounded, and each protocol is given only the hosts that answer on its
+#  own port.
+# ---------------------------------------------------------------------
+NXC_CAP="${NXC_CAP:-15m}"
+nxcq(){
+  if have timeout; then timeout -k 20 "$NXC_CAP" nxc "$@"; else nxc "$@"; fi
+}
+
+proto_list(){   # $1 name, $2.. ports -> writes targets/$1.txt, echoes the count
+  local name="$1"; shift
+  local out="$RAW/targets/$name.txt" p h
+  mkdir -p "$RAW/targets"; : > "$out"
+  if [ -s "$RAW/ports/map.txt" ]; then
+    for p in "$@"; do
+      awk -v w="$p" '{n=split($2,a,",");for(i=1;i<=n;i++) if(a[i]==w) print $1}' \
+          "$RAW/ports/map.txt"
+    done | sort -uV > "$out"
+  fi
+  # The port scan can be dropped in transit and report nothing at all while
+  # services are in fact listening. Only a COMPLETELY empty map triggers the
+  # direct probe: a populated map means the scan worked, and is authoritative
+  # about which ports are open. Falling back per protocol instead would spend
+  # five seconds a host on every protocol the estate simply does not run.
+  if [ ! -s "$out" ] && [ ! -s "$RAW/ports/map.txt" ] && [ -s "$RAW/live.txt" ]; then
+    while read -r h; do
+      [ -n "$h" ] || continue
+      for p in "$@"; do
+        if net_open "$h" "$p"; then echo "$h"; break; fi
+      done
+    done < "$RAW/live.txt" | sort -uV > "$out"
+  fi
+  cnt "$out"
+}
+
 # =====================================================================
 #  LLM annotation layer
 # =====================================================================
@@ -1584,9 +1626,33 @@ fi
 #  Stage 4  Authentication across protocols
 # =====================================================================
 step "Stage 4  Authentication"
-ap(){ nxc "$1" "$RAW/live.txt" -u "$U" -p "$P" --continue-on-success -t "$NXC_THREADS" > "$RAW/auth-$1.txt" 2>&1; }
+SMB_T=$(proto_list smb 445 139)
+LDAP_T=$(proto_list ldap 389 636)
+MSSQL_T=$(proto_list mssql 1433)
+WINRM_T=$(proto_list winrm 5985 5986)
+RDP_T=$(proto_list rdp 3389)
+dim "targets by protocol, from the stage 2 port map"
+printf "    %-8s%-6s%-8s%-6s%-8s%-6s%-8s%-6s%-8s%s\n" \
+  "smb" "$SMB_T" "ldap" "$LDAP_T" "mssql" "$MSSQL_T" \
+  "winrm" "$WINRM_T" "rdp" "$RDP_T"
+dim "each call is capped at $NXC_CAP"
+ap(){ local pr="$1" t="$RAW/targets/$1.txt"
+      if [ ! -s "$t" ]; then
+        printf 'no live host answered on the %s port, so this protocol was not attempted\n' \
+               "$pr" > "$RAW/auth-$pr.txt"
+        return 0
+      fi
+      nxcq "$pr" "$t" -u "$U" -p "$P" --continue-on-success \
+           -t "$NXC_THREADS" > "$RAW/auth-$pr.txt" 2>&1; }
 for pr in smb ldap mssql winrm rdp; do pool ap "$pr"; done
-pool bash -c "nxc smb '$RAW/live.txt' -u '' -p '' --shares > '$RAW/null-session.txt' 2>&1"
+nullsess(){
+  if [ ! -s "$RAW/targets/smb.txt" ]; then
+    echo 'no live host answered on 445' > "$RAW/null-session.txt"; return 0
+  fi
+  nxcq smb "$RAW/targets/smb.txt" -u '' -p '' --shares \
+       > "$RAW/null-session.txt" 2>&1
+}
+pool nullsess
 finish
 
 grep '\[+\]' "$RAW/auth-smb.txt" | awk '{print $2}' | sort -uV > "$RAW/auth-ok.txt"   || : > "$RAW/auth-ok.txt"
@@ -1630,9 +1696,15 @@ fi
 # =====================================================================
 step "Stage 5  Windows exploit modules"
 MODS="ms17-010 zerologon petitpotam nopac smbghost printnightmare spooler webdav coerce_plus"
-runmod(){ nxc smb "$RAW/live.txt" -u "$U" -p "$P" -M "$1" -t "$NXC_THREADS" > "$RAW/mods/$1.txt" 2>&1; }
-for m in $MODS; do pool runmod "$m"; done
-finish
+runmod(){ nxcq smb "$RAW/targets/smb.txt" -u "$U" -p "$P" -M "$1" \
+                -t "$NXC_THREADS" > "$RAW/mods/$1.txt" 2>&1; }
+if [ -s "$RAW/targets/smb.txt" ]; then
+  for m in $MODS; do pool runmod "$m"; done
+  finish
+else
+  dim "no live host answered on 445, so no module was attempted"
+  for m in $MODS; do echo 'no SMB host in scope' > "$RAW/mods/$m.txt"; done
+fi
 : > "$RAW/vuln-summary.txt"; : > "$RAW/vuln-detail.txt"
 for m in $MODS; do
   H=$(gcntiE 'VULNERABLE|is vulnerable' "$RAW/mods/$m.txt")
@@ -1648,7 +1720,12 @@ MOD_VULN=$(awk -F': ' '{s+=$2} END{print s+0}' "$RAW/vuln-summary.txt" 2>/dev/nu
 #  Stage 6  Active Directory
 # =====================================================================
 step "Stage 6  Active Directory"
-adr(){ nxc "$1" "$RAW/live.txt" -u "$U" -p "$P" $2 > "$RAW/ad/$3.txt" 2>&1; }
+adr(){ local pr="$1" t="$RAW/targets/$1.txt"
+       if [ ! -s "$t" ]; then
+         printf 'no live host answered on the %s port\n' "$pr" > "$RAW/ad/$3.txt"
+         return 0
+       fi
+       nxcq "$pr" "$t" -u "$U" -p "$P" $2 > "$RAW/ad/$3.txt" 2>&1; }
 pool adr ldap "-M adcs"                    adcs
 pool adr ldap "-M ldap-checker"            ldap-signing
 pool adr ldap "--kerberoasting $RAW/ad/kerberoast-tickets.txt" kerberoast
@@ -1673,7 +1750,8 @@ info "adcs $ADCS_H   kerberoast $KERB_H   asrep $ASREP_H   delegation $DELEG_H  
 #  Stage 7  Configuration audit
 # =====================================================================
 step "Stage 7  Configuration audit"
-cf(){ nxc smb "$RAW/live.txt" -u "$U" -p "$P" $1 -t "$NXC_THREADS" > "$RAW/$2.txt" 2>&1; }
+cf(){ nxcq smb "$RAW/targets/smb.txt" -u "$U" -p "$P" $1 \
+           -t "$NXC_THREADS" > "$RAW/$2.txt" 2>&1; }
 pool cf "--pass-pol"                     password-policy
 pool cf "--local-groups Administrators"  local-admins
 pool cf "--shares"                       shares
@@ -1732,7 +1810,10 @@ fi
 step "Stage 9  Linux authenticated collection"
 LINUX_OK=0; LINUX_EOL=0
 if [ "$SSH_ON" -eq 1 ]; then
-  nxc ssh "$RAW/live.txt" -u "$SU" -p "$SP" --continue-on-success -t "$NXC_THREADS" > "$RAW/auth-ssh.txt" 2>&1
+  SSH_T=$(proto_list ssh 22)
+  dim "ssh targets $SSH_T"
+  nxcq ssh "$RAW/targets/ssh.txt" -u "$SU" -p "$SP" --continue-on-success \
+       -t "$NXC_THREADS" > "$RAW/auth-ssh.txt" 2>&1
   grep '\[+\]' "$RAW/auth-ssh.txt" | awk '{print $2}' | sort -uV > "$RAW/ssh-ok.txt" || : > "$RAW/ssh-ok.txt"
   lg(){ nxc ssh "$1" -u "$SU" -p "$SP" -x 'cat /etc/os-release 2>/dev/null; echo ---KERNEL---; uname -r; echo ---SUDO---; sudo -n -l 2>/dev/null; echo ---SUID---; find / -perm -4000 -type f 2>/dev/null | head -40; echo ---PKGS---; (dpkg -l 2>/dev/null || rpm -qa 2>/dev/null)' 2>/dev/null > "$RAW/linux/$1.txt"; }
   while read -r h; do [ -n "$h" ] && pool lg "$h"; done < "$RAW/ssh-ok.txt"
