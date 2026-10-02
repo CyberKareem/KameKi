@@ -1012,6 +1012,13 @@ nvt_count(){
 # hand. It is run here instead. Output is not captured, so rsync progress is
 # visible rather than the terminal appearing dead for an hour.
 FEED_SYNC="${FEED_SYNC:-1}"
+# gvmd-data is a few megabytes and carries the scan configs, report formats
+# and port lists, so it goes first: the operator sees "scan configs" stop
+# reading zero within a minute instead of after the multi-gigabyte NVT
+# download. nvt is what an actual scan needs. scap and cert are large and
+# add CVE and advisory metadata only, so they come last and an interrupted
+# run still leaves a usable scanner behind.
+FEED_TYPES="${FEED_TYPES:-gvmd-data nvt scap cert}"
 greenbone_sync_feeds(){
   have greenbone-feed-sync || {
     warn "greenbone-feed-sync is not installed, the feed cannot be fetched"
@@ -1022,7 +1029,9 @@ greenbone_sync_feeds(){
   before=$(nvt_count)
   dim "fetching the Greenbone feeds. First run is several GB and can take"
   dim "a long time on a client link. Skip with FEED_SYNC=0 $0 setup-greenbone"
-  for t in nvt gvmd-data scap cert; do
+  dim "order: $FEED_TYPES. rsync resumes, so an interrupted sync continues"
+  dim "where it stopped rather than starting again."
+  for t in $FEED_TYPES; do
     echo
     dim "--- feed: $t"
     if greenbone-feed-sync --type "$t"; then dim "$t ok"

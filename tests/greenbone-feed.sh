@@ -84,9 +84,19 @@ t "nvt synced"                   "$(grep -c 'feed-sync --type nvt' "$LOG")" 1
 t "gvmd-data synced"             "$(grep -c 'feed-sync --type gvmd-data' "$LOG")" 1
 t "scap synced"                  "$(grep -c 'feed-sync --type scap' "$LOG")" 1
 t "cert synced"                  "$(grep -c 'feed-sync --type cert' "$LOG")" 1
-t "nvt is fetched first"         "$(grep -n 'feed-sync --type' "$LOG" | head -1 | grep -c nvt)" 1
+t "gvmd-data is fetched first"   "$(grep -n 'feed-sync --type' "$LOG" | head -1 | grep -c gvmd-data)" 1
+t "nvt comes before scap"        "$([ "$(grep -n 'type nvt'  "$LOG" | head -1 | cut -d: -f1)" \
+                                     -lt "$(grep -n 'type scap' "$LOG" | head -1 | cut -d: -f1)" ] && echo yes)" yes
 t "ospd reloaded after the sync" "$(grep -c 'systemctl restart ospd-openvas' "$LOG")" 1
 t "plugin count reported"        "$(printf '%s' "$OUT" | grep -c 'NVT plugins')" 1
+t "says rsync resumes"           "$(printf '%s' "$OUT" | grep -c 'rsync resumes')" 1
+
+echo
+echo "FEED_TYPES narrows the sync for a slow link"
+: > "$LOG"
+OUT=$(FEED_TYPES="gvmd-data nvt" greenbone_sync_feeds 2>&1)
+t "only the two asked for"       "$(grep -c 'feed-sync --type' "$LOG")" 2
+t "scap not fetched"             "$(grep -c 'type scap' "$LOG")" 0
 
 echo
 echo "a sync failure is reported, not swallowed"
