@@ -937,6 +937,87 @@ gvmd_db_ready(){      # $1: the gvm service account, e.g. _gvm
   fi
   return 0
 }
+# gvmd asks ospd-openvas for the VT list while it is starting. With an empty
+# plugin directory, or a feed large enough to take minutes to enumerate, that
+# request does not return inside systemd's default 90-second start timeout.
+# systemd then kills gvmd and restarts it, forever: one site reached restart
+# counter 493. Raising the timeout is what breaks the loop, and the loop has
+# to be broken before a feed import, because an import takes longer than 90
+# seconds and gets killed half way through every time.
+GVMD_START_TIMEOUT="${GVMD_START_TIMEOUT:-1800}"
+gvmd_fix_start_timeout(){
+  local d=/etc/systemd/system/gvmd.service.d
+  printf "    %-24s" "gvmd start timeout"
+  mkdir -p "$d" 2>/dev/null || { echo "${YEL}cannot write $d${RST}"; return 1; }
+  cat > "$d/kameki-timeout.conf" <<CONF
+# Written by kameki. gvmd queries ospd-openvas for the VT list during start,
+# which exceeds the packaged 90s TimeoutStartSec on a fresh or large feed.
+# systemd killed and restarted gvmd indefinitely as a result.
+[Unit]
+StartLimitIntervalSec=0
+[Service]
+TimeoutStartSec=${GVMD_START_TIMEOUT}
+Restart=on-failure
+RestartSec=30
+CONF
+  systemctl daemon-reload >/dev/null 2>&1
+  echo "${GRN}${GVMD_START_TIMEOUT}s${RST}"
+}
+
+# A gvmd already in a restart loop must be stopped before the feed work, or
+# every import is cut short by the next restart.
+gvmd_break_restart_loop(){
+  local n
+  n=$(systemctl show -p NRestarts --value gvmd 2>/dev/null | tr -cd '0-9')
+  systemctl stop gvmd    >/dev/null 2>&1 || true
+  systemctl reset-failed gvmd >/dev/null 2>&1 || true
+  if [ -n "${n:-}" ] && [ "${n:-0}" -gt 3 ]; then
+    printf "    %-24s" "restart loop"
+    echo "${YEL}stopped after ${n} restarts${RST}"
+  fi
+}
+
+nvt_count(){
+  local n=0
+  [ -d /var/lib/openvas/plugins ] \
+    && n=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l | tr -cd '0-9')
+  echo "${n:-0}"
+}
+
+# The feed is what every other number depends on. Nothing in this script used
+# to fetch it, so a clean machine reached the end of setup with 0 plugins, 0
+# scan configs and 0 report formats, and was told to go and run the sync by
+# hand. It is run here instead. Output is not captured, so rsync progress is
+# visible rather than the terminal appearing dead for an hour.
+FEED_SYNC="${FEED_SYNC:-1}"
+greenbone_sync_feeds(){
+  have greenbone-feed-sync || {
+    warn "greenbone-feed-sync is not installed, the feed cannot be fetched"
+    dim "install the Greenbone tooling, or run with FEED_SYNC=0 to skip"
+    return 1
+  }
+  local t rc=0 before after
+  before=$(nvt_count)
+  dim "fetching the Greenbone feeds. First run is several GB and can take"
+  dim "a long time on a client link. Skip with FEED_SYNC=0 $0 setup-greenbone"
+  for t in nvt gvmd-data scap cert; do
+    echo
+    dim "--- feed: $t"
+    if greenbone-feed-sync --type "$t"; then dim "$t ok"
+    else warn "$t sync failed or was incomplete"; rc=1; fi
+  done
+  after=$(nvt_count)
+  echo
+  printf "    %-24s%s\n" "NVT plugins" "$before -> $after"
+  # ospd-openvas caches the plugin set in redis and only rereads it on start,
+  # so gvmd would otherwise ask about a feed ospd has not loaded yet.
+  if systemctl list-unit-files ospd-openvas.service >/dev/null 2>&1; then
+    printf "    %-24s" "ospd-openvas reload"
+    if systemctl restart ospd-openvas >/dev/null 2>&1; then echo "${GRN}ok${RST}"
+    else echo "${YEL}failed${RST}"; fi
+  fi
+  return $rc
+}
 gvmd_socket(){
   local s
   for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock \
@@ -991,8 +1072,11 @@ greenbone_ready_report(){
     dim "/var/lib/gvm/data-objects/gvmd and sync separately:"
     dim "  sudo greenbone-feed-sync --type gvmd-data"
     dim "  sudo systemctl restart gvmd     # gvmd imports on start"
-    dim "if the counts stay at 1 after both, gvmd downloaded but did not"
-    dim "import. check: journalctl -u gvmd --since '10 min ago'"
+    dim "if the counts do not move after both, gvmd downloaded the data but"
+    dim "did not import it. The usual reason is that systemd killed gvmd"
+    dim "mid-import on its start timeout, which looks like a restart loop:"
+    dim "  systemctl show -p NRestarts --value gvmd"
+    dim "  journalctl -u gvmd --since '10 min ago'"
     return 1
   fi
   echo
@@ -1077,8 +1161,28 @@ cmd_setup_greenbone(){
   if GVM_ACCT=$(gvm_service_account); then gvmd_db_ready "$GVM_ACCT" || true
   else dim "no _gvm or gvm account yet, skipping the database step"; fi
 
+  # Order matters from here. A gvmd in a restart loop truncates every feed
+  # import, and an import on an empty feed takes far longer than the packaged
+  # start timeout, so the loop is broken and the timeout raised before any
+  # feed work, and gvmd is started only once the feed is on disk.
+  if systemctl list-unit-files gvmd.service >/dev/null 2>&1; then
+    gvmd_break_restart_loop
+    gvmd_fix_start_timeout || true
+  fi
+
+  # 3. feeds ----------------------------------------------------------
+  if [ "$FEED_SYNC" = "1" ] && [ "$(nvt_count)" -lt 10000 ]; then
+    greenbone_sync_feeds || true
+  else
+    printf "    %-24s%s\n" "NVT plugins" "$(nvt_count)"
+    [ "$FEED_SYNC" = "1" ] || dim "feed sync skipped, FEED_SYNC=0"
+  fi
+
+  # 4. gvmd -----------------------------------------------------------
   if systemctl list-unit-files gvmd.service >/dev/null 2>&1; then
     printf "    %-24s" "gvmd"
+    # --now blocks until systemd decides the unit is up, which is now up to
+    # GVMD_START_TIMEOUT, so this is the step that waits.
     if out=$(systemctl enable --now gvmd 2>&1); then echo "${GRN}started${RST}"
     else
       echo "${YEL}failed${RST}"
@@ -1089,21 +1193,24 @@ cmd_setup_greenbone(){
     fi
   fi
 
-  # 3. wait for the socket --------------------------------------------
+  # 5. wait for the socket --------------------------------------------
+  # Thirty seconds was never enough on a first start: gvmd enumerates the VT
+  # set before it listens, which is minutes on a full feed.
   printf "    %-24s" "gvmd socket"
-  local tries=15 SOCK=""
-  while [ "$tries" -gt 0 ]; do
+  local waited=0 SOCK="" SOCK_WAIT="${SOCK_WAIT:-300}"
+  while [ "$waited" -lt "$SOCK_WAIT" ]; do
     SOCK=$(gvmd_socket) && break
-    tries=$((tries - 1))
-    sleep 2
+    sleep 3; waited=$((waited + 3))
+    [ $((waited % 30)) -eq 0 ] && printf "."
   done
   if [ -z "$SOCK" ]; then
-    echo "${YEL}not present after 30s${RST}"
-    dim "gvmd did not come up. the usual cause is its PostgreSQL database."
+    echo "${YEL}not present after ${SOCK_WAIT}s${RST}"
     dim "the lines above are gvmd's own output. check these in order:"
-    dim "  systemctl is-active postgresql"
-    dim "  sudo runuser -u postgres -- psql -lqt | cut -d\| -f1 | grep gvmd"
+    dim "  systemctl is-active postgresql ospd-openvas"
     dim "  sudo journalctl -u gvmd -n 40 --no-pager"
+    dim "  systemctl show -p NRestarts --value gvmd    # a loop means it is"
+    dim "    being killed before it finishes starting; raise the timeout with"
+    dim "    GVMD_START_TIMEOUT=3600 sudo -E $0 setup-greenbone"
     dim "on Kali the packaged helper does all of this: sudo gvm-setup"
     dim "the standalone engine needs none of it: $0 run"
     return 1
