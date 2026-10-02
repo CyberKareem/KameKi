@@ -20,9 +20,10 @@ set -uo pipefail
 SRC="${1:-$(dirname "$0")/../KameKi.sh}"
 [ -f "$SRC" ] || { echo "no such file: $SRC" >&2; exit 2; }
 H=$(mktemp); trap 'rm -f "$H" /tmp/kameki-pgstate.$$' EXIT
-sed -n '/^gvmd_db_ready(){/,/^}$/p' "$SRC" > "$H"
-grep -q '^gvmd_db_ready(){' "$H" || {
-  echo "gvmd_db_ready is not present in $SRC" >&2; exit 2; }
+sed -n '/^say_err(){/,/^}$/p;/^gvmd_db_ready(){/,/^}$/p' "$SRC" > "$H"
+for fn in say_err gvmd_db_ready; do
+  grep -q "^${fn}(){" "$H" || { echo "$fn is not present in $SRC" >&2; exit 2; }
+done
 
 PASS=0; FAIL=0
 t(){ if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"
@@ -41,8 +42,9 @@ STATE="/tmp/kameki-pgstate.$$"
 pg_stub(){ shift 3; local cmd="$1"; shift
   case "$cmd" in
     psql) case "$*" in
-            *"pg_roles WHERE rolname"*)    grep -q role "$STATE" && echo 1 ;;
-            *"pg_database WHERE datname"*) grep -q db   "$STATE" && echo 1 ;;
+            *"pg_roles WHERE rolname"*)    grep -q role   "$STATE" && echo 1 ;;
+            *"pg_database WHERE datname"*) grep -q db     "$STATE" && echo 1 ;;
+            *"table_name='meta'"*)         grep -q schema "$STATE" && echo 1 ;;
           esac ;;
     createuser) echo role >> "$STATE" ;;
     createdb)   echo db   >> "$STATE" ;;
@@ -56,7 +58,8 @@ t "exits 0"                "$RC" 0
 t "creates the role"       "$(printf '%s' "$OUT" | grep -c 'postgres role _gvm.*created')" 1
 t "creates the database"   "$(printf '%s' "$OUT" | grep -c 'gvmd database.*created')" 1
 t "creates the extensions" "$(printf '%s' "$OUT" | grep -c 'database extensions.*ok')" 1
-t "migrates the schema"    "$(printf '%s' "$OUT" | grep -c 'schema migration.*ok')" 1
+t "an empty schema is left to gvmd" "$(printf '%s' "$OUT" | grep -c 'gvmd creates it on first start')" 1
+t "a fresh database is not migrated" "$(printf '%s' "$OUT" | grep -c 'migration failed')" 0
 
 echo
 echo "running it again changes nothing"
@@ -78,11 +81,11 @@ t "returns non-zero"       "$RC" 1
 t "prints the real error"  "$(printf '%s' "$OUT" | grep -c 'could not connect to server')" 1
 
 echo
-echo "a gvmd migration failure is reported in gvmd's own words"
-: > "$STATE"; echo role >> "$STATE"; echo db >> "$STATE"
+echo "an existing schema is migrated, and a failure is reported in gvmd's words"
+: > "$STATE"; printf 'role\ndb\nschema\n' >> "$STATE"
 runuser(){ shift 3; local cmd="$1"; shift
   case "$cmd" in
-    psql) case "$*" in *rolname*|*datname*) echo 1 ;; esac ;;
+    psql) case "$*" in *rolname*|*datname*|*"table_name='meta'"*) echo 1 ;; esac ;;
     gvmd) echo "gvmd: database is wrong version" >&2; return 1 ;;
   esac; return 0; }
 OUT=$(gvmd_db_ready _gvm 2>&1); RC=$?
@@ -90,12 +93,36 @@ t "returns non-zero"       "$RC" 1
 t "prints the real error"  "$(printf '%s' "$OUT" | grep -c 'database is wrong version')" 1
 
 echo
+echo "a tool that fails silently is named as silent, not shown as a blank line"
+runuser(){ shift 3; local cmd="$1"; shift
+  case "$cmd" in
+    psql) case "$*" in *rolname*|*datname*|*"table_name='meta'"*) echo 1 ;; esac ;;
+    gvmd) return 1 ;;
+  esac; return 0; }
+OUT=$(gvmd_db_ready _gvm 2>&1); RC=$?
+t "returns non-zero"            "$RC" 1
+t "says the command was silent" "$(printf '%s' "$OUT" | grep -c 'printed nothing')" 1
+t "names the likely cause"      "$(printf '%s' "$OUT" | grep -c 'will not migrate while an instance is running')" 1
+
+echo
+echo "a schema that is already current reports so"
+runuser(){ shift 3; local cmd="$1"; shift
+  case "$cmd" in
+    psql) case "$*" in *rolname*|*datname*|*"table_name='meta'"*) echo 1 ;; esac ;;
+  esac; return 0; }
+OUT=$(gvmd_db_ready _gvm 2>&1); RC=$?
+t "exits 0"                "$RC" 0
+t "reports up to date"     "$(printf '%s' "$OUT" | grep -c 'schema.*up to date')" 1
+
+echo
 echo "setup starts postgres, provisions, then starts gvmd, in that order"
 BLK=$(sed -n '/^cmd_setup_greenbone(){/,/wait for the socket/p' "$SRC")
 PGN=$(printf '%s\n' "$BLK" | grep -n 'for svc in postgresql'        | head -1 | cut -d: -f1)
 DBN=$(printf '%s\n' "$BLK" | grep -n 'gvmd_db_ready'               | head -1 | cut -d: -f1)
 GVN=$(printf '%s\n' "$BLK" | grep -n 'systemctl enable --now gvmd' | head -1 | cut -d: -f1)
+LPN=$(printf '%s\n' "$BLK" | grep -n 'gvmd_break_restart_loop' | head -1 | cut -d: -f1)
 t "postgres before provisioning" "$([ -n "$PGN" ] && [ -n "$DBN" ] && [ "$PGN" -lt "$DBN" ] && echo yes)" yes
+t "restart loop broken before the database" "$([ -n "$LPN" ] && [ -n "$DBN" ] && [ "$LPN" -lt "$DBN" ] && echo yes)" yes
 t "provisioning before gvmd"     "$([ -n "$DBN" ] && [ -n "$GVN" ] && [ "$DBN" -lt "$GVN" ] && echo yes)" yes
 t "gvmd failure shows the journal" "$(printf '%s\n' "$BLK" | grep -c 'journalctl -u gvmd')" 1
 

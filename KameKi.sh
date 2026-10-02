@@ -892,6 +892,14 @@ gvm_service_account(){
   return 1
 }
 
+# Report a captured failure. A tool that fails silently is worse than one
+# that fails loudly, because the blank line reads as a display bug rather
+# than a missing message, so silence is named as silence.
+say_err(){   # $1: captured output, $2.. a hint to print when it is empty
+  if [ -n "${1:-}" ]; then printf '%s\n' "$1" | tail -8 | sed 's/^/      /'
+  else shift; dim "the command printed nothing."; [ $# -gt 0 ] && dim "$*"; fi
+}
+
 # gvmd keeps every object it owns in PostgreSQL: the role, the database and
 # two extensions. Without them it exits immediately at startup, which showed
 # up only as "gvmd failed" with no reason, because nothing started postgres
@@ -906,14 +914,14 @@ gvmd_db_ready(){      # $1: the gvm service account, e.g. _gvm
        | grep -q 1; then
     printf "    %-24s" "postgres role $acct"
     if out=$(_pg createuser -DRS "$acct" 2>&1); then echo "${GRN}created${RST}"
-    else echo "${YEL}failed${RST}"; printf '%s\n' "$out" | sed 's/^/      /'; return 1; fi
+    else echo "${YEL}failed${RST}"; say_err "$out" "check: systemctl is-active postgresql"; return 1; fi
   fi
 
   if ! _pg psql -tAc "SELECT 1 FROM pg_database WHERE datname='gvmd'" 2>/dev/null \
        | grep -q 1; then
     printf "    %-24s" "gvmd database"
     if out=$(_pg createdb -O "$acct" gvmd 2>&1); then echo "${GRN}created${RST}"
-    else echo "${YEL}failed${RST}"; printf '%s\n' "$out" | sed 's/^/      /'; return 1; fi
+    else echo "${YEL}failed${RST}"; say_err "$out" "check: systemctl is-active postgresql"; return 1; fi
   fi
 
   # Idempotent, so a partially provisioned box is repaired rather than
@@ -923,17 +931,31 @@ gvmd_db_ready(){      # $1: the gvm service account, e.g. _gvm
           -c 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp";' \
           -c 'CREATE EXTENSION IF NOT EXISTS "pgcrypto";' 2>&1)
   if [ -n "$out" ] && printf '%s' "$out" | grep -qi 'error'; then
-    echo "${YEL}failed${RST}"; printf '%s\n' "$out" | sed 's/^/      /'; return 1
+    echo "${YEL}failed${RST}"; say_err "$out"; return 1
   fi
   _pg psql -q -d gvmd -c 'CREATE ROLE dba WITH SUPERUSER NOINHERIT;' >/dev/null 2>&1 || true
   _pg psql -q -d gvmd -c "GRANT dba TO \"$acct\";"             >/dev/null 2>&1 || true
   echo "${GRN}ok${RST}"
 
-  # The schema itself is created by gvmd, not by psql.
-  printf "    %-24s" "schema migration"
-  if out=$(runuser -u "$acct" -- gvmd --migrate 2>&1); then echo "${GRN}ok${RST}"
+  # The schema is created by gvmd itself the first time it runs, so --migrate
+  # is only meaningful once one exists. On a database created a moment ago
+  # there is nothing to migrate and gvmd exits non-zero, which is not a
+  # fault. Reporting that as "schema migration failed" sent the operator
+  # looking for a database problem that was not there.
+  printf "    %-24s" "schema"
+  if ! _pg psql -d gvmd -tAc \
+        "SELECT 1 FROM information_schema.tables WHERE table_name='meta'" \
+        2>/dev/null | grep -q 1; then
+    echo "${DIM}empty, gvmd creates it on first start${RST}"
+    return 0
+  fi
+  if out=$(runuser -u "$acct" -- gvmd --migrate 2>&1); then
+    echo "${GRN}up to date${RST}"
   else
-    echo "${YEL}failed${RST}"; printf '%s\n' "$out" | tail -8 | sed 's/^/      /'; return 1
+    echo "${YEL}migration failed${RST}"
+    say_err "$out" "gvmd will not migrate while an instance is running. \
+stop it and re-run: systemctl stop gvmd"
+    return 1
   fi
   return 0
 }
@@ -1157,18 +1179,19 @@ cmd_setup_greenbone(){
     fi
   done
 
-  local GVM_ACCT
-  if GVM_ACCT=$(gvm_service_account); then gvmd_db_ready "$GVM_ACCT" || true
-  else dim "no _gvm or gvm account yet, skipping the database step"; fi
-
-  # Order matters from here. A gvmd in a restart loop truncates every feed
-  # import, and an import on an empty feed takes far longer than the packaged
-  # start timeout, so the loop is broken and the timeout raised before any
-  # feed work, and gvmd is started only once the feed is on disk.
+  # Order matters from here, and this block has to come first. A gvmd in a
+  # restart loop holds the database, so gvmd --migrate below cannot run, and
+  # it truncates every feed import. The loop is broken and the start timeout
+  # raised before anything touches the database or the feed, and gvmd is
+  # started again only once the feed is on disk.
   if systemctl list-unit-files gvmd.service >/dev/null 2>&1; then
     gvmd_break_restart_loop
     gvmd_fix_start_timeout || true
   fi
+
+  local GVM_ACCT
+  if GVM_ACCT=$(gvm_service_account); then gvmd_db_ready "$GVM_ACCT" || true
+  else dim "no _gvm or gvm account yet, skipping the database step"; fi
 
   # 3. feeds ----------------------------------------------------------
   if [ "$FEED_SYNC" = "1" ] && [ "$(nvt_count)" -lt 10000 ]; then
