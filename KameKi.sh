@@ -892,6 +892,51 @@ gvm_service_account(){
   return 1
 }
 
+# gvmd keeps every object it owns in PostgreSQL: the role, the database and
+# two extensions. Without them it exits immediately at startup, which showed
+# up only as "gvmd failed" with no reason, because nothing started postgres
+# and nothing printed gvmd's own error.
+gvmd_db_ready(){      # $1: the gvm service account, e.g. _gvm
+  local acct="$1" out=""
+  have psql || { dim "psql not found. install: apt-get install -y postgresql"; return 1; }
+  id -u postgres >/dev/null 2>&1 || { dim "no postgres system account"; return 1; }
+  _pg(){ runuser -u postgres -- "$@"; }
+
+  if ! _pg psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$acct'" 2>/dev/null \
+       | grep -q 1; then
+    printf "    %-24s" "postgres role $acct"
+    if out=$(_pg createuser -DRS "$acct" 2>&1); then echo "${GRN}created${RST}"
+    else echo "${YEL}failed${RST}"; printf '%s\n' "$out" | sed 's/^/      /'; return 1; fi
+  fi
+
+  if ! _pg psql -tAc "SELECT 1 FROM pg_database WHERE datname='gvmd'" 2>/dev/null \
+       | grep -q 1; then
+    printf "    %-24s" "gvmd database"
+    if out=$(_pg createdb -O "$acct" gvmd 2>&1); then echo "${GRN}created${RST}"
+    else echo "${YEL}failed${RST}"; printf '%s\n' "$out" | sed 's/^/      /'; return 1; fi
+  fi
+
+  # Idempotent, so a partially provisioned box is repaired rather than
+  # refused. gvmd needs the dba role and both extensions present.
+  printf "    %-24s" "database extensions"
+  out=$(_pg psql -q -d gvmd \
+          -c 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp";' \
+          -c 'CREATE EXTENSION IF NOT EXISTS "pgcrypto";' 2>&1)
+  if [ -n "$out" ] && printf '%s' "$out" | grep -qi 'error'; then
+    echo "${YEL}failed${RST}"; printf '%s\n' "$out" | sed 's/^/      /'; return 1
+  fi
+  _pg psql -q -d gvmd -c 'CREATE ROLE dba WITH SUPERUSER NOINHERIT;' >/dev/null 2>&1 || true
+  _pg psql -q -d gvmd -c "GRANT dba TO \"$acct\";"             >/dev/null 2>&1 || true
+  echo "${GRN}ok${RST}"
+
+  # The schema itself is created by gvmd, not by psql.
+  printf "    %-24s" "schema migration"
+  if out=$(runuser -u "$acct" -- gvmd --migrate 2>&1); then echo "${GRN}ok${RST}"
+  else
+    echo "${YEL}failed${RST}"; printf '%s\n' "$out" | tail -8 | sed 's/^/      /'; return 1
+  fi
+  return 0
+}
 gvmd_socket(){
   local s
   for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock \
@@ -1014,12 +1059,35 @@ cmd_setup_greenbone(){
     systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 \
       && { redis_unit="$svc"; break; }
   done
-  for svc in $redis_unit ospd-openvas gvmd; do
+  # postgresql first: gvmd will not start without its database, and gvmd is
+  # started last so the database exists by the time it runs.
+  local out=""
+  for svc in postgresql $redis_unit ospd-openvas; do
     systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || continue
     printf "    %-24s" "$svc"
-    if systemctl enable --now "$svc" >/dev/null 2>&1; then echo "${GRN}started${RST}"
-    else echo "${YEL}failed${RST}"; fi
+    if out=$(systemctl enable --now "$svc" 2>&1); then echo "${GRN}started${RST}"
+    else
+      echo "${YEL}failed${RST}"
+      printf '%s\n' "$out" | tail -4 | sed 's/^/      /'
+      systemctl status "$svc" --no-pager -n 6 2>&1 | sed 's/^/      /'
+    fi
   done
+
+  local GVM_ACCT
+  if GVM_ACCT=$(gvm_service_account); then gvmd_db_ready "$GVM_ACCT" || true
+  else dim "no _gvm or gvm account yet, skipping the database step"; fi
+
+  if systemctl list-unit-files gvmd.service >/dev/null 2>&1; then
+    printf "    %-24s" "gvmd"
+    if out=$(systemctl enable --now gvmd 2>&1); then echo "${GRN}started${RST}"
+    else
+      echo "${YEL}failed${RST}"
+      printf '%s\n' "$out" | tail -4 | sed 's/^/      /'
+      # Suppressing this is what made the failure unreadable before.
+      journalctl -u gvmd -n 15 --no-pager 2>/dev/null | sed 's/^/      /' \
+        || systemctl status gvmd --no-pager -n 10 2>&1 | sed 's/^/      /'
+    fi
+  fi
 
   # 3. wait for the socket --------------------------------------------
   printf "    %-24s" "gvmd socket"
@@ -1031,7 +1099,13 @@ cmd_setup_greenbone(){
   done
   if [ -z "$SOCK" ]; then
     echo "${YEL}not present after 30s${RST}"
-    dim "gvmd did not come up. check: systemctl status gvmd"
+    dim "gvmd did not come up. the usual cause is its PostgreSQL database."
+    dim "the lines above are gvmd's own output. check these in order:"
+    dim "  systemctl is-active postgresql"
+    dim "  sudo runuser -u postgres -- psql -lqt | cut -d\| -f1 | grep gvmd"
+    dim "  sudo journalctl -u gvmd -n 40 --no-pager"
+    dim "on Kali the packaged helper does all of this: sudo gvm-setup"
+    dim "the standalone engine needs none of it: $0 run"
     return 1
   fi
   echo "${GRN}$SOCK${RST}"
