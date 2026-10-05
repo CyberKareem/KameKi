@@ -117,12 +117,18 @@ Restricted networks frequently block the package CDNs, Docker Hub, external
 DNS, or simply time out on large transfers. Build a portable bundle where
 internet works, then carry it in.
 
+The outer archive is gzip, deliberately. It used to be zstd, which is smaller
+but is itself one of the packages a filtering proxy will stop you installing —
+and the bundle shipping zstd's own `.deb` inside is no help when you need zstd
+to open the bundle to reach it. `install --bundle` still accepts the older
+`.tar.zst` bundles.
+
 ```bash
 # on a machine with internet, after a full install
 ./kameki.sh bundle
 ```
 
-Produces `kameki-bundle-<date>.tar.zst`, roughly 6 to 8 GB. It contains the
+Produces `kameki-bundle-<date>.tar.gz`, roughly 6 to 8 GB. It contains the
 python wheels, system packages, the nuclei binary and templates, vulscan,
 testssl.sh, WES-NG definitions, the KEV catalogue, and the entire Greenbone
 NVT feed.
@@ -130,7 +136,7 @@ NVT feed.
 On the target machine:
 
 ```bash
-sudo ./kameki.sh install --bundle kameki-bundle-2026-09-23.tar.zst
+sudo ./kameki.sh install --bundle kameki-bundle-2026-09-23.tar.gz
 ```
 
 No network access required. This also pins the feed version for the

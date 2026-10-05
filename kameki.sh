@@ -33,7 +33,7 @@
 #    ./kameki.sh install                   # at the office, with internet
 #    ./kameki.sh bundle                    # build the portable bundle
 #    # carry bundle to client, then on their machine:
-#    ./kameki.sh install --bundle kameki-bundle-*.tar.zst
+#    ./kameki.sh install --bundle kameki-bundle-*.tar.gz
 #    ./kameki.sh preflight                 # confirm credential format
 #    ./kameki.sh run
 #    ./kameki.sh cleanup                   # before you leave site
@@ -114,6 +114,40 @@ err(){  echo "${RED}[-]${RST} $*"; }
 step(){ echo; echo "${CYN}── $* ${RST}"; }
 dim(){  echo "${DIM}    $*${RST}"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
+
+# zstd compresses the Greenbone feed far better than gzip, but it is not always
+# installable on a client box -- on a recent Ubuntu behind a filtering proxy the
+# apt mirror timed out and zstd was one of the packages that did not arrive.
+# The bundle ships zstd's own .deb, which is no help at all when you need zstd
+# to unpack the bundle to reach it. So the OUTER archive is always gzip, which
+# every box already has, and only the inner feed archives use zstd when it is
+# available. GNU tar sniffs the compression on extraction, so both old
+# .tar.zst bundles and new .tar.gz ones unpack with the same command.
+tar_in(){       # $1 archive, rest: passed to tar -> extract, whatever it is
+  local a="$1"; shift
+  case "$a" in
+    *.zst|*.tzst)
+      have zstd || {
+        err "this bundle is zstd-compressed and zstd is not installed"
+        dim "either: sudo apt install zstd -y"
+        dim "or rebuild the bundle with a newer kameki, which uses gzip for the"
+        dim "outer archive precisely so this cannot happen on a client box"
+        return 1
+      } ;;
+  esac
+  tar -xf "$a" "$@"
+}
+# tar_out BASE ARGS... -> writes BASE.tar.zst or BASE.tar.gz, echoes which
+tar_out(){
+  local base="$1"; shift
+  if have zstd && tar --zstd -cf "$base.tar.zst" "$@" 2>/dev/null; then
+    printf '%s' "$base.tar.zst"
+  elif tar -czf "$base.tar.gz" "$@" 2>/dev/null; then
+    printf '%s' "$base.tar.gz"
+  else
+    return 1
+  fi
+}
 # Everything that talks to gvmd goes through kameki_gmp.py, which speaks GMP
 # with python-gvm and parses the replies as XML.
 #
@@ -394,8 +428,7 @@ cmd_install(){
     mkdir -p "$B"
     info "unpacking bundle"
     if [[ "$BUNDLE" == *.zst ]]; then
-      have zstd || { err "zstd required to unpack. apt install zstd"; exit 1; }
-      tar --zstd -xf "$BUNDLE" -C "$B"
+      tar_in "$BUNDLE" -C "$B" || exit 1
     else
       tar -xzf "$BUNDLE" -C "$B"
     fi
@@ -416,16 +449,22 @@ cmd_install(){
     [ -f "$B/definitions.zip" ] && { cp "$B/definitions.zip" "${SUDO_USER:+/home/$SUDO_USER/}definitions.zip" 2>/dev/null || cp "$B/definitions.zip" /root/; info "WES-NG definitions installed"; }
     [ -f "$B/kev.json" ]     && { cp "$B/kev.json" "${SUDO_USER:+/home/$SUDO_USER/}.kameki-kev.json" 2>/dev/null || cp "$B/kev.json" /root/.kameki-kev.json; info "KEV catalogue installed"; }
 
-    if [ -f "$B/openvas-feed.tar.zst" ]; then
+    for FEEDTAR in "$B/openvas-feed.tar.zst" "$B/openvas-feed.tar.gz"; do
+      [ -f "$FEEDTAR" ] && break
+    done
+    if [ -f "$FEEDTAR" ]; then
       info "restoring Greenbone NVT feed, this takes a few minutes"
       mkdir -p /var/lib/openvas
-      tar --zstd -xf "$B/openvas-feed.tar.zst" -C /var/lib/openvas
+      tar_in "$FEEDTAR" -C /var/lib/openvas
       chown -R _gvm:_gvm /var/lib/openvas 2>/dev/null || true
       info "feed restored: $(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l) NVTs"
     fi
-    if [ -f "$B/gvm-data.tar.zst" ]; then
+    for GVMTAR in "$B/gvm-data.tar.zst" "$B/gvm-data.tar.gz"; do
+      [ -f "$GVMTAR" ] && break
+    done
+    if [ -f "$GVMTAR" ]; then
       info "restoring gvmd data"
-      tar --zstd -xf "$B/gvm-data.tar.zst" -C /var/lib
+      tar_in "$GVMTAR" -C /var/lib
       chown -R _gvm:_gvm /var/lib/gvm 2>/dev/null || true
     fi
     rm -rf "$B"
@@ -494,12 +533,40 @@ cmd_install(){
     pip3 install --break-system-packages wesng >/dev/null 2>&1 || warn "wesng install failed"
   su "${SUDO_USER:-root}" -c "pipx install gvm-tools" >/dev/null 2>&1 || \
     pip3 install --break-system-packages gvm-tools >/dev/null 2>&1 || warn "gvm-tools install failed"
-  # pipx hides gvm-tools' dependencies inside its own venv, so python-gvm is
-  # installed again where the system interpreter can import it. kameki_gmp.py
-  # needs the library, not the gvm-cli binary.
-  pip3 install --break-system-packages python-gvm >/dev/null 2>&1 \
-    || pip3 install python-gvm >/dev/null 2>&1 \
-    || warn "python-gvm install failed, the NVT engine will be unavailable"
+  # kameki_gmp.py needs the python-gvm LIBRARY importable, not the gvm-cli
+  # binary. pipx hides gvm-tools' dependencies inside its own venv, which the
+  # system interpreter cannot see -- but gmp_py_interp knows to look in that
+  # venv, so a successful `pipx install gvm-tools` is already enough.
+  #
+  # Every route is tried because on a restricted client network the apt mirror
+  # may not answer: python3-pip was one of the packages that failed to arrive
+  # on a recent Ubuntu behind a filtering proxy, which left no pip to install
+  # python-gvm with, and the old code then declared the NVT engine dead when
+  # the pipx venv had the library all along.
+  install_python_gvm(){
+    gmp_py_interp >/dev/null 2>&1 && return 0
+    pip3 install --break-system-packages python-gvm >/dev/null 2>&1 && return 0
+    python3 -m pip install --break-system-packages python-gvm >/dev/null 2>&1 && return 0
+    # Debian and Ubuntu package the library itself, no pip needed.
+    apt-get install -y -qq python3-gvm >/dev/null 2>&1 && return 0
+    # No pip at all? bootstrap one and retry.
+    python3 -m ensurepip --upgrade >/dev/null 2>&1 \
+      && python3 -m pip install --break-system-packages python-gvm >/dev/null 2>&1 \
+      && return 0
+    python3 -m pip install python-gvm >/dev/null 2>&1 && return 0
+    GMP_PY_INTERP=""     # discovery may have cached a miss
+    gmp_py_interp >/dev/null 2>&1
+  }
+  if install_python_gvm; then
+    dim "python-gvm ok ($(gmp_py_interp))"
+  else
+    warn "python-gvm could not be installed, so the NVT engine is unavailable"
+    dim "the standalone engine is unaffected and the run will still work"
+    dim "to fix it later, any one of these is enough:"
+    dim "  sudo apt install python3-gvm -y"
+    dim "  sudo pip3 install --break-system-packages python-gvm"
+    dim "  pipx install gvm-tools      (kameki finds the library in its venv)"
+  fi
   su "${SUDO_USER:-root}" -c "pipx ensurepath" >/dev/null 2>&1 || true
 
   if ! have nuclei; then
@@ -552,9 +619,9 @@ cmd_install(){
 # =====================================================================
 cmd_bundle(){
   step "Building offline bundle"
-  local OUT="kameki-bundle-${DATE}.tar.zst"
+  local OUT=""   # set once the archive is written, extension depends on zstd
   local B; B=$(mktemp -d)
-  have zstd || { err "zstd required: sudo apt install zstd -y"; exit 1; }
+  have zstd || dim "zstd absent, the bundle will use gzip and be larger"
 
   info "collecting python wheels"
   mkdir -p "$B/wheels"
@@ -584,9 +651,9 @@ cmd_bundle(){
   [ -d /var/lib/openvas/plugins ] && NVTN=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
   if [ "$NVTN" -gt 10000 ]; then
     info "including Greenbone NVT feed ($NVTN scripts), this is the large part"
-    tar --zstd -cf "$B/openvas-feed.tar.zst" -C /var/lib/openvas plugins 2>/dev/null \
+    tar_out "$B/openvas-feed" -C /var/lib/openvas plugins >/dev/null \
       || warn "feed archive failed, may need sudo"
-    [ -d /var/lib/gvm ] && tar --zstd -cf "$B/gvm-data.tar.zst" -C /var/lib gvm 2>/dev/null || true
+    [ -d /var/lib/gvm ] && tar_out "$B/gvm-data" -C /var/lib gvm >/dev/null || true
   else
     warn "NVT feed not present or incomplete ($NVTN scripts), bundle will be standalone only"
     dim "run: sudo greenbone-feed-sync    then rebuild the bundle"
@@ -607,7 +674,11 @@ On the target machine:
 EOF
 
   info "compressing"
-  tar --zstd -cf "$OUT" -C "$B" . && info "bundle: $OUT ($(du -h "$OUT" | cut -f1))"
+  # Always gzip for the outer archive: it is mostly already-compressed
+  # content, so zstd buys little, and it must unpack on a box where zstd may
+  # be missing.
+  OUT="kameki-bundle-${DATE}.tar.gz"
+  tar -czf "$OUT" -C "$B" . && info "bundle: $OUT ($(du -h "$OUT" | cut -f1))"
   rm -rf "$B"
   dim "carry this to site, then: sudo ./kameki.sh install --bundle $OUT"
 }
