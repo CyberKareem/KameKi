@@ -88,7 +88,11 @@ sudo ./kameki.sh install
 
 That installs nmap, NetExec, nuclei and its templates, WES-NG with
 definitions, vulscan, testssl.sh, searchsploit, onesixtyone, the KEV
-catalogue, and the Greenbone scanner backend.
+catalogue, the Greenbone scanner backend, and `python-gvm`.
+
+`kameki_gmp.py` must stay next to `kameki.sh`; the clone puts it there and
+`bundle` carries it along. Without it the NVT engine is unavailable and
+runs fall back to the standalone engine.
 
 Greenbone needs two manual steps because `gvm-setup` prints a password you
 must save:
@@ -431,6 +435,30 @@ security team the dates. Run `cleanup` before you leave.
 
 ---
 
+## Tests
+
+```bash
+./tests/run-all.sh
+```
+
+Seven suites, no Greenbone, no root and no network. Each one slices the real
+functions out of `KameKi.sh` with `sed` and drives them against stubs, so what
+is tested is what ships rather than a copy that drifts.
+
+| Suite | Covers |
+|---|---|
+| `tests/stage3a.sh` | the NVT stage: every way it can abandon, and that the scan credential travels by path, never in `argv`, and is deleted afterwards |
+| `tests/gmp-client.py` | `kameki_gmp.py` against a stubbed gvmd: the one-line XML, the `<owner><name>` trap, overlapping config names, the report blob's real position |
+| `tests/gmp-live.py` | the same client against a fake gvmd on a real Unix socket, using the real `python-gvm`, so a library change is noticed |
+| `tests/protocol-targets.sh` | per-protocol target lists and the Stage 4 wall-clock cap |
+| `tests/greenbone-db.sh` | the PostgreSQL role, database and extensions |
+| `tests/greenbone-feed.sh` | feed selection, the systemd restart loop, and the start timeout |
+
+Each suite was checked by reintroducing the bug it exists to catch and
+confirming it fails. A test that cannot fail is not a test.
+
+---
+
 ## Requirements
 
 Linux. Tested on Ubuntu and Debian.
@@ -438,8 +466,11 @@ Linux. Tested on Ubuntu and Debian.
 Core: `nmap`, `nxc` (NetExec), `nuclei`, `jq`, `awk`, `wes` (WES-NG), and
 either `vulscan` or `vulners` for service CVE mapping.
 
-Optional but recommended: `testssl.sh`, `searchsploit`, `onesixtyone`,
-`gvm-cli` with a synced Greenbone backend.
+Optional but recommended: `testssl.sh`, `searchsploit`, `onesixtyone`.
+
+For the NVT engine: a synced Greenbone backend, plus the `python-gvm`
+library and `kameki_gmp.py` from this repository. The helper has to sit
+beside `kameki.sh` — `./kameki.sh doctor` says so plainly when it does not.
 
 `./kameki.sh install` handles all of it.
 
