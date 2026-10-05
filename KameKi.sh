@@ -75,6 +75,10 @@ NMAP_RATE="${NMAP_RATE:-2000}"
 HOST_TIMEOUT="${HOST_TIMEOUT:-20m}"
 RESUME="${RESUME:-0}"
 POLL="${POLL:-60}"
+# 0 means wait as long as the scan takes. A full NVT run against a large
+# scope legitimately takes many hours, so this is not capped by default,
+# but it is here for a link that drops mid-scan and leaves the task idle.
+NVT_MAX_MIN="${NVT_MAX_MIN:-0}"
 SCAN_CONFIG="${SCAN_CONFIG:-fast}"
 ALIVE_TEST="${ALIVE_TEST:-ICMP, TCP-ACK Service & ARP Ping}"
 DEPTH_WARN="${DEPTH_WARN:-3}"      # authenticated findings per host below which we warn
@@ -110,57 +114,97 @@ err(){  echo "${RED}[-]${RST} $*"; }
 step(){ echo; echo "${CYN}── $* ${RST}"; }
 dim(){  echo "${DIM}    $*${RST}"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
-# gvm-cli aborts with "This tool MUST NOT be run as root user."
-# (gvmtools.helper.do_not_run_as_root). The scan needs root for nmap's raw
-# sockets, so every GMP call has to drop back to the invoking user. The gvmd
-# socket is group-owned by the gvm service group, so that group is set
-# explicitly rather than assuming the user is already a member.
-gvm_group(){
-  local g
-  for g in _gvm gvm; do
-    getent group "$g" >/dev/null 2>&1 && { echo "$g"; return 0; }
+# Everything that talks to gvmd goes through kameki_gmp.py, which speaks GMP
+# with python-gvm and parses the replies as XML.
+#
+# This used to be gvm-cli plus sed and grep, and it was wrong in ways that only
+# showed up at client sites. gvmd puts an entire response on one line, so
+# `grep -c '<config id='` answered 1 however many configs existed and the
+# operator was told the feed had not imported. Worse, the first <name> inside a
+# <config> is <owner><name>admin</name>, so every scan config was read as being
+# called "admin" and the requested one never matched. The report blob sits after
+# </report_format>, not inside <report>, so reading the wrong one wrote an empty
+# CSV. None of that is fixable in a shell pipeline; it is three lines of
+# ElementTree.
+#
+# gvm-cli also refuses to run as root by design, which forced a runuser wrapper
+# that had to guess which account to drop to, and it took the GMP password as a
+# command-line argument -- visible in `ps` to every user on the box, and left
+# behind in shell history. python-gvm needs neither: the socket is opened as
+# whoever invoked the script, and credentials are read from files.
+KAMEKI_GMP=""
+GMP_PY_INTERP=""
+
+# kameki_gmp.py ships beside this script. When the script has been copied
+# somewhere on its own, the usual install locations are tried before giving up.
+gmp_py_find(){
+  [ -n "$KAMEKI_GMP" ] && { printf '%s' "$KAMEKI_GMP"; return 0; }
+  local self d c
+  self="${BASH_SOURCE[0]:-$0}"
+  # Follow a symlink, so /usr/local/bin/kameki -> /opt/kameki/kameki.sh works.
+  while [ -L "$self" ]; do
+    d=$(dirname -- "$self")
+    self=$(readlink -- "$self")
+    case "$self" in /*) ;; *) self="$d/$self" ;; esac
+  done
+  d=$(CDPATH= cd -- "$(dirname -- "$self")" 2>/dev/null && pwd -P) || d=""
+  for c in "$d/kameki_gmp.py" /opt/kameki/kameki_gmp.py \
+           /usr/local/lib/kameki/kameki_gmp.py \
+           /usr/local/share/kameki/kameki_gmp.py; do
+    [ -f "$c" ] && { KAMEKI_GMP="$c"; printf '%s' "$c"; return 0; }
   done
   return 1
 }
-# gvmd returns the whole response on one line, so grep -c counts 1 no matter
-# how many objects there are, and a bare <name> match also picks up
-# <owner><name> and <filters><name>. Both are handled by walking the tags and
-# taking only the name that follows each object id.
-# gvmd answers on one line, so grep -c always says 1 and grep -A2 always
-# lands in <owner><name>admin</name>. The response is split on "<" and the
-# nesting tracked, so only an object's own direct-child <name> is taken.
-gmp_pairs(){    # stdin: a GMP response, $1: element -> "id<TAB>name" a line
-  tr '<' '\n' | awk -v el="$1" '
-    $0 ~ "^" el " id=" {
-      want = 1; nest = 0; id = ""
-      if (match($0, /"[A-Fa-f0-9][A-Fa-f0-9-]*"/))
-        id = substr($0, RSTART + 1, RLENGTH - 2)
-      next
-    }
-    want && /^\// && !/^\/name>/  { if (nest > 0) nest--; next }
-    want && nest > 0              { next }
-    want && /^name>/              { n = $0; sub(/^name>/, "", n)
-                                    print id "\t" n; want = 0; next }
-    want && /^[a-z_]+[ >]/        { nest++; next }
-  '
-}
-gmp_names(){    # stdin: a GMP response, $1: element -> one name a line
-  gmp_pairs "$1" | cut -f2
-}
-gmp_id_for(){   # stdin: a GMP response, $1: element, $2: name -> that id
-  gmp_pairs "$1" | awk -F'\t' -v w="$2" 'tolower($2) == tolower(w) { print $1; exit }'
+
+# python-gvm has to be importable by whichever interpreter runs the helper.
+# `pipx install gvm-tools` puts it in an isolated venv that the system python3
+# cannot see, so that venv is one of the candidates rather than a reason to
+# report the library missing.
+gmp_py_interp(){
+  [ -n "$GMP_PY_INTERP" ] && { printf '%s' "$GMP_PY_INTERP"; return 0; }
+  local p
+  for p in python3 python \
+           "$HOME/.local/share/pipx/venvs/gvm-tools/bin/python" \
+           "${SUDO_USER:+/home/$SUDO_USER/.local/share/pipx/venvs/gvm-tools/bin/python}" \
+           /root/.local/share/pipx/venvs/gvm-tools/bin/python; do
+    [ -n "$p" ] || continue
+    command -v "$p" >/dev/null 2>&1 || [ -x "$p" ] || continue
+    if "$p" -c 'import gvm' >/dev/null 2>&1; then
+      GMP_PY_INTERP="$p"; printf '%s' "$p"; return 0
+    fi
+  done
+  return 1
 }
 
-gvmcli(){
-  [ "$(id -u)" -eq 0 ] || { gvm-cli "$@"; return $?; }
-  local u="${SUDO_USER:-}" g
-  [ -n "$u" ] || {
-    echo "gvm-cli must not run as root, and no SUDO_USER is set to drop to" >&2
+# 0 when a GMP conversation is actually possible.
+gmp_py_ready(){ gmp_py_find >/dev/null 2>&1 && gmp_py_interp >/dev/null 2>&1; }
+
+# gmp_py SOCKET SUBCOMMAND... -> the helper's JSON on stdout, its exit status.
+# Progress goes to stderr, so stdout stays a single parseable object.
+gmp_py(){
+  local sock="$1"; shift
+  local py helper
+  helper=$(gmp_py_find) || {
+    printf '{"ok":false,"error":"kameki_gmp.py was not found next to %s"}\n' \
+      "${BASH_SOURCE[0]:-$0}"
     return 1
   }
-  if g=$(gvm_group); then runuser -u "$u" -g "$g" -- gvm-cli "$@"
-  else                    runuser -u "$u"          -- gvm-cli "$@"; fi
+  py=$(gmp_py_interp) || {
+    printf '%s\n' '{"ok":false,"error":"python-gvm is not installed for any python on this box","hint":"sudo pip3 install --break-system-packages python-gvm"}'
+    return 1
+  }
+  "$py" "$helper" --socket "$sock" \
+    --user-file "${GMP_UF:-gmp-user.txt}" \
+    --pass-file "${GMP_PF:-gmp-pass.txt}" "$@"
 }
+# Point gmp_py at a different credential pair. setup-greenbone has to verify an
+# account it has only just created, before gmp-user.txt exists, so the pair is
+# written to a private directory instead of being passed as arguments.
+GMP_UF=""
+GMP_PF=""
+
+# jgmp JSON FILTER -> that field, or empty. Keeps the jq noise in one place.
+jgmp(){ printf '%s' "$1" | jq -r "$2" 2>/dev/null || true; }
 # net_open HOST PORT -> 0 when a TCP connection succeeds inside five seconds.
 # Client networks routinely block outbound 80 and 873, and finding that out
 # after a long apt run or a 5 GB rsync attempt wastes site time.
@@ -362,7 +406,7 @@ cmd_install(){
     fi
     if [ -d "$B/wheels" ]; then
       info "installing python tools from bundle"
-      pip3 install --break-system-packages --no-index --find-links "$B/wheels" netexec wesng gvm-tools >/dev/null 2>&1 \
+      pip3 install --break-system-packages --no-index --find-links "$B/wheels" netexec wesng gvm-tools python-gvm >/dev/null 2>&1 \
         || warn "python tool install reported errors"
     fi
     [ -f "$B/nuclei" ]        && { install -m755 "$B/nuclei" /usr/local/bin/nuclei; info "nuclei installed"; }
@@ -450,6 +494,12 @@ cmd_install(){
     pip3 install --break-system-packages wesng >/dev/null 2>&1 || warn "wesng install failed"
   su "${SUDO_USER:-root}" -c "pipx install gvm-tools" >/dev/null 2>&1 || \
     pip3 install --break-system-packages gvm-tools >/dev/null 2>&1 || warn "gvm-tools install failed"
+  # pipx hides gvm-tools' dependencies inside its own venv, so python-gvm is
+  # installed again where the system interpreter can import it. kameki_gmp.py
+  # needs the library, not the gvm-cli binary.
+  pip3 install --break-system-packages python-gvm >/dev/null 2>&1 \
+    || pip3 install python-gvm >/dev/null 2>&1 \
+    || warn "python-gvm install failed, the NVT engine will be unavailable"
   su "${SUDO_USER:-root}" -c "pipx ensurepath" >/dev/null 2>&1 || true
 
   if ! have nuclei; then
@@ -508,7 +558,7 @@ cmd_bundle(){
 
   info "collecting python wheels"
   mkdir -p "$B/wheels"
-  pip3 download -q -d "$B/wheels" "$NETEXEC_REPO" wesng gvm-tools >/dev/null 2>&1 \
+  pip3 download -q -d "$B/wheels" "$NETEXEC_REPO" wesng gvm-tools python-gvm >/dev/null 2>&1 \
     || warn "wheel download incomplete"
 
   info "collecting system packages"
@@ -543,6 +593,10 @@ cmd_bundle(){
   fi
 
   cp "$0" "$B/kameki.sh"
+  # The GMP client is not optional any more: without it the bundle installs a
+  # kameKi that can only run the standalone engine.
+  if P=$(gmp_py_find); then cp "$P" "$B/kameki_gmp.py"
+  else warn "kameki_gmp.py not found, the bundle will have no NVT engine"; fi
   cat > "$B/README.txt" <<EOF
 kameki offline bundle, built $STAMP
 NVT scripts included: $NVTN
@@ -572,9 +626,17 @@ cmd_doctor(){
   done
   local WES=""; for c in wes wes.py; do have "$c" && { WES="$c"; break; }; done
   [ -n "$WES" ] && printf "    %-14s ok (%s)\n" "wes" "$WES" || { printf "    %-14s ${RED}missing${RST}\n" "wes"; ISSUES=$((ISSUES+1)); }
-  for t in testssl.sh searchsploit onesixtyone gvm-cli; do
+  for t in testssl.sh searchsploit onesixtyone; do
     have "$t" && printf "    %-14s ok\n" "$t" || printf "    %-14s ${YEL}absent (optional)${RST}\n" "$t"
   done
+  # The NVT engine needs python-gvm and the helper, not gvm-cli.
+  if gmp_py_ready; then
+    printf "    %-14s ok (%s)\n" "python-gvm" "$(gmp_py_interp)"
+  elif gmp_py_find >/dev/null 2>&1; then
+    printf "    %-14s ${YEL}no python has it: sudo pip3 install --break-system-packages python-gvm${RST}\n" "python-gvm"
+  else
+    printf "    %-14s ${YEL}kameki_gmp.py is not beside this script${RST}\n" "kameki_gmp.py"
+  fi
 
   echo
   echo "  data"
@@ -594,10 +656,9 @@ cmd_doctor(){
   done
   if [ -n "$SOCK" ]; then
     printf "    %-14s ok (%s)\n" "gvmd socket" "$SOCK"
-    if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] && have gvm-cli; then
-      local R; R=$(gvmcli --gmp-username "$(head -n1 gmp-user.txt)" --gmp-password "$(head -n1 gmp-pass.txt)" \
-                   socket --socketpath "$SOCK" --xml "<get_version/>" 2>&1)
-      echo "$R" | grep -q 'status="200"' && printf "    %-14s ok\n" "gmp auth" \
+    if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] && gmp_py_ready; then
+      local R; R=$(gmp_py "$SOCK" check 2>&1)
+      printf '%s' "$R" | grep -q '"ok": *true' && printf "    %-14s ok\n" "gmp auth" \
         || { printf "    %-14s ${RED}failed${RST}\n" "gmp auth"; ISSUES=$((ISSUES+1)); }
     else
       printf "    %-14s ${YEL}gmp-user.txt / gmp-pass.txt not set${RST}\n" "gmp auth"
@@ -764,12 +825,14 @@ cmd_cleanup(){
   echo
   echo "  shell history"
   if [ -f "$HOME/.bash_history" ]; then
+    # kameKi no longer puts a GMP password in argv, but an older run may have
+    # left one in this file, so the pattern stays.
     local H; H=$(gcntiE 'kameki|nxc |gvm-cli' "$HOME/.bash_history")
     sed -i '/nxc .*-p /d;/gvm-cli.*--gmp-password/d' "$HOME/.bash_history" 2>/dev/null
     printf "    %-18s %s line(s) scrubbed\n" "bash_history" "$H"
   fi
 
-  if [ -d /run/gvmd ] && have gvm-cli && [ -s gmp-user.txt ]; then
+  if [ -d /run/gvmd ] && [ -s gmp-user.txt ]; then
     echo
     echo "  gvmd objects"
     dim "scan credentials are already deleted at the end of each run"
@@ -1067,20 +1130,15 @@ greenbone_ready_report(){
   # which syncs separately from the NVT plugins. A machine can hold a hundred
   # thousand NVTs and still be unable to create a task because that feed never
   # arrived, so it is checked here rather than discovered mid-scan.
-  local CFGS=0 RFMTS=0 SCANNERS=0 U P CFG_LIST="" FMT_LIST=""
+  local CFGS=0 RFMTS=0 SCANNERS=0 CFG_LIST="" FMT_LIST=""
   local WANT_CFG="${CFG_NAME:-Full and fast}" HAVE_CFG="" HAVE_CSV=""
   if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
-    U=$(head -n1 gmp-user.txt); P=$(head -n1 gmp-pass.txt)
-    CFG_LIST=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
-                 --socketpath "$SOCK" --xml "<get_configs/>" 2>/dev/null \
-               | gmp_names config)
-    FMT_LIST=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
-                 --socketpath "$SOCK" --xml "<get_report_formats/>" 2>/dev/null \
-               | gmp_names report_format)
-    SCANNERS=$(gvmcli --gmp-username "$U" --gmp-password "$P" socket \
-                 --socketpath "$SOCK" --xml "<get_scanners/>" 2>/dev/null \
-               | gmp_names scanner | grep -c . | tr -cd '0-9')
-    U=""; P=""
+    CFG_LIST=$(jgmp "$(gmp_py "$SOCK" list --kind configs 2>/dev/null)" \
+                     '(.items // [])[].name')
+    FMT_LIST=$(jgmp "$(gmp_py "$SOCK" list --kind formats 2>/dev/null)" \
+                     '(.items // [])[].name')
+    SCANNERS=$(jgmp "$(gmp_py "$SOCK" list --kind scanners 2>/dev/null)" \
+                     '(.items // []) | length' | tr -cd '0-9')
     CFGS=$(printf '%s' "$CFG_LIST" | grep -c . | tr -cd '0-9')
     RFMTS=$(printf '%s' "$FMT_LIST" | grep -c . | tr -cd '0-9')
     HAVE_CFG=$(printf '%s\n' "$CFG_LIST" | grep -Fxi "$WANT_CFG")
@@ -1121,27 +1179,40 @@ greenbone_ready_report(){
   fi
 }
 
-GMP_LAST=""        # whatever gvm-cli said on the most recent check
-GMP_BROKEN=0       # 1 when gvm-cli itself failed, as opposed to rejecting us
-# gvm-tools moved its global options behind the connection subcommand at one
-# point, so both orders are tried. A Python traceback means the tool is
-# broken, which is a different problem from gvmd refusing the credentials and
-# must not be reported as a bad password.
+GMP_LAST=""        # whatever the helper said on the most recent check
+GMP_BROKEN=0       # 1 when the client could not run, as opposed to being refused
+# A helper that cannot run is not a bad account. The two are reported
+# separately so a missing library is never presented as a wrong password,
+# which previously sent people off rotating credentials that were fine.
 gmp_auth_ok(){     # user pass socket -> 0 when gvmd actually accepts them
   GMP_BROKEN=0
-  have gvm-cli || { GMP_LAST="gvm-cli is not installed"; GMP_BROKEN=1; return 1; }
-  local o
-  o=$(gvmcli --gmp-username "$1" --gmp-password "$2" \
-             socket --socketpath "$3" --xml "<get_version/>" 2>&1)
-  printf '%s' "$o" | grep -q 'status="200"' && { GMP_LAST="$o"; return 0; }
-  if printf '%s' "$o" | grep -q 'Traceback\|ModuleNotFoundError\|ImportError'; then
-    o=$(gvmcli socket --socketpath "$3" --gmp-username "$1" \
-               --gmp-password "$2" --xml "<get_version/>" 2>&1)
-    printf '%s' "$o" | grep -q 'status="200"' && { GMP_LAST="$o"; return 0; }
-    printf '%s' "$o" | grep -q 'Traceback\|ModuleNotFoundError\|ImportError' \
-      && GMP_BROKEN=1
+  if ! gmp_py_ready; then
+    GMP_BROKEN=1
+    gmp_py_find >/dev/null 2>&1 \
+      && GMP_LAST="python-gvm is not installed for any python on this box" \
+      || GMP_LAST="kameki_gmp.py is not beside this script"
+    return 1
   fi
-  GMP_LAST="$o"
+  # The account being checked may not be on disk yet, so the pair is written to
+  # a private directory and passed by path. It never appears in argv, which is
+  # what the old --gmp-password did, visible in ps to every user on the box.
+  local d o rc
+  d=$(mktemp -d 2>/dev/null) || {
+    GMP_LAST="cannot create a private directory to check the GMP credential"
+    GMP_BROKEN=1; return 1
+  }
+  chmod 700 "$d" 2>/dev/null || true
+  ( umask 077; printf '%s' "$1" > "$d/u"; printf '%s' "$2" > "$d/p" )
+  GMP_UF="$d/u"; GMP_PF="$d/p"
+  o=$(gmp_py "$3" check 2>&1); rc=$?
+  GMP_UF=""; GMP_PF=""
+  rm -rf "$d"
+  # Report gvmd's own sentence where there is one; the raw JSON otherwise.
+  local e; e=$(jgmp "$o" '.error // empty')
+  [ -n "$e" ] && GMP_LAST="$e" || GMP_LAST="$o"
+  [ "$rc" -eq 0 ] && return 0
+  # Exit 3 is the helper's "library missing"; anything else is gvmd's answer.
+  [ "$rc" -eq 3 ] && GMP_BROKEN=1
   return 1
 }
 
@@ -1309,21 +1380,21 @@ cmd_setup_greenbone(){
     gmp_auth_ok "$GU" "$GP" "$SOCK" && made=1
   fi
 
-  # A crashing gvm-cli is not a bad account. If the credentials could not be
-  # checked because the checking tool is broken, keep them, say so plainly,
-  # and point at the thing that actually needs fixing.
+  # A GMP client that cannot run is not a bad account. If the credentials
+  # could not be checked because the checker is broken, keep them, say so
+  # plainly, and point at the thing that actually needs fixing.
   if [ "$made" -eq 0 ] && [ "$GMP_BROKEN" -eq 1 ] && [ -n "$harvest" ]; then
     GP="$harvest"
     echo "${YEL}created, unverified${RST}"
     printf '%s\n' "$tried" | sed '/^$/d'
     echo
-    warn "the account was created, gvm-cli could not be used to check it"
-    dim "gvm-cli failed rather than refusing the credentials, so the fault is"
-    dim "in the tool or how it was invoked, not in gvmd or the password."
-    dim "check it by hand as your own user, never as root:"
-    dim "  gvm-cli --gmp-username $GU --gmp-password <pass> \\"
-    dim "          socket --socketpath $SOCK --xml \"<get_version/>\""
-    dim "the standalone engine does not use gvm-cli and is unaffected"
+    warn "the account was created, the GMP client could not be used to check it"
+    dim "$GMP_LAST"
+    dim "the client failed rather than being refused, so the fault is in the"
+    dim "client or its install, not in gvmd or the password. check by hand:"
+    dim "  sudo pip3 install --break-system-packages python-gvm"
+    dim "  $0 doctor"
+    dim "the standalone engine needs no GMP client and is unaffected"
     made=1
   fi
 
@@ -1351,8 +1422,9 @@ cmd_setup_greenbone(){
   if gmp_auth_ok "$(head -n1 gmp-user.txt)" "$(head -n1 gmp-pass.txt)" "$SOCK"; then
     echo "${GRN}ok${RST}"
   elif [ "$GMP_BROKEN" -eq 1 ]; then
-    echo "${YEL}not checked, gvm-cli is broken${RST}"
-    dim "credentials kept. repair gvm-tools, then: $0 doctor"
+    echo "${YEL}not checked, the GMP client could not run${RST}"
+    dim "$GMP_LAST"
+    dim "credentials kept. install python-gvm, then: $0 doctor"
   else
     echo "${RED}failed${RST}"
     dim "gvmd refused these credentials:"
@@ -1439,7 +1511,7 @@ NVT_READY=0; SOCK=""; NVT_FILES=0
 # feed, sending people to re-run a 5 GB greenbone-feed-sync they did not need.
 [ -d /var/lib/openvas/plugins ] \
   && NVT_FILES=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
-if command -v gvm-cli >/dev/null 2>&1; then
+if gmp_py_ready; then
   for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock \
            /var/run/gvm/gvmd.sock "$HOME/.gvm/gvmd/gvmd.sock"; do
     [ -S "$s" ] && { SOCK="$s"; break; }
@@ -1453,7 +1525,12 @@ if [ "$NVT_READY" -eq 1 ]; then
   printf "    %-14s ok  (%s NVTs, %s)\n" "greenbone" "$NVT_FILES" "$SOCK"
 else
   printf "    %-14s %s\n" "greenbone" "unavailable"
-  [ -z "$SOCK" ] && dim "no gvmd socket, or gvm-cli missing. run: $0 --setup"
+  if ! gmp_py_ready; then
+    gmp_py_find >/dev/null 2>&1 \
+      && dim "python-gvm missing -> sudo pip3 install --break-system-packages python-gvm" \
+      || dim "kameki_gmp.py is not beside this script, re-clone or re-install"
+  fi
+  [ -z "$SOCK" ] && dim "no gvmd socket. run: $0 --setup"
   [ -n "$SOCK" ] && [ "$NVT_FILES" -lt 10000 ] && dim "feed incomplete ($NVT_FILES NVTs). run: sudo greenbone-feed-sync"
   [ -n "$SOCK" ] && { [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] || dim "gmp-user.txt and gmp-pass.txt not found"; }
 fi
@@ -1640,139 +1717,80 @@ NVT_CSV="$RAW/nvt/results.csv"
 if [ "$RUN_NVT" -eq 1 ]; then
 step "Stage 3A  Greenbone NVT scan  ($NVT_FILES scripts, $CFG_NAME)"
 
-GMPU=$(head -n1 gmp-user.txt | tr -d '\r\n'); GMPP=$(head -n1 gmp-pass.txt | tr -d '\r\n')
-xesc(){ printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
-gmp(){ gvmcli --gmp-username "$GMPU" --gmp-password "$GMPP" socket --socketpath "$SOCK" --xml "$1" 2>&1; }
-xid(){  sed -n 's/.*id="\([a-f0-9][a-f0-9-]*\)".*/\1/p' | head -1; }
-xtag(){ sed -n "s|.*<$1>\([^<]*\)</$1>.*|\1|p" | head -1; }
-
-V=$(gmp "<get_version/>")
-if ! echo "$V" | grep -q 'status="200"'; then
-  err "GMP authentication failed"; echo "$V" | head -3; RUN_NVT=0
+# One process, one authenticated connection, for the whole scan: create the
+# credential and target, create and start the task, poll it, export the CSV and
+# XML, and delete the credential again. That last step runs even when the scan
+# fails, so an aborted run does not leave the client's domain password sitting
+# in gvmd.
+#
+# The scan credential reaches the helper through files in a private directory,
+# never through argv, so it is not visible in `ps` to anyone else on the box.
+NVT_SECRETS=$(mktemp -d 2>/dev/null) || NVT_SECRETS=""
+if [ -z "$NVT_SECRETS" ]; then
+  err "cannot create a private directory for the scan credential"
+  RUN_NVT=0
 else
-info "GMP $(echo "$V" | xtag version) authenticated"
-
-R=$(gmp "<create_credential><name>kameki-smb-$RUN_NAME</name><type>up</type>
-  <allow_insecure>1</allow_insecure><login>$(xesc "$NVT_U")</login>
-  <password>$(xesc "$NVT_P")</password></create_credential>")
-SMB_CRED=$(echo "$R" | xid)
-[ -n "$SMB_CRED" ] || { err "SMB credential creation failed"; echo "$R" | head -3; }
-
-SSH_CRED=""
-if [ "$SSH_ON" -eq 1 ]; then
-  R=$(gmp "<create_credential><name>kameki-ssh-$RUN_NAME</name><type>up</type>
-    <allow_insecure>1</allow_insecure><login>$(xesc "$SU")</login>
-    <password>$(xesc "$SP")</password></create_credential>")
-  SSH_CRED=$(echo "$R" | xid)
+chmod 700 "$NVT_SECRETS" 2>/dev/null || true
+( umask 077
+  printf '%s' "$NVT_U" > "$NVT_SECRETS/smb-login"
+  printf '%s' "$NVT_P" > "$NVT_SECRETS/smb-pass" )
+NVT_SSH_ARGS=""
+if [ "$SSH_ON" -eq 1 ] && [ -n "$SU" ]; then
+  ( umask 077
+    printf '%s' "$SU" > "$NVT_SECRETS/ssh-login"
+    printf '%s' "$SP" > "$NVT_SECRETS/ssh-pass" )
+  NVT_SSH_ARGS="--ssh-login-file $NVT_SECRETS/ssh-login --ssh-pass-file $NVT_SECRETS/ssh-pass"
 fi
 
-CREDXML="<smb_credential id=\"$SMB_CRED\"/>"
-[ -n "$SSH_CRED" ] && CREDXML="$CREDXML<ssh_credential id=\"$SSH_CRED\" port=\"22\"/>"
-HOSTS=$(grep -ve '^\s*$' targets.txt | tr '\n' ',' | sed 's/,$//')
-R=$(gmp "<create_target><name>kameki-target-$RUN_NAME</name><hosts>$HOSTS</hosts>
-  <alive_tests>$ALIVE_TEST</alive_tests>$CREDXML</create_target>")
-TARGET=$(echo "$R" | xid)
-[ -n "$TARGET" ] || { err "target creation failed"; echo "$R" | head -3; }
+# shellcheck disable=SC2086  # NVT_SSH_ARGS is a deliberate pair of flags
+SCAN_OUT=$(gmp_py "$SOCK" scan \
+  --run-name     "$RUN_NAME" \
+  --hosts-file   targets.txt \
+  --config-name  "$CFG_NAME" \
+  --config-id    "$CFG_ID" \
+  --alive-test   "$ALIVE_TEST" \
+  --smb-login-file "$NVT_SECRETS/smb-login" \
+  --smb-pass-file  "$NVT_SECRETS/smb-pass" \
+  $NVT_SSH_ARGS \
+  --poll         "$POLL" \
+  --max-minutes  "$NVT_MAX_MIN" \
+  --csv-out      "$NVT_CSV" \
+  --xml-out      "$RAW/nvt/report-full.xml")
+SCAN_RC=$?
+rm -rf "$NVT_SECRETS"
+NVT_SECRETS=""
 
-SCANNER=$(gmp "<get_scanners/>" | gmp_pairs scanner \
-          | awk -F'\t' 'tolower($2) ~ /^openvas/ { print $1; exit }')
-[ -n "$SCANNER" ] || SCANNER="08b69003-5fc2-4037-a479-93b440211c73"
+# Whatever happened, keep whichever ids the helper got as far as issuing. A
+# scan that died after create_task still leaves a task in gvmd, and the id is
+# what you need to find it.
+TASK=$(jgmp "$SCAN_OUT" '.task // ""')
+TARGET=$(jgmp "$SCAN_OUT" '.target // ""')
+REPORT=$(jgmp "$SCAN_OUT" '.report // ""')
 
-# Report format UUIDs are stock on most installs but not guaranteed, and an
-# export against a wrong id fails after the scan has already run. Resolve by
-# name, keep the stock UUID when gvmd does not name one.
-FMT_AVAIL=$(gmp "<get_report_formats/>")
-FMT_BYNAME=$(printf '%s' "$FMT_AVAIL" | gmp_id_for report_format "CSV Results")
-[ -n "$FMT_BYNAME" ] && FMT_CSV="$FMT_BYNAME"
-FMT_BYNAME=$(printf '%s' "$FMT_AVAIL" | gmp_id_for report_format "XML")
-[ -n "$FMT_BYNAME" ] && FMT_XML="$FMT_BYNAME"
-
-# The hardcoded UUIDs are the stock Greenbone ones, but a machine only has
-# the configs its GVMD data feed delivered, and a partial feed leaves a
-# different set. Resolve by name against what gvmd actually holds, and keep
-# the UUID only as a fallback, so a missing config is named rather than
-# surfacing later as an unexplained create_task failure.
-CFG_AVAIL=$(gmp "<get_configs/>")
-CFG_BYNAME=$(printf '%s' "$CFG_AVAIL" | gmp_id_for config "$CFG_NAME")
-if [ -n "$CFG_BYNAME" ]; then
-  [ "$CFG_BYNAME" != "$CFG_ID" ] && dim "scan config \"$CFG_NAME\" resolved to $CFG_BYNAME"
-  CFG_ID="$CFG_BYNAME"
-elif ! printf '%s' "$CFG_AVAIL" | grep -q "config id=\"$CFG_ID\""; then
-  err "scan config \"$CFG_NAME\" is not present on this gvmd"
-  dim "configs it does have:"
-  printf '%s' "$CFG_AVAIL" | gmp_names config | sort -u | sed 's|^|      |' | head -12
-  dim "sync the GVMD data feed, then re-run:"
-  dim "  sudo greenbone-feed-sync --type gvmd-data && sudo systemctl restart gvmd"
-  RUN_NVT=0
-fi
-if [ "$RUN_NVT" -eq 1 ]; then
-R=$(gmp "<create_task><name>$RUN_NAME</name><config id=\"$CFG_ID\"/>
-  <target id=\"$TARGET\"/><scanner id=\"$SCANNER\"/>
-  <preferences>
-    <preference><scanner_name>max_checks</scanner_name><value>5</value></preference>
-    <preference><scanner_name>max_hosts</scanner_name><value>20</value></preference>
-  </preferences></create_task>")
-else
-R=""
-fi
-TASK=$(echo "$R" | xid)
-if [ "$RUN_NVT" -eq 1 ] && [ -z "$TASK" ]; then
-  err "task creation failed, the NVT scan cannot run"
-  dim "gvmd said:"
-  printf '%s\n' "$R" | head -4 | sed 's/^/      /'
-  dim ""
-  dim "the usual cause is a missing GVMD data feed. Scan configs, report"
-  dim "formats and port lists come from data-objects/gvmd, which syncs"
-  dim "separately from the NVT plugins. Check with:"
-  dim "  $0 doctor        and:  sudo greenbone-feed-sync --type gvmd-data"
-  RUN_NVT=0
-fi
-if [ "$RUN_NVT" -eq 1 ]; then
-R=$(gmp "<start_task task_id=\"$TASK\"/>")
-REPORT=$(echo "$R" | xtag report_id)
-if [ -z "$REPORT" ]; then
-  err "the task was created but would not start"
-  printf '%s\n' "$R" | head -4 | sed 's/^/      /'
-  RUN_NVT=0
-fi
-fi
-echo "task=$TASK target=$TARGET report=$REPORT" > "$RAW/nvt/ids.txt"
-if [ "$RUN_NVT" -eq 1 ]; then
-  info "task $TASK   report $REPORT"
-  dim "polling every ${POLL}s"
-fi
-
-LAST=-1
-while [ "$RUN_NVT" -eq 1 ]; do
-  S=$(gmp "<get_tasks task_id=\"$TASK\"/>")
-  ST=$(echo "$S" | xtag status); PR=$(echo "$S" | xtag progress); [ -z "$PR" ] && PR=0
-  case "$ST" in
-    Done) echo; info "NVT scan complete"; break ;;
-    Stopped|Interrupted) echo; warn "NVT scan $ST at ${PR}%, exporting partial"; break ;;
-    "") echo; err "gvmd returned no status for this task"
-        dim "the task may have been removed, or gvmd restarted mid-scan"
-        dim "check: journalctl -u gvmd --since '1 hour ago'"
-        break ;;
-  esac
-  if [ "$PR" != "$LAST" ]; then
-    printf "\r    %-12s %3s%%   %d min elapsed    " "$ST" "$PR" "$(( ($(date +%s)-T0)/60 ))"
-    LAST="$PR"
+if [ "$SCAN_RC" -ne 0 ]; then
+  err "the Greenbone NVT scan did not run"
+  GMSG=$(jgmp "$SCAN_OUT" '.error // empty')
+  if [ -n "$GMSG" ]; then dim "$GMSG"
+  else printf '%s\n' "$SCAN_OUT" | head -3 | sed 's|^|      |'; fi
+  GAVAIL=$(jgmp "$SCAN_OUT" '(.available // [])[]')
+  if [ -n "$GAVAIL" ]; then
+    dim "configs this gvmd does have:"
+    printf '%s\n' "$GAVAIL" | head -12 | sed 's|^|        |'
   fi
-  sleep "$POLL"
-done
-
-if [ -n "$REPORT" ]; then
-  gmp "<get_reports report_id=\"$REPORT\" format_id=\"$FMT_CSV\" ignore_pagination=\"1\"
-        details=\"1\" filter=\"levels=hmlg rows=-1\"/>" > "$RAW/nvt/csv.xml" 2>&1
-  sed -n 's|.*</report_format>\(.*\)</report>.*|\1|p' "$RAW/nvt/csv.xml" | base64 -d > "$NVT_CSV" 2>/dev/null
-  [ -s "$NVT_CSV" ] || grep -oE '[A-Za-z0-9+/=]{200,}' "$RAW/nvt/csv.xml" | head -1 | base64 -d > "$NVT_CSV" 2>/dev/null
-  gmp "<get_reports report_id=\"$REPORT\" format_id=\"$FMT_XML\" ignore_pagination=\"1\"
-        details=\"1\" filter=\"levels=hmlg rows=-1\"/>" > "$RAW/nvt/report-full.xml" 2>&1
+  GHINT=$(jgmp "$SCAN_OUT" '.hint // empty')
+  [ -n "$GHINT" ] && printf '%s\n' "$GHINT" | fold -s -w 64 | sed 's|^|      |'
+  RUN_NVT=0
+else
+  NVT_STATUS=$(jgmp "$SCAN_OUT" '.status // ""')
+  case "$NVT_STATUS" in
+    Done) info "NVT scan complete" ;;
+    "")   warn "NVT scan finished with no status reported" ;;
+    *)    warn "NVT scan $NVT_STATUS, exporting what it produced" ;;
+  esac
 fi
-
-[ -n "$SMB_CRED" ] && gmp "<delete_credential credential_id=\"$SMB_CRED\" ultimate=\"1\"/>" >/dev/null 2>&1
-[ -n "$SSH_CRED" ] && gmp "<delete_credential credential_id=\"$SSH_CRED\" ultimate=\"1\"/>" >/dev/null 2>&1
-dim "scan credentials removed from gvmd"
+# Written whatever happened. A scan that died after creating the task still
+# leaves the ids behind, which is what you need to find it in gvmd afterwards.
+echo "task=$TASK target=$TARGET report=$REPORT" > "$RAW/nvt/ids.txt"
 
 if [ -s "$NVT_CSV" ]; then
   NVT_ROWS=$(( $(wc -l < "$NVT_CSV") - 1 ))
