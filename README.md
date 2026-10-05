@@ -441,13 +441,73 @@ security team the dates. Run `cleanup` before you leave.
 
 ---
 
+## Windows patch level
+
+Two methods run, and they are reported separately because their error profiles
+are opposite.
+
+**MSRC build comparison** is the authoritative one. Microsoft publishes, per
+CVE, the exact OS build that fixes it. Windows 10, 11 and Server 2016 and later
+ship cumulative updates, so a later cumulative contains every earlier one —
+which makes one comparison the entire supersedence check:
+
+```
+installed revision  <  the revision Microsoft says fixes this CVE
+```
+
+No version ranges, no CPE matching, no inference. If the host is at or above
+the fixed build it is not affected, and the method cannot say otherwise. The
+host's build, revision and installation type are read from one registry key
+over SMB; nothing is copied to the target and no agent is installed.
+
+The data is one JSON document per month from `api.msrc.microsoft.com`, roughly
+20 MB, over plain HTTPS with no authentication. `kameki.sh update` fetches the
+last six months (`MSRC_MONTHS`) and compiles them into a ~3 MB table. That is
+the point of it: the Greenbone feed is several GB over rsync/873, which a
+filtering client network kills — and its Windows content is a year stale
+regardless. The newest Windows cumulative-update check in the Greenbone
+community feed is dated 2025-10-15, and Server 2022 has two checks in total.
+
+What it deliberately will not do:
+
+- It will not assess a build it has no Microsoft data for. Windows 8.1 and
+  Server 2012 R2 report 6.x builds and were never serviced by cumulative
+  updates, so they are reported as not assessed, with the reason.
+- It will not key on the base build alone. Build 26100 is shared by Windows 11
+  24H2 and Server 2025, and in September 2026 they required revision 9445 and
+  33438. Taking the higher one would report every 24H2 host as missing a patch
+  that does not exist for it. Client and server are separate lines, decided by
+  the host's own `InstallationType`.
+- It will not present a count as complete when it cannot be. A host below the
+  oldest month held is missing earlier updates too, so its CVE count is
+  reported as a floor.
+- It will not guess at a host it could not read. That is a coverage gap and is
+  listed as one, with the transport that was tried.
+
+**WES-NG** runs alongside it, mapping the hotfix list from `systeminfo` against
+the MSRC bulletin feed. It reaches past the OS — Office, .NET — but its own
+documentation is explicit: *"the data provided by Microsoft's MSRC feed is
+frequently incomplete and false positives are reported by wes.py"*. Its output
+is labelled as inference, to be confirmed, rather than presented beside
+authoritative findings as though equivalent.
+
+Every report carries a **data provenance** table: per source, the URL, the
+document version and release date, when it was fetched, its size and its
+SHA-256. PCI DSS v4.0.1 requirement 11.3.1 requires the scan tool be *"kept up
+to date with the latest vulnerability information"* and testing procedure
+11.3.1.c has the assessor examine that it is. A feed that failed to sync does
+not satisfy that clause, and neither does a carried-in bundle of unknown age,
+so the evidence is printed rather than asserted.
+
+---
+
 ## Tests
 
 ```bash
 ./tests/run-all.sh
 ```
 
-Seven suites, no Greenbone, no root and no network. Each one slices the real
+Eleven suites, no Greenbone, no root and no network. Each one slices the real
 functions out of `kameki.sh` with `sed` and drives them against stubs, so what
 is tested is what ships rather than a copy that drifts.
 
@@ -456,6 +516,8 @@ is tested is what ships rather than a copy that drifts.
 | `tests/stage3a.sh` | the NVT stage: every way it can abandon, and that the scan credential travels by path, never in `argv`, and is deleted afterwards |
 | `tests/gmp-client.py` | `kameki_gmp.py` against a stubbed gvmd: the one-line XML, the `<owner><name>` trap, overlapping config names, the report blob's real position |
 | `tests/gmp-live.py` | the same client against a fake gvmd on a real Unix socket, using the real `python-gvm`, so a library change is noticed |
+| `tests/msrc.py` | the Windows patch engine, against the real shapes from Microsoft's own 2026-Jul..Oct documents: the 26100 client/server collision, chronological month ordering, the empty current month, floor counts, and what it refuses to assess |
+| `tests/win-facts.sh` | the registry read, against a stubbed NetExec: hexadecimal `REG_DWORD` revisions, the transport ladder when EDR blocks command execution, and a partial read that must be refused rather than completed with a placeholder |
 | `tests/protocol-targets.sh` | per-protocol target lists and the Stage 4 wall-clock cap |
 | `tests/greenbone-db.sh` | the PostgreSQL role, database and extensions |
 | `tests/greenbone-feed.sh` | feed selection, the systemd restart loop, and the start timeout |

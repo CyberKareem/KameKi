@@ -46,6 +46,8 @@ run "bash syntax"               bash -n "$SRC"
 run "Stage 3A"                  bash tests/stage3a.sh
 run "bundle archive"            bash tests/bundle-archive.sh
 run "GMP helper fetch"          bash tests/gmp-helper-fetch.sh
+run "win_facts registry read"   bash tests/win-facts.sh
+run "MSRC patch engine"         python3 tests/msrc.py
 run "protocol targets"          bash tests/protocol-targets.sh
 run "greenbone database"        bash tests/greenbone-db.sh
 run "greenbone feed"            bash tests/greenbone-feed.sh

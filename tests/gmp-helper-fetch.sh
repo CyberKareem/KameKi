@@ -40,12 +40,30 @@ check(){ if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"
 # "no curl on the box" case fell through to the real curl and actually fetched
 # from github -- a unit test making a network call, and passing for the wrong
 # reason. Only these tools are visible, and curl/wget only when stubbed.
+# Resolve to a real filesystem path. `command -v` returns the bare word for
+# an alias or a shell builtin, and `ln -s grep grep` then makes a broken
+# self-referential symlink -- which silently removes grep from the sealed PATH
+# and makes every case fail for a reason that has nothing to do with the code
+# under test. type -P skips aliases, functions and builtins.
+bin_path(){
+  local p
+  p=$(type -P "$1" 2>/dev/null)
+  [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  for p in /usr/bin/"$1" /bin/"$1" /usr/local/bin/"$1"; do
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+
 seal_bin(){ # $1 bin dir
   local b="$1" t p
   mkdir -p "$b"
   for t in bash sh head grep rm sed cat ln chmod mktemp dirname readlink \
            python3 printf env tr; do
-    p=$(command -v "$t" 2>/dev/null) && ln -sf "$p" "$b/$t" 2>/dev/null
+    p=$(bin_path "$t") && ln -sf "$p" "$b/$t"
+  done
+  for t in head grep rm; do
+    [ -x "$b/$t" ] || { echo "cannot seal a PATH without $t" >&2; exit 2; }
   done
 }
 

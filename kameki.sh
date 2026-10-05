@@ -84,6 +84,22 @@ ALIVE_TEST="${ALIVE_TEST:-ICMP, TCP-ACK Service & ARP Ping}"
 DEPTH_WARN="${DEPTH_WARN:-3}"      # authenticated findings per host below which we warn
 KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
+# Microsoft's own security data, as the Windows patch engine. One ~20 MB
+# JSON per month over plain HTTPS, which is the point: the Greenbone feed is
+# several GB over rsync/873 that a filtering client network kills, and its
+# Windows content is a year stale regardless -- the newest Windows
+# cumulative-update check in the community feed is dated 2025-10-15, and
+# Server 2022 has two checks in total.
+#
+# Each document states, per CVE, the exact OS build that fixes it. Windows
+# 10, 11 and Server 2016+ ship cumulative updates, so comparing the build a
+# host reports against the build Microsoft requires IS the supersedence
+# check: no version ranges, no CPE matching, nothing copied to the target.
+MSRC_API="${MSRC_API:-https://api.msrc.microsoft.com/cvrf/v3.0/cvrf}"
+MSRC_MONTHS="${MSRC_MONTHS:-6}"
+MSRC_DIR="${MSRC_DIR:-$HOME/.kameki-msrc}"
+MSRC_DB="${MSRC_DB:-$HOME/.kameki-msrc/patch-table.json}"
+
 # ---- optional LLM annotation layer ----------------------------------
 #  Any OpenAI compatible /v1/chat/completions endpoint: Ollama, vLLM,
 #  LM Studio, llama.cpp server. Local by default and gated otherwise,
@@ -243,6 +259,188 @@ fetch_gmp_helper(){
   KAMEKI_GMP=""          # clear the cached miss so discovery runs again
   gmp_py_find >/dev/null 2>&1
 }
+
+# kameki_msrc.py sits beside this script, like the GMP client.
+KAMEKI_MSRC=""
+msrc_py_find(){
+  [ -n "$KAMEKI_MSRC" ] && { printf '%s' "$KAMEKI_MSRC"; return 0; }
+  local self d c
+  self="${BASH_SOURCE[0]:-$0}"
+  while [ -L "$self" ]; do
+    d=$(dirname -- "$self"); self=$(readlink -- "$self")
+    case "$self" in /*) ;; *) self="$d/$self" ;; esac
+  done
+  d=$(CDPATH= cd -- "$(dirname -- "$self")" 2>/dev/null && pwd -P) || d=""
+  for c in "$d/kameki_msrc.py" /opt/kameki/kameki_msrc.py \
+           /usr/local/lib/kameki/kameki_msrc.py; do
+    [ -f "$c" ] && { KAMEKI_MSRC="$c"; printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+# Unlike the GMP client this needs no third-party library, only python3.
+msrc_ready(){ have python3 && msrc_py_find >/dev/null 2>&1 && [ -s "$MSRC_DB" ]; }
+msrc_py(){ python3 "$(msrc_py_find)" "$@"; }
+
+# Same story as the GMP client: a one-file wget install leaves this behind,
+# and then the whole Windows assessment silently falls back to WES-NG alone
+# with nothing to say the authoritative check never ran.
+fetch_msrc_helper(){
+  msrc_py_find >/dev/null 2>&1 && return 0
+  local self d
+  self="${BASH_SOURCE[0]:-$0}"
+  d=$(CDPATH= cd -- "$(dirname -- "$self")" 2>/dev/null && pwd -P) || return 1
+  [ -w "$d" ] || return 1
+  if   have curl; then curl -fsSL "$KAMEKI_RAW/kameki_msrc.py" -o "$d/kameki_msrc.py" 2>/dev/null
+  elif have wget; then wget -qO   "$d/kameki_msrc.py" "$KAMEKI_RAW/kameki_msrc.py" 2>/dev/null
+  else return 1
+  fi
+  if ! { [ -s "$d/kameki_msrc.py" ] \
+         && head -1 "$d/kameki_msrc.py" | grep -q 'python' \
+         && grep -q 'def main' "$d/kameki_msrc.py"; }; then
+    rm -f "$d/kameki_msrc.py"
+    return 1
+  fi
+  KAMEKI_MSRC=""
+  msrc_py_find >/dev/null 2>&1
+}
+
+# msrc_months N -> the last N months as YYYY-Mon, newest first.
+# The current month is published before its Patch Tuesday and is routinely
+# almost empty -- 2026-Oct was 9,441 bytes against September's 20,303,321. It
+# is still fetched, because kameki_msrc records it as an empty month rather
+# than letting it narrow the data window unnoticed.
+msrc_months(){
+  python3 - "$1" <<'PYMONTHS'
+import sys, datetime
+n = int(sys.argv[1])
+d = datetime.date.today().replace(day=1)
+for _ in range(n):
+    print("%d-%s" % (d.year, d.strftime("%b")))
+    d = (d - datetime.timedelta(days=1)).replace(day=1)
+PYMONTHS
+}
+
+# Fetch the monthly documents and compile the build table.
+msrc_sync(){
+  have python3 || { say_err "python3 is needed for the Windows patch engine"; return 1; }
+  msrc_py_find >/dev/null 2>&1 || fetch_msrc_helper || {
+    say_err "kameki_msrc.py is not beside this script and could not be fetched"
+    return 1
+  }
+  mkdir -p "$MSRC_DIR/cvrf" || return 1
+  local m got=0 miss="" url out
+  for m in $(msrc_months "$MSRC_MONTHS"); do
+    out="$MSRC_DIR/cvrf/$m.json"
+    url="$MSRC_API/$m"
+    # Short HTTPS requests with no authentication. --max-time is generous
+    # because one month is up to 20 MB and a client link is slow.
+    if curl -fsSL --retry 3 --retry-delay 2 --max-time 300 \
+            -H 'Accept: application/json' "$url" -o "$out.part" 2>/dev/null \
+       && [ -s "$out.part" ] \
+       && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$out.part" 2>/dev/null
+    then mv -f "$out.part" "$out"; got=$((got+1))
+    else
+      rm -f "$out.part"; miss="$miss $m"
+      # A copy from an earlier run is still usable.
+      [ -s "$out" ] && got=$((got+1))
+    fi
+  done
+  [ -n "$miss" ] && dim "not fetched:$miss (copies already on disk are still used)"
+  [ "$got" -gt 0 ] || { say_err "no MSRC documents available"; return 1; }
+  msrc_py build --in "$MSRC_DIR/cvrf" --out "$MSRC_DB" \
+    --fetched "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$MSRC_DIR/build.json" 2>&1 || {
+      say_err "could not compile the MSRC patch table"
+      head -3 "$MSRC_DIR/build.json" | sed 's/^/      /' >&2
+      return 1
+    }
+  return 0
+}
+
+# One registry key carries everything the comparison needs:
+# CurrentBuildNumber, UBR, ProductName and InstallationType.
+#
+# InstallationType is the host's own word for whether it is a Server or a
+# Client, and that is what decides which cumulative line applies. Base build
+# 26100 is shared by Windows 11 24H2 and Windows Server 2025, and in September
+# 2026 they required revision 9445 and 33438 respectively -- so guessing wrong
+# does not just mislabel the host, it invents a missing patch.
+WIN_CV_KEY='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+
+# win_facts HOST -> "base|ubr|kind|product|method" on stdout, 1 if nothing
+# could be read. Several transports are tried, because command execution over
+# SMB is the first thing EDR blocks and this scan has already seen hosts
+# authenticate and then return nothing. Which transport worked is recorded:
+# PCI DSS 11.3.1.2.a asks for the collection method per host, not only the
+# finding it produced.
+win_facts(){
+  local h="$1" raw="" m="" try=""
+  for try in smb-reg smb-ps wmi-reg; do
+    case "$try" in
+      smb-reg) raw=$(timeout 90 nxc smb "$h" -u "$U" -p "$P" \
+                       -x "reg query \"$WIN_CV_KEY\"" 2>/dev/null) ;;
+      smb-ps)  raw=$(timeout 90 nxc smb "$h" -u "$U" -p "$P" \
+                       -X "Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' | Select-Object CurrentBuildNumber,UBR,ProductName,InstallationType | Format-List" 2>/dev/null) ;;
+      wmi-reg) have nxc && raw=$(timeout 90 nxc wmi "$h" -u "$U" -p "$P" \
+                       -x "reg query \"$WIN_CV_KEY\"" 2>/dev/null) || raw="" ;;
+    esac
+    raw=$(printf '%s\n' "$raw" \
+          | sed -E 's/^(SMB|WMI)[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+//' \
+          | grep -v '^\[')
+    if printf '%s' "$raw" | grep -qiE 'CurrentBuildNumber|CurrentBuild|UBR'; then
+      m="$try"; break
+    fi
+    raw=""
+  done
+  [ -n "$raw" ] || return 1
+  # The registry text travels in the environment, NOT on stdin: `python3 -`
+  # reads the program from stdin, and the heredoc below already occupies it,
+  # so anything piped in is silently discarded and the parse sees nothing.
+  WIN_FACTS_RAW="$raw" python3 - "$m" <<'PYFACTS'
+import os, re, sys
+body = os.environ.get("WIN_FACTS_RAW", "")
+method = sys.argv[1]
+
+
+def grab(name):
+    # reg query prints "NAME    REG_DWORD    0x1234"; PowerShell's Format-List
+    # prints "Name : value". Accept either, and read hex as hex -- UBR comes
+    # back as a REG_DWORD, so reading 0x1234 as decimal would understate the
+    # patch level and invent missing updates.
+    # (.+?) not (\S+): ProductName is "Windows Server 2022 Standard", four
+    # words, and a single-token capture matches nothing at all rather than
+    # matching part of it -- so the host's product, and with it the
+    # client/server fallback, silently went missing.
+    m = re.search(r'^\s*%s\s*(?::|\s)\s*(?:REG_\w+\s+)?(.+?)\s*$' % name,
+                  body, re.I | re.M)
+    if not m:
+        return None
+    value = m.group(1).strip()
+    if value.lower().startswith('0x'):
+        try:
+            return str(int(value, 16))
+        except ValueError:
+            return None
+    return value
+
+
+base = grab('CurrentBuildNumber') or grab('CurrentBuild')
+ubr = grab('UBR')
+product = grab('ProductName') or ''
+itype = (grab('InstallationType') or '').lower()
+if itype.startswith('serv'):
+    kind = 'server'
+elif itype:
+    kind = 'client'
+elif 'server' in product.lower():
+    kind = 'server'
+else:
+    kind = ''
+if not base:
+    sys.exit(1)
+print('%s|%s|%s|%s|%s' % (base, ubr or '', kind, product.replace('|', ' '), method))
+PYFACTS
+}
+
 
 # gmp_py SOCKET SUBCOMMAND... -> the helper's JSON on stdout, its exit status.
 # Progress goes to stderr, so stdout stays a single parseable object.
@@ -479,6 +677,13 @@ cmd_install(){
     [ -d "$B/testssl.sh" ]   && { cp -r "$B/testssl.sh" /opt/; ln -sf /opt/testssl.sh/testssl.sh /usr/local/bin/testssl.sh; info "testssl.sh installed"; }
     [ -f "$B/definitions.zip" ] && { cp "$B/definitions.zip" "${SUDO_USER:+/home/$SUDO_USER/}definitions.zip" 2>/dev/null || cp "$B/definitions.zip" /root/; info "WES-NG definitions installed"; }
     [ -f "$B/kev.json" ]     && { cp "$B/kev.json" "${SUDO_USER:+/home/$SUDO_USER/}.kameki-kev.json" 2>/dev/null || cp "$B/kev.json" /root/.kameki-kev.json; info "KEV catalogue installed"; }
+    if [ -f "$B/msrc/patch-table.json" ]; then
+      _MD="${SUDO_USER:+/home/$SUDO_USER}"; _MD="${_MD:-/root}/.kameki-msrc"
+      mkdir -p "$_MD" && cp "$B/msrc/patch-table.json" "$_MD/patch-table.json" \
+        && { [ -n "${SUDO_USER:-}" ] && chown -R "$SUDO_USER" "$_MD" 2>/dev/null; \
+             info "Microsoft patch data installed"; }
+    fi
+    [ -f "$B/kameki_msrc.py" ] && { cp "$B/kameki_msrc.py" "$(dirname -- "${BASH_SOURCE[0]:-$0}")/" 2>/dev/null && info "Windows patch engine installed"; }
 
     for FEEDTAR in "$B/openvas-feed.tar.zst" "$B/openvas-feed.tar.gz"; do
       [ -f "$FEEDTAR" ] && break
@@ -701,6 +906,18 @@ cmd_bundle(){
   # kameKi that can only run the standalone engine.
   if P=$(gmp_py_find); then cp "$P" "$B/kameki_gmp.py"
   else warn "kameki_gmp.py not found, the bundle will have no NVT engine"; fi
+  if P=$(msrc_py_find); then cp "$P" "$B/kameki_msrc.py"
+  else warn "kameki_msrc.py not found, the bundle will have no Windows patch engine"; fi
+  # The compiled table is a couple of MB and is the whole Windows patch engine,
+  # so it rides along rather than being re-fetched on a network that cannot.
+  if [ -s "$MSRC_DB" ]; then
+    mkdir -p "$B/msrc"
+    cp "$MSRC_DB" "$B/msrc/patch-table.json"
+    info "including Microsoft patch data ($(du -h "$MSRC_DB" | cut -f1))"
+  else
+    warn "no compiled MSRC patch table, the bundle will have no Windows patch engine"
+    dim "build it first with: sudo $0 update"
+  fi
   cat > "$B/README.txt" <<EOF
 kameki offline bundle, built $STAMP
 NVT scripts included: $NVTN
@@ -759,6 +976,18 @@ cmd_doctor(){
   [ -d /usr/share/nmap/scripts/vulscan ] && printf "    %-14s ok\n" "vulscan" || printf "    %-14s ${YEL}absent${RST}\n" "vulscan"
   { [ -f definitions.zip ] || [ -f "$HOME/definitions.zip" ]; } && printf "    %-14s ok\n" "wes defs" || printf "    %-14s ${YEL}run: wes --update${RST}\n" "wes defs"
   [ -f "$HOME/.kameki-kev.json" ] && printf "    %-14s ok\n" "KEV" || printf "    %-14s ${YEL}absent${RST}\n" "KEV"
+  if msrc_ready; then
+    local MW
+    MW=$(msrc_py window --db "$MSRC_DB" 2>/dev/null \
+         | python3 -c "import json,sys;w=json.load(sys.stdin)['window'];print('%s..%s, %d month(s)' % (w['earliest'],w['latest'],len(w['months_with_windows_data'])))" 2>/dev/null)
+    printf "    %-14s ok (%s)\n" "MSRC data" "${MW:-compiled}"
+  elif msrc_py_find >/dev/null 2>&1; then
+    printf "    %-14s ${YEL}not compiled, run: sudo %s update${RST}\n" "MSRC data" "$0"
+    dim "without it Windows patch level is assessed by WES-NG alone, which"
+    dim "reports false positives by its own documentation"
+  else
+    printf "    %-14s ${YEL}kameki_msrc.py is not beside this script${RST}\n" "MSRC data"
+  fi
 
   echo
   echo "  greenbone"
@@ -1059,6 +1288,17 @@ cmd_update(){
   if curl -s --max-time 60 -o "$UH/.kameki-kev.json" "$KEV_URL" 2>/dev/null \
      && [ -s "$UH/.kameki-kev.json" ]; then echo "${GRN}ok${RST}"
   else echo "${YEL}failed${RST}"; FAILED="$FAILED kev"; fi
+
+  printf "    %-22s" "MSRC patch data"
+  MSRC_DIR="$UH/.kameki-msrc"
+  MSRC_DB="$UH/.kameki-msrc/patch-table.json"
+  if msrc_sync >/dev/null 2>&1; then
+    local MW
+    MW=$(msrc_py window --db "$MSRC_DB" 2>/dev/null \
+         | python3 -c "import json,sys;w=json.load(sys.stdin)['window'];print('%s..%s' % (w['earliest'],w['latest']))" 2>/dev/null)
+    echo "${GRN}ok${RST}${MW:+ ($MW)}"
+    [ -n "${SUDO_USER:-}" ] && chown -R "$SUDO_USER" "$UH/.kameki-msrc" 2>/dev/null
+  else echo "${YEL}failed${RST}"; FAILED="$FAILED msrc"; fi
 
   echo
   if [ -n "$FAILED" ]; then
@@ -2167,6 +2407,136 @@ if [ "$SYSOK" -gt 0 ]; then
 fi
 fi
 
+# ---------------------------------------------------------------------------
+#  Windows patch level from Microsoft's own data
+#
+#  Runs alongside WES-NG rather than instead of it, because the two answer
+#  different questions and have opposite error profiles:
+#
+#    WES-NG reads the hotfix list out of systeminfo and maps it against the
+#    MSRC bulletin feed. It covers more than the OS -- Office, .NET, drivers --
+#    but its own documentation says so plainly: "the data provided by
+#    Microsoft's MSRC feed is frequently incomplete and false positives are
+#    reported by wes.py". Its wiki shows a fully patched Windows 10 1803
+#    reporting 97 vulnerabilities.
+#
+#    This compares the OS build the host itself reports against the build
+#    Microsoft states fixes each CVE. For cumulative-update Windows that is
+#    the supersedence check, complete, so it cannot report a patch the host
+#    already has. It covers the OS only.
+#
+#  Both are recorded, each labelled with its method, so a reader can tell
+#  an authoritative finding from an inferred one instead of having to trust
+#  the pair equally.
+# ---------------------------------------------------------------------------
+MSRC_ASSESSED=0; MSRC_BEHIND=0; MSRC_CVES=0; MSRC_EXPL=0; MSRC_UNASSESSED=0
+: > "$RAW/windows-patch-msrc.csv"
+: > "$RAW/windows-patch-coverage.txt"
+if [ "$AUTH_OK" -gt 0 ] && msrc_ready; then
+  step "Stage 5B  Windows patch level  (Microsoft MSRC build comparison)"
+  mkdir -p "$RAW/msrc"
+  if is_done msrc; then info "skipped (resume)"; else
+    echo "Host,Product,Build,InstalledUBR,RequiredUBR,Method,Assessed,Behind,CVEs,MaxCVSS,Exploited,CountIsFloor" \
+      > "$RAW/windows-patch-coverage.csv"
+    msrc_one(){
+      local h="$1" facts base ubr kind product method out
+      out="$RAW/msrc/$h.json"
+      if ! facts=$(win_facts "$h"); then
+        # Recorded, not dropped: a host that could not be read is a coverage
+        # gap and belongs in the figures. PCI 11.3.1.2.a asks what was
+        # collected per host, and "nothing" is an answer the report must carry.
+        printf '%s,,,,,none,no,,,,,\n' "$h" >> "$RAW/windows-patch-coverage.csv"
+        printf '%s\tno registry read\n' "$h" >> "$RAW/windows-patch-coverage.txt"
+        return 0
+      fi
+      base=$(printf '%s' "$facts" | cut -d'|' -f1)
+      ubr=$(printf  '%s' "$facts" | cut -d'|' -f2)
+      kind=$(printf '%s' "$facts" | cut -d'|' -f3)
+      product=$(printf '%s' "$facts" | cut -d'|' -f4)
+      method=$(printf '%s' "$facts" | cut -d'|' -f5)
+      # An unknown installation type is not guessed at. Server and client are
+      # separate cumulative lines and picking the wrong one invents findings,
+      # so the host is reported as unassessed instead.
+      [ -n "$kind" ] || kind=unknown
+      if [ "$kind" = unknown ]; then
+        printf '%s,%s,%s.%s,%s,,%s,no,,,,,\n' \
+          "$h" "$product" "$base" "$ubr" "$ubr" "$method" \
+          >> "$RAW/windows-patch-coverage.csv"
+        printf '%s\tinstallation type unknown, cumulative line undetermined\n' \
+          "$h" >> "$RAW/windows-patch-coverage.txt"
+        return 0
+      fi
+      msrc_py assess --db "$MSRC_DB" --base "$base" \
+        ${ubr:+--ubr "$ubr"} --kind "$kind" --host "$h" > "$out" 2>/dev/null || true
+      [ -s "$out" ] || { printf '%s\tassessment produced nothing\n' "$h" \
+                           >> "$RAW/windows-patch-coverage.txt"; return 0; }
+      python3 - "$h" "$product" "$method" "$out" \
+        "$RAW/windows-patch-msrc.csv" "$RAW/windows-patch-coverage.csv" <<'PYROW'
+import csv, json, sys
+host, product, method, path, findings_csv, coverage_csv = sys.argv[1:7]
+with open(path, encoding='utf-8') as fh:
+    d = json.load(fh)
+with open(coverage_csv, 'a', newline='', encoding='utf-8') as fh:
+    csv.writer(fh).writerow([
+        host, product,
+        '%s.%s' % (d.get('base_build') or '', d.get('installed_ubr') or ''),
+        d.get('installed_ubr') or '', d.get('required_ubr') or '', method,
+        'yes' if d.get('assessed') else 'no',
+        d.get('behind_by_levels') if d.get('assessed') else '',
+        d.get('cve_count') if d.get('assessed') else '',
+        d.get('max_cvss') if d.get('assessed') else '',
+        len(d.get('exploited_cves') or []),
+        'yes' if d.get('counts_are_a_floor') else '',
+    ])
+rows = d.get('findings') or []
+if rows:
+    with open(findings_csv, 'a', newline='', encoding='utf-8') as fh:
+        w = csv.writer(fh)
+        for f in rows:
+            w.writerow([host, f.get('cve'), f.get('cvss'), f.get('severity'),
+                        f.get('impact'), f.get('kb'), f.get('fixed_ubr'),
+                        'yes' if f.get('exploited') else '',
+                        'MSRC build comparison', f.get('vector')])
+PYROW
+    }
+    N=0; TOT=$(cnt "$RAW/auth-ok.txt")
+    while read -r h; do [ -z "$h" ] && continue
+      N=$((N+1)); printf "\r    reading build %d/%d" "$N" "$TOT"
+      pool msrc_one "$h"
+    done < "$RAW/auth-ok.txt"
+    finish; echo
+    mark_done msrc
+  fi
+
+  # A header only once, and only if there are rows to head.
+  if [ -s "$RAW/windows-patch-msrc.csv" ]; then
+    { echo "Host,CVE,CVSS,Severity,Impact,MissingKB,FixedUBR,Exploited,Method,Vector"
+      cat "$RAW/windows-patch-msrc.csv"; } > "$RAW/windows-patch-msrc.csv.tmp" \
+      && mv -f "$RAW/windows-patch-msrc.csv.tmp" "$RAW/windows-patch-msrc.csv"
+  fi
+  if [ -s "$RAW/windows-patch-coverage.csv" ]; then
+    MSRC_ASSESSED=$(awk -F',' 'NR>1 && $7=="yes"' "$RAW/windows-patch-coverage.csv" | wc -l | tr -d ' ')
+    MSRC_UNASSESSED=$(awk -F',' 'NR>1 && $7!="yes"' "$RAW/windows-patch-coverage.csv" | wc -l | tr -d ' ')
+    MSRC_BEHIND=$(awk -F',' 'NR>1 && $7=="yes" && $8+0>0' "$RAW/windows-patch-coverage.csv" | wc -l | tr -d ' ')
+  fi
+  MSRC_CVES=$(awk -F',' 'NR>1{print $2}' "$RAW/windows-patch-msrc.csv" 2>/dev/null | sort -u | grep -c . | tr -d ' ')
+  MSRC_EXPL=$(awk -F',' 'NR>1 && $8=="yes"{print $2}' "$RAW/windows-patch-msrc.csv" 2>/dev/null | sort -u | grep -c . | tr -d ' ')
+  info "assessed $MSRC_ASSESSED of $AUTH_OK authenticated, $MSRC_BEHIND behind"
+  info "distinct CVEs $MSRC_CVES   actively exploited per Microsoft $MSRC_EXPL"
+  [ "$MSRC_UNASSESSED" -gt 0 ] && \
+    dim "$MSRC_UNASSESSED host(s) not assessed by this method, see windows-patch-coverage.csv"
+  if awk -F',' 'NR>1 && $12=="yes"' "$RAW/windows-patch-coverage.csv" 2>/dev/null | grep -q .; then
+    dim "some hosts sit below the oldest month held, so their CVE counts are a"
+    dim "floor rather than a total. widen it with: MSRC_MONTHS=12 sudo $0 update"
+  fi
+elif [ "$AUTH_OK" -gt 0 ]; then
+  if msrc_py_find >/dev/null 2>&1; then
+    warn "Microsoft patch data not compiled, Windows patch level rests on WES-NG alone"
+    dim "WES-NG reports false positives by its own documentation. fix with:"
+    dim "  sudo $0 update"
+  fi
+fi
+
 # =====================================================================
 #  Stage 9  Linux
 # =====================================================================
@@ -2624,6 +2994,53 @@ fi
 if [ "$RUN_SA" -eq 1 ]; then
 echo "---"; echo
 echo "## 3B. Windows Patch Level"; echo
+echo "Two methods are reported separately because they have opposite error"
+echo "profiles and must not be read as one number."; echo
+echo "**MSRC build comparison** compares the OS build each host reports against"
+echo "the build Microsoft states fixes each CVE. For cumulative-update Windows"
+echo "that is the complete supersedence check, so it cannot report a patch the"
+echo "host already has. It covers the operating system only."; echo
+echo "**WES-NG** maps the hotfix list from \`systeminfo\` against the MSRC"
+echo "bulletin feed. It reaches beyond the OS, but its own documentation states"
+echo "that \"the data provided by Microsoft's MSRC feed is frequently incomplete"
+echo "and false positives are reported by wes.py\". Treat its output as leads to"
+echo "confirm, not as confirmed findings."; echo
+echo "---"; echo
+echo "### MSRC build comparison"; echo
+if [ "$MSRC_ASSESSED" -gt 0 ]; then
+  echo "Hosts assessed: **$MSRC_ASSESSED** of $AUTH_OK authenticated  "
+  echo "Hosts behind the required build: **$MSRC_BEHIND**  "
+  echo "Distinct CVEs: **$MSRC_CVES**  "
+  echo "Actively exploited per Microsoft: **$MSRC_EXPL**"; echo
+  if [ -s "$RAW/windows-patch-msrc.csv" ]; then
+    echo "#### Highest scoring, with the KB that fixes each"; echo
+    echo '```'
+    { head -1 "$RAW/windows-patch-msrc.csv"
+      tail -n +2 "$RAW/windows-patch-msrc.csv" \
+        | sort -t',' -k3 -rn | head -40; } | cut -d',' -f1-9
+    echo '```'; echo
+  fi
+  if awk -F',' 'NR>1 && $8=="yes"' "$RAW/windows-patch-msrc.csv" 2>/dev/null | grep -q .; then
+    echo "#### Microsoft records these as exploited in the wild"; echo
+    echo '```'
+    awk -F',' 'NR>1 && $8=="yes"{print $1","$2","$3","$6}' \
+      "$RAW/windows-patch-msrc.csv" | sort -u | head -40
+    echo '```'; echo
+  fi
+  echo "#### Per-host coverage, including what could not be assessed"; echo
+  echo "A host that could not be read is a coverage gap, not an absence of"
+  echo "findings, and is listed here for that reason."; echo
+  echo '```'; cat "$RAW/windows-patch-coverage.csv" | head -60; echo '```'; echo
+  if awk -F',' 'NR>1 && $12=="yes"' "$RAW/windows-patch-coverage.csv" 2>/dev/null | grep -q .; then
+    echo "> Some hosts sit below the oldest month in the data window, so their"
+    echo "> CVE counts are a floor and not a total: updates released before the"
+    echo "> window are missing as well and are not counted."; echo
+  fi
+else
+  echo "_Not assessed. Either no host authenticated, or Microsoft's patch data"
+  echo "was not compiled on this machine (\`sudo $0 update\`)._"; echo
+fi
+echo "### WES-NG, hotfix-list inference"; echo
 if [ "$WIN_CVES" -gt 0 ]; then
   echo "### CVE count by host"; echo
   echo '```'; tail -n +2 "$RAW/windows-cves.csv" | cut -d',' -f1 | sort | uniq -c | sort -rn | head -40; echo '```'; echo
@@ -2697,6 +3114,63 @@ echo "WinRM authenticated: **$WINRM_OK**  "
 echo "SNMP default strings: **$SNMPN**"; echo
 [ "$SNMPN" -gt 0 ] && { echo '```'; cat "$RAW/snmp.txt"; echo '```'; echo; }
 
+echo "---"; echo
+echo "## 10B. Vulnerability Data Provenance"; echo
+echo "PCI DSS v4.0.1 requirement 11.3.1 requires that the scan tool \"is kept up"
+echo "to date with the latest vulnerability information\", and testing procedure"
+echo "11.3.1.c has the assessor examine that it is. This is that evidence: what"
+echo "each data source was, when it was fetched, and the digest of the exact"
+echo "bytes used."; echo
+echo "| Source | Version or window | Fetched | Size | SHA-256 |"
+echo "|---|---|---|---|---|"
+if msrc_ready; then
+  msrc_py window --db "$MSRC_DB" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+w = d.get("window") or {}
+rows = d.get("provenance") or []
+months = ", ".join(w.get("months_with_windows_data") or []) or "none"
+print("| MSRC CVRF (compiled table) | %s | %s | %d documents | - |"
+      % (months, (rows[0].get("fetched") if rows else None) or "-", len(rows)))
+for p in sorted(rows, key=lambda r: r.get("month") or ""):
+    print("| %s | document v%s, released %s | %s | %s bytes | `%s` |"
+          % (p.get("source") or "-", p.get("document_version") or "?",
+             (p.get("current_release") or "?")[:10], p.get("fetched") or "-",
+             p.get("bytes") or "?", (p.get("sha256") or "-")[:16] + "..."))
+if w.get("empty_months"):
+    print()
+    print("Months fetched that carried no Windows build data: %s. These are"
+          % ", ".join(w["empty_months"]))
+    print("published before their Patch Tuesday; they are recorded so the window")
+    print("is not narrowed without the reader being told.")
+' 2>/dev/null
+else
+  echo "| MSRC CVRF | not compiled | - | - | - |"
+fi
+for _f in "$HOME/.kameki-kev.json:CISA KEV catalogue" \
+          "$HOME/definitions.zip:WES-NG definitions"; do
+  _p="${_f%%:*}"; _n="${_f#*:}"
+  if [ -s "$_p" ]; then
+    printf "| %s | - | %s | %s bytes | \`%s...\` |\n" "$_n" \
+      "$(date -u -r "$_p" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)" \
+      "$(wc -c < "$_p" | tr -d ' ')" \
+      "$(sha256sum "$_p" 2>/dev/null | cut -c1-16 || echo '-')"
+  else
+    printf "| %s | absent | - | - | - |\n" "$_n"
+  fi
+done
+if [ "$RUN_NVT" -eq 1 ]; then
+  printf "| Greenbone NVT feed | %s scripts | - | - | - |\n" "$NVT_FILES"
+  echo
+  echo "> The Greenbone community feed's newest Windows cumulative-update check"
+  echo "> is dated 2025-10-15, so its Windows patch coverage is not current."
+  echo "> Windows patch level in this report rests on the MSRC build comparison"
+  echo "> above, not on the NVT feed."
+fi
+echo
 echo "---"; echo
 echo "## 11. Coverage Gaps"; echo
 echo "### SMB authentication failed"; echo
