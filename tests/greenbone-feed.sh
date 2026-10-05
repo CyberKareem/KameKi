@@ -2,11 +2,11 @@
 #
 #  Greenbone feed and restart-loop regression test
 #
-#  Lifts the feed and start-timeout helpers out of KameKi.sh and drives them
+#  Lifts the feed and start-timeout helpers out of kameki.sh and drives them
 #  against stubbed systemctl and greenbone-feed-sync. No Greenbone, no
 #  network, no root.
 #
-#    ./tests/greenbone-feed.sh            # tests ../KameKi.sh
+#    ./tests/greenbone-feed.sh            # tests ../kameki.sh
 #    ./tests/greenbone-feed.sh path.sh
 #
 #  What it guards against, which shipped once:
@@ -20,7 +20,15 @@
 #    counter 493, and every feed import was truncated by the next restart.
 #
 set -uo pipefail
-SRC="${1:-$(dirname "$0")/../KameKi.sh}"
+# The script has been both KameKi.sh and kameki.sh. Resolve whichever is
+# present, because a case-insensitive filesystem hides a wrong name and a
+# case-sensitive one fails on it.
+SRC="${1:-}"
+if [ -z "$SRC" ]; then
+  for _c in "$(dirname "$0")/../kameki.sh" "$(dirname "$0")/../KameKi.sh"; do
+    [ -f "$_c" ] && { SRC="$_c"; break; }
+  done
+fi
 [ -f "$SRC" ] || { echo "no such file: $SRC" >&2; exit 2; }
 H=$(mktemp); trap 'rm -f "$H"' EXIT
 sed -n '/^GVMD_START_TIMEOUT=/,/^}$/p;/^gvmd_break_restart_loop(){/,/^}$/p;/^nvt_count(){/,/^}$/p;/^FEED_SYNC=/,/^}$/p' \

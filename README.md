@@ -448,7 +448,7 @@ security team the dates. Run `cleanup` before you leave.
 ```
 
 Seven suites, no Greenbone, no root and no network. Each one slices the real
-functions out of `KameKi.sh` with `sed` and drives them against stubs, so what
+functions out of `kameki.sh` with `sed` and drives them against stubs, so what
 is tested is what ships rather than a copy that drifts.
 
 | Suite | Covers |

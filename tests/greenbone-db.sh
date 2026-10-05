@@ -2,10 +2,10 @@
 #
 #  Greenbone database provisioning regression test
 #
-#  Lifts gvmd_db_ready out of KameKi.sh and drives it against stubbed
+#  Lifts gvmd_db_ready out of kameki.sh and drives it against stubbed
 #  postgres and gvmd. No PostgreSQL, no Greenbone, no root needed.
 #
-#    ./tests/greenbone-db.sh            # tests ../KameKi.sh
+#    ./tests/greenbone-db.sh            # tests ../kameki.sh
 #    ./tests/greenbone-db.sh path.sh
 #
 #  What it guards against, which shipped once:
@@ -17,7 +17,15 @@
 #    operator was left with "check: systemctl status gvmd" and no reason.
 #
 set -uo pipefail
-SRC="${1:-$(dirname "$0")/../KameKi.sh}"
+# The script has been both KameKi.sh and kameki.sh. Resolve whichever is
+# present, because a case-insensitive filesystem hides a wrong name and a
+# case-sensitive one fails on it.
+SRC="${1:-}"
+if [ -z "$SRC" ]; then
+  for _c in "$(dirname "$0")/../kameki.sh" "$(dirname "$0")/../KameKi.sh"; do
+    [ -f "$_c" ] && { SRC="$_c"; break; }
+  done
+fi
 [ -f "$SRC" ] || { echo "no such file: $SRC" >&2; exit 2; }
 H=$(mktemp); trap 'rm -f "$H" /tmp/kameki-pgstate.$$' EXIT
 sed -n '/^say_err(){/,/^}$/p;/^gvmd_db_ready(){/,/^}$/p' "$SRC" > "$H"
