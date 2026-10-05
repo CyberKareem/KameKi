@@ -213,6 +213,37 @@ gmp_py_interp(){
 # 0 when a GMP conversation is actually possible.
 gmp_py_ready(){ gmp_py_find >/dev/null 2>&1 && gmp_py_interp >/dev/null 2>&1; }
 
+KAMEKI_RAW="${KAMEKI_RAW:-https://raw.githubusercontent.com/CyberKareem/KameKi/main}"
+# kameki is routinely installed by wget-ing the one script, which leaves the
+# GMP client behind. That is not a harmless omission: with no client to check
+# with, setup-greenbone cannot verify the account it just created, takes its
+# "created, unverified" branch, and writes a harvested password to
+# gmp-pass.txt that gvmd never accepted. Every later Greenbone check then
+# fails in a way that reads as a credential problem rather than a missing
+# file. So fetch the helper next to ourselves when it is absent.
+fetch_gmp_helper(){
+  gmp_py_find >/dev/null 2>&1 && return 0
+  local self d
+  self="${BASH_SOURCE[0]:-$0}"
+  d=$(CDPATH= cd -- "$(dirname -- "$self")" 2>/dev/null && pwd -P) || return 1
+  [ -w "$d" ] || return 1
+  if   have curl; then curl -fsSL "$KAMEKI_RAW/kameki_gmp.py" -o "$d/kameki_gmp.py" 2>/dev/null
+  elif have wget; then wget -qO   "$d/kameki_gmp.py" "$KAMEKI_RAW/kameki_gmp.py" 2>/dev/null
+  else return 1
+  fi
+  # A captive portal or an error page saved to that name is worse than nothing:
+  # it would be found and then fail with a syntax error instead of a clear
+  # missing-file message. Require it to look like the module it claims to be.
+  if ! { [ -s "$d/kameki_gmp.py" ] \
+         && head -1 "$d/kameki_gmp.py" | grep -q 'python' \
+         && grep -q 'def main' "$d/kameki_gmp.py"; }; then
+    rm -f "$d/kameki_gmp.py"
+    return 1
+  fi
+  KAMEKI_GMP=""          # clear the cached miss so discovery runs again
+  gmp_py_find >/dev/null 2>&1
+}
+
 # gmp_py SOCKET SUBCOMMAND... -> the helper's JSON on stdout, its exit status.
 # Progress goes to stderr, so stdout stays a single parseable object.
 gmp_py(){
@@ -543,6 +574,12 @@ cmd_install(){
   # on a recent Ubuntu behind a filtering proxy, which left no pip to install
   # python-gvm with, and the old code then declared the NVT engine dead when
   # the pipx venv had the library all along.
+  if fetch_gmp_helper; then dim "GMP client present ($(gmp_py_find))"
+  else warn "kameki_gmp.py is missing and could not be fetched"
+       dim "the NVT engine needs it. put it beside this script:"
+       dim "  wget -O $(dirname -- "${BASH_SOURCE[0]:-$0}")/kameki_gmp.py \\"
+       dim "    $KAMEKI_RAW/kameki_gmp.py"
+  fi
   install_python_gvm(){
     gmp_py_interp >/dev/null 2>&1 && return 0
     pip3 install --break-system-packages python-gvm >/dev/null 2>&1 && return 0
@@ -714,7 +751,11 @@ cmd_doctor(){
   local NVTN=0
   [ -d /var/lib/openvas/plugins ] && NVTN=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
   if [ "$NVTN" -ge 10000 ]; then printf "    %-14s ok (%s scripts)\n" "NVT feed" "$NVTN"
-  else printf "    %-14s ${YEL}%s scripts, run: sudo greenbone-feed-sync${RST}\n" "NVT feed" "$NVTN"; fi
+  else
+    printf "    %-14s ${YEL}%s scripts, run: sudo greenbone-feed-sync${RST}\n" "NVT feed" "$NVTN"
+    dim "with no feed the NVT engine cannot run whatever else is configured;"
+    dim "the standalone engine is unaffected and needs no feed"
+  fi
   [ -d /usr/share/nmap/scripts/vulscan ] && printf "    %-14s ok\n" "vulscan" || printf "    %-14s ${YEL}absent${RST}\n" "vulscan"
   { [ -f definitions.zip ] || [ -f "$HOME/definitions.zip" ]; } && printf "    %-14s ok\n" "wes defs" || printf "    %-14s ${YEL}run: wes --update${RST}\n" "wes defs"
   [ -f "$HOME/.kameki-kev.json" ] && printf "    %-14s ok\n" "KEV" || printf "    %-14s ${YEL}absent${RST}\n" "KEV"
@@ -729,8 +770,26 @@ cmd_doctor(){
     printf "    %-14s ok (%s)\n" "gvmd socket" "$SOCK"
     if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] && gmp_py_ready; then
       local R; R=$(gmp_py "$SOCK" check 2>&1)
-      printf '%s' "$R" | grep -q '"ok": *true' && printf "    %-14s ok\n" "gmp auth" \
-        || { printf "    %-14s ${RED}failed${RST}\n" "gmp auth"; ISSUES=$((ISSUES+1)); }
+      if printf '%s' "$R" | grep -q '"ok": *true'; then
+        printf "    %-14s ok\n" "gmp auth"
+      else
+        printf "    %-14s ${RED}failed${RST}\n" "gmp auth"
+        # Throwing this away made every GMP problem look identical and had to
+        # be re-diagnosed by hand on site. Print what gvmd actually said.
+        local GE; GE=$(jgmp "$R" '.error // empty')
+        [ -z "$GE" ] && GE=$(printf '%s' "$R" | head -2 | tr '\n' ' ')
+        dim "$GE"
+        case "$GE" in
+          *uthentication*|*uthenticate*)
+            dim "gmp-pass.txt holds a password gvmd does not accept. The usual"
+            dim "cause is an account created while no GMP client was installed,"
+            dim "so it was written without ever being verified. Recreate it:"
+            dim "  sudo FEED_SYNC=0 $0 setup-greenbone" ;;
+          *)
+            dim "recreate the account with: sudo FEED_SYNC=0 $0 setup-greenbone" ;;
+        esac
+        ISSUES=$((ISSUES+1))
+      fi
     else
       printf "    %-14s ${YEL}gmp-user.txt / gmp-pass.txt not set${RST}\n" "gmp auth"
     fi
@@ -1250,6 +1309,8 @@ greenbone_ready_report(){
   fi
 }
 
+# Before any credential work: without the helper the verification below cannot
+# run, and an unverified password would be written as though it worked.
 GMP_LAST=""        # whatever the helper said on the most recent check
 GMP_BROKEN=0       # 1 when the client could not run, as opposed to being refused
 # A helper that cannot run is not a bad account. The two are reported
