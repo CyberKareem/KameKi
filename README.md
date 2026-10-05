@@ -441,6 +441,47 @@ security team the dates. Run `cleanup` before you leave.
 
 ---
 
+## The Greenbone feed, over HTTPS
+
+The community feed is published as container images with the data baked in,
+anonymous-pullable over port 443 and rebuilt daily. `setup-greenbone` uses that
+by default and keeps rsync only as a fallback, because rsync to port 873 is the
+transport that actually fails at client sites — it connects, transfers, and a
+filtering device kills it mid-stream:
+
+```
+rsync: [Receiver] safe_read failed to read 1 bytes: Connection timed out (110)
+```
+
+Registry blobs answer Range requests with `206`, so a killed transfer resumes
+where it stopped and every blob is verified against the digest the registry
+itself published. A blob that fails verification is deleted rather than kept: a
+truncated feed file is worse than no feed, because gvmd will load it and report
+whatever it happens to contain.
+
+| set | size |
+|---|---|
+| vulnerability-tests | 224 MiB |
+| notus-data | 42 MiB |
+| data-objects, report-formats, cert data | ~5 MiB |
+| **default total** | **~270 MiB, resumable** |
+| scap-data, *not fetched by default* | 1,516 MiB |
+
+SCAP is skipped because gvmd runs without it — it logs `No SCAP database found`
+and continues, and CVE references come from each test's own `script_cve_id`.
+Add it with `GB_WITH_SCAP=1`. `FEED_TRANSPORT` is `auto` (HTTPS, then rsync),
+`https` (never rsync) or `rsync` (the old behaviour).
+
+**This does not make Greenbone a Windows engine.** Its newest Windows
+cumulative-update test is dated 2025-10-15 and Server 2022 has two tests in
+total, against 992 for Server 2008. Windows patch level comes from the MSRC
+comparison below. What the HTTPS transport rescues is the part of Greenbone
+that is genuinely current: Debian, Ubuntu, SUSE and Fedora-family Linux via
+Notus, which is backport-aware and rebuilt daily. RHEL, Rocky, Alma, Oracle and
+Amazon have **no** Notus coverage in the community feed at all.
+
+---
+
 ## Windows patch level
 
 Two methods run, and they are reported separately because their error profiles
@@ -507,7 +548,7 @@ so the evidence is printed rather than asserted.
 ./tests/run-all.sh
 ```
 
-Eleven suites, no Greenbone, no root and no network. Each one slices the real
+Twelve suites, no Greenbone, no root and no network. Each one slices the real
 functions out of `kameki.sh` with `sed` and drives them against stubs, so what
 is tested is what ships rather than a copy that drifts.
 
@@ -521,6 +562,7 @@ is tested is what ships rather than a copy that drifts.
 | `tests/protocol-targets.sh` | per-protocol target lists and the Stage 4 wall-clock cap |
 | `tests/greenbone-db.sh` | the PostgreSQL role, database and extensions |
 | `tests/greenbone-feed.sh` | feed selection, the systemd restart loop, and the start timeout |
+| `tests/greenbone-oci.sh` | the HTTPS feed transport against a stubbed registry: the busybox base layer that must contribute nothing, release directories that differ per repository, resume after a killed transfer, and a valid tarball with the wrong digest |
 
 Each suite was checked by reintroducing the bug it exists to catch and
 confirming it fails. A test that cannot fail is not a test.

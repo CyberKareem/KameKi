@@ -51,6 +51,7 @@ run "MSRC patch engine"         python3 tests/msrc.py
 run "protocol targets"          bash tests/protocol-targets.sh
 run "greenbone database"        bash tests/greenbone-db.sh
 run "greenbone feed"            bash tests/greenbone-feed.sh
+run "greenbone OCI transport"   bash tests/greenbone-oci.sh
 run "GMP client (stubbed)"      python3 tests/gmp-client.py
 run "GMP client (live socket)"  python3 tests/gmp-live.py
 

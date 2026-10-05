@@ -1444,6 +1444,209 @@ nvt_count(){
 # scan configs and 0 report formats, and was told to go and run the sync by
 # hand. It is run here instead. Output is not captured, so rsync progress is
 # visible rather than the terminal appearing dead for an hour.
+# ---------------------------------------------------------------------------
+#  Greenbone feed over HTTPS, as OCI images, instead of rsync
+#
+#  The community feed is published as container images with the data baked in,
+#  anonymous-pullable over 443 and rebuilt daily. That matters because rsync to
+#  873 is what fails at client sites: it connects, starts transferring, and the
+#  filtering device kills it -- "safe_read failed to read 1 bytes: Connection
+#  timed out (110)". Registry blobs answer Range requests with 206, so a killed
+#  transfer resumes where it stopped and is verified against its own digest.
+#
+#  Without SCAP the required set is about 270 MiB in resumable chunks rather
+#  than several GB in one stream. SCAP is another 1.5 GiB and is NOT fetched by
+#  default: gvmd runs without it, logging "No SCAP database found" and
+#  continuing, and CVE references come from each test's own script_cve_id.
+#
+#  This does not make Greenbone a Windows engine. Its newest Windows
+#  cumulative-update test is dated 2025-10-15 and Server 2022 has two tests in
+#  total, so Windows patch level comes from the MSRC comparison. What this
+#  rescues is the part of Greenbone that is genuinely current: Debian, Ubuntu,
+#  SUSE and Fedora-family Linux via Notus.
+# ---------------------------------------------------------------------------
+GB_REGISTRY="${GB_REGISTRY:-registry.community.greenbone.net}"
+GB_REPOS="${GB_REPOS:-vulnerability-tests notus-data data-objects report-formats cert-bund-data dfn-cert-data}"
+GB_WITH_SCAP="${GB_WITH_SCAP:-0}"
+# Back-off between resume attempts. Configurable so the regression suite
+# can drive the failure paths without waiting out real sleeps.
+GB_RETRY_SLEEP="${GB_RETRY_SLEEP:-3}"
+GB_RETRIES="${GB_RETRIES:-5}"
+
+# A pull token lasts 1800s and is re-minted for every attempt, because a blob
+# that needs resuming is exactly the blob whose transfer outlived its token.
+gb_oci_token(){
+  curl -fsSL --max-time 60 \
+    "https://$GB_REGISTRY/service/token?service=harbor-registry&scope=repository:community/$1:pull" \
+    2>/dev/null | python3 -c 'import json,sys
+try: sys.stdout.write(json.load(sys.stdin)["token"])
+except Exception: sys.exit(1)'
+}
+
+# gb_oci_layers REPO -> "digest<TAB>size" a line, for the amd64 image.
+gb_oci_layers(){
+  local repo="$1" tok child
+  tok=$(gb_oci_token "$repo") || return 1
+  child=$(curl -fsSL --max-time 60 -H "Authorization: Bearer $tok" \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+    "https://$GB_REGISTRY/v2/community/$repo/manifests/latest" 2>/dev/null \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for m in d.get("manifests") or []:
+    if (m.get("platform") or {}).get("architecture") == "amd64":
+        sys.stdout.write(m["digest"]); break
+else:
+    sys.exit(1)') || return 1
+  curl -fsSL --max-time 60 -H "Authorization: Bearer $tok" \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "https://$GB_REGISTRY/v2/community/$repo/manifests/$child" 2>/dev/null \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for l in d.get("layers") or []:
+    print("%s\t%d" % (l["digest"], l["size"]))'
+}
+
+# gb_oci_blob REPO DIGEST OUT SIZE -> resumable download, verified against the
+# digest the registry itself published. A blob that fails verification is
+# deleted: a half-written feed file is worse than none, because gvmd will load
+# it and report whatever it happens to contain.
+gb_oci_blob(){
+  local repo="$1" dig="$2" out="$3" want="${4:-0}" try tok have
+  for try in $(seq 1 "$GB_RETRIES"); do
+    have=0; [ -f "$out" ] && have=$(wc -c < "$out" | tr -d ' ')
+    [ "$want" -gt 0 ] && [ "$have" -eq "$want" ] && break
+    tok=$(gb_oci_token "$repo") || { sleep "$GB_RETRY_SLEEP"; continue; }
+    curl -fsSL --max-time 1800 --speed-time 60 --speed-limit 1024 \
+      -C - -H "Authorization: Bearer $tok" \
+      "https://$GB_REGISTRY/v2/community/$repo/blobs/$dig" -o "$out" 2>/dev/null
+    have=0; [ -f "$out" ] && have=$(wc -c < "$out" | tr -d ' ')
+    [ "$want" -gt 0 ] && [ "$have" -eq "$want" ] && break
+    [ "$want" -eq 0 ] && [ "$have" -gt 0 ] && break
+    dim "  resuming $(printf '%.20s' "${dig#sha256:}") at ${have} of ${want} bytes"
+    sleep "$GB_RETRY_SLEEP"
+  done
+  [ -s "$out" ] || return 1
+  if have sha256sum; then
+    [ "sha256:$(sha256sum "$out" | cut -d' ' -f1)" = "$dig" ] && return 0
+    err "digest mismatch on $(printf '%.20s' "${dig#sha256:}"), discarding"
+    rm -f "$out"
+    return 1
+  fi
+  return 0
+}
+
+# gb_oci_pull REPO STAGING -> every layer fetched and its var/ tree unpacked
+# into STAGING, later layers overlaying earlier ones the way a container image
+# is assembled.
+#
+# Only var/ is taken. Each image is built on busybox, so the first layer is a
+# whole root filesystem -- 2.2 MiB of /bin that is not feed data and must not
+# be written anywhere near /var/lib. Choosing "the biggest layer" would be
+# worse than useless: for data-objects the base image IS the biggest layer, so
+# that heuristic downloads the wrong thing and extracts nothing.
+gb_oci_pull(){
+  local repo="$1" stage="$2" dig size n=0 ok=0 tmp
+  tmp="$stage/.blobs"; mkdir -p "$tmp" "$stage" || return 1
+  local layers; layers=$(gb_oci_layers "$repo") || { err "$repo: no manifest"; return 1; }
+  [ -n "$layers" ] || { err "$repo: manifest lists no layers"; return 1; }
+  while IFS=$'\t' read -r dig size; do
+    [ -n "$dig" ] || continue
+    n=$((n+1))
+    if gb_oci_blob "$repo" "$dig" "$tmp/${dig#sha256:}.tgz" "$size"; then
+      # A layer with no var/ is the base image or a metadata layer; tar exits
+      # non-zero and that is the expected, uninteresting case.
+      tar -xzf "$tmp/${dig#sha256:}.tgz" -C "$stage" var 2>/dev/null && ok=$((ok+1))
+      rm -f "$tmp/${dig#sha256:}.tgz"
+    else
+      err "$repo: layer $n could not be fetched"
+      return 1
+    fi
+  done <<< "$layers"
+  rmdir "$tmp" 2>/dev/null
+  [ "$ok" -gt 0 ] || { err "$repo: no layer carried feed data"; return 1; }
+  return 0
+}
+
+# Move a staged tree into place. Separate from the download so the placement
+# rules can be tested without a network.
+gb_oci_place(){
+  local stage="$1" rel moved=0
+  # The release directory inside each image is NOT fixed and is not the same
+  # across repositories: the tests ship under var/lib/openvas/24.10/ while the
+  # gvmd data objects ship under var/lib/gvm/data-objects/gvmd/20.08/. It is
+  # discovered rather than assumed, so a Greenbone release bump does not
+  # silently produce an empty feed.
+  for rel in "$stage"/var/lib/openvas/*/vt-data/nasl; do
+    [ -d "$rel" ] || continue
+    mkdir -p /var/lib/openvas/plugins
+    cp -a "$rel/." /var/lib/openvas/plugins/ 2>/dev/null && moved=$((moved+1))
+    dim "  tests from $(basename "$(dirname "$(dirname "$rel")")")"
+  done
+  # Notus ships its advisories as a tarball inside the image.
+  if [ -f "$stage/var/lib/notus/notus-data.tar.gz" ]; then
+    mkdir -p /var/lib/notus
+    tar -xzf "$stage/var/lib/notus/notus-data.tar.gz" -C /var/lib/notus/ 2>/dev/null \
+      && moved=$((moved+1))
+  fi
+  for sub in data-objects cert-data scap-data report-formats; do
+    [ -d "$stage/var/lib/gvm/$sub" ] || continue
+    mkdir -p "/var/lib/gvm/$sub"
+    cp -a "$stage/var/lib/gvm/$sub/." "/var/lib/gvm/$sub/" 2>/dev/null \
+      && moved=$((moved+1))
+  done
+  # gvmd and the scanner run as the service account, not as root.
+  local g; g=$(gb_account 2>/dev/null || echo _gvm)
+  chown -R "$g:$g" /var/lib/openvas /var/lib/gvm /var/lib/notus 2>/dev/null || true
+  [ "$moved" -gt 0 ]
+}
+
+# The service account the Greenbone packages use. Debian and Ubuntu use _gvm.
+gb_account(){
+  local a
+  for a in _gvm gvm; do id -u "$a" >/dev/null 2>&1 && { printf '%s' "$a"; return 0; }; done
+  printf '_gvm'
+}
+
+# Fetch the whole feed over HTTPS. Returns 0 when at least the vulnerability
+# tests and Notus arrived, which is what an authenticated Linux scan needs.
+gb_feed_oci(){
+  local stage repo failed="" got=0
+  stage=$(mktemp -d) || return 1
+  local repos="$GB_REPOS"
+  [ "$GB_WITH_SCAP" = "1" ] && repos="$repos scap-data"
+  info "fetching the Greenbone feed over HTTPS from $GB_REGISTRY"
+  dim "resumable, digest-verified, and about 270 MiB without SCAP"
+  [ "$GB_WITH_SCAP" = "1" ] \
+    && dim "SCAP included, another 1.5 GiB: GB_WITH_SCAP=0 to skip it" \
+    || dim "SCAP skipped (1.5 GiB). gvmd runs without it; CVE references come"
+  [ "$GB_WITH_SCAP" = "1" ] || dim "from each test's own script_cve_id. GB_WITH_SCAP=1 to include it"
+  for repo in $repos; do
+    printf "    %-22s" "$repo"
+    if gb_oci_pull "$repo" "$stage" >/dev/null 2>&1; then
+      echo "${GRN}ok${RST}"; got=$((got+1))
+    else
+      echo "${YEL}failed${RST}"; failed="$failed $repo"
+    fi
+  done
+  if [ -n "$failed" ]; then
+    warn "not fetched:$failed"
+    dim "re-run to resume; partial blobs are discarded, completed ones are not"
+  fi
+  if [ "$got" -eq 0 ]; then rm -rf "$stage"; return 1; fi
+  if gb_oci_place "$stage"; then
+    local n=0
+    [ -d /var/lib/openvas/plugins ] \
+      && n=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l | tr -d ' ')
+    info "feed in place, $n test scripts"
+    rm -rf "$stage"
+    [ -n "$failed" ] && return 1
+    return 0
+  fi
+  err "nothing could be moved into place"
+  rm -rf "$stage"
+  return 1
+}
+
 FEED_SYNC="${FEED_SYNC:-1}"
 # gvmd-data is a few megabytes and carries the scan configs, report formats
 # and port lists, so it goes first: the operator sees "scan configs" stop
@@ -1452,6 +1655,10 @@ FEED_SYNC="${FEED_SYNC:-1}"
 # add CVE and advisory metadata only, so they come last and an interrupted
 # run still leaves a usable scanner behind.
 FEED_TYPES="${FEED_TYPES:-gvmd-data nvt scap cert}"
+# auto  : HTTPS from the registry, rsync only if that cannot complete
+# https : registry only, never rsync
+# rsync : the old behaviour
+FEED_TRANSPORT="${FEED_TRANSPORT:-auto}"
 greenbone_sync_feeds(){
   have greenbone-feed-sync || {
     warn "greenbone-feed-sync is not installed, the feed cannot be fetched"
@@ -1646,8 +1853,22 @@ cmd_setup_greenbone(){
   else dim "no _gvm or gvm account yet, skipping the database step"; fi
 
   # 3. feeds ----------------------------------------------------------
+  # HTTPS first. rsync to 873 is the transport that fails at client sites --
+  # it connects, transfers, and the filtering device kills it. The same data
+  # is published as OCI images over 443 in resumable, digest-verified chunks,
+  # so that is tried first and rsync is kept only as the fallback for a site
+  # where the registry is blocked but 873 is not.
   if [ "$FEED_SYNC" = "1" ] && [ "$(nvt_count)" -lt 10000 ]; then
-    greenbone_sync_feeds || true
+    if [ "$FEED_TRANSPORT" = "rsync" ]; then
+      greenbone_sync_feeds || true
+    elif gb_feed_oci; then
+      :
+    elif [ "$FEED_TRANSPORT" = "auto" ]; then
+      warn "the registry did not serve the whole feed, falling back to rsync"
+      dim "rsync is the transport that tends to fail here, so expect this to"
+      dim "be slower and to need re-running. FEED_TRANSPORT=https to not try it"
+      greenbone_sync_feeds || true
+    fi
   else
     printf "    %-24s%s\n" "NVT plugins" "$(nvt_count)"
     [ "$FEED_SYNC" = "1" ] || dim "feed sync skipped, FEED_SYNC=0"
