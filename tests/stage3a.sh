@@ -2,11 +2,11 @@
 #
 #  Stage 3A regression test
 #
-#  Slices the real Stage 3A out of KameKi.sh and runs it against a stubbed
+#  Slices the real Stage 3A out of kameki.sh and runs it against a stubbed
 #  kameki_gmp.py, so each way the stage can abandon is exercised as written
 #  rather than as retyped here. It needs no Greenbone, no root and no network.
 #
-#    ./tests/stage3a.sh            # tests ../KameKi.sh
+#    ./tests/stage3a.sh            # tests ../kameki.sh
 #    ./tests/stage3a.sh path.sh    # tests a specific file
 #
 #  What it guards against, all of which shipped at least once:
@@ -28,7 +28,15 @@
 #    test fails if that file still exists when the stage is done.
 #
 set -uo pipefail
-SRC="${1:-$(dirname "$0")/../KameKi.sh}"
+# The script has been both KameKi.sh and kameki.sh. Resolve whichever is
+# present, because a case-insensitive filesystem hides a wrong name and a
+# case-sensitive one fails on it.
+SRC="${1:-}"
+if [ -z "$SRC" ]; then
+  for _c in "$(dirname "$0")/../kameki.sh" "$(dirname "$0")/../KameKi.sh"; do
+    [ -f "$_c" ] && { SRC="$_c"; break; }
+  done
+fi
 [ -f "$SRC" ] || { echo "no such file: $SRC" >&2; exit 2; }
 
 SECRET='Sup3r-Secret-Dom@inPass'

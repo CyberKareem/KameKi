@@ -16,6 +16,14 @@ cd "$(dirname "$0")/.."
 # while these suites were being written.
 export PYTHONDONTWRITEBYTECODE=1
 
+# The script has been both KameKi.sh and kameki.sh. A case-insensitive
+# filesystem resolves either, so a wrong name here passes on macOS and fails
+# on the Linux box this actually ships to.
+SRC=""
+for _c in kameki.sh KameKi.sh; do [ -f "$_c" ] && { SRC="$_c"; break; }; done
+[ -n "$SRC" ] || { echo "cannot find kameki.sh next to tests/" >&2; exit 2; }
+echo "script under test: $SRC"
+
 PASS=0; FAIL=0; FAILED=""
 
 run(){ # $1 label, $2... command
@@ -34,7 +42,7 @@ echo "python: $(python3 --version 2>&1)"
 python3 -c 'import gvm, sys; sys.stdout.write("python-gvm: " + gvm.__version__ + "\n")' \
   2>/dev/null || echo "python-gvm: not installed (the live transport suite will skip)"
 
-run "bash syntax"               bash -n KameKi.sh
+run "bash syntax"               bash -n "$SRC"
 run "Stage 3A"                  bash tests/stage3a.sh
 run "bundle archive"            bash tests/bundle-archive.sh
 run "protocol targets"          bash tests/protocol-targets.sh

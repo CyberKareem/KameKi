@@ -2,7 +2,7 @@
 #
 #  Bundle archive regression test
 #
-#  Slices the real tar_in / tar_out out of KameKi.sh and drives them with and
+#  Slices the real tar_in / tar_out out of kameki.sh and drives them with and
 #  without zstd on PATH. Needs no root and no network.
 #
 #    ./tests/bundle-archive.sh
@@ -20,7 +20,15 @@
 #    extraction must still accept the older zstd bundles.
 #
 set -uo pipefail
-SRC="${1:-$(dirname "$0")/../KameKi.sh}"
+# The script has been both KameKi.sh and kameki.sh. Resolve whichever is
+# present, because a case-insensitive filesystem hides a wrong name and a
+# case-sensitive one fails on it.
+SRC="${1:-}"
+if [ -z "$SRC" ]; then
+  for _c in "$(dirname "$0")/../kameki.sh" "$(dirname "$0")/../KameKi.sh"; do
+    [ -f "$_c" ] && { SRC="$_c"; break; }
+  done
+fi
 [ -f "$SRC" ] || { echo "no such file: $SRC" >&2; exit 2; }
 
 PASS=0; FAIL=0

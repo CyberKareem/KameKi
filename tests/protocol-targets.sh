@@ -2,11 +2,11 @@
 #
 #  Protocol target list regression test
 #
-#  Lifts proto_list, net_open, nxcq and cnt out of KameKi.sh and exercises
+#  Lifts proto_list, net_open, nxcq and cnt out of kameki.sh and exercises
 #  them against the shape that caused a four-hour stall at a client: many
 #  live hosts, very few with any open port.
 #
-#    ./tests/protocol-targets.sh            # tests ../KameKi.sh
+#    ./tests/protocol-targets.sh            # tests ../kameki.sh
 #    ./tests/protocol-targets.sh path.sh
 #
 #  What it guards against, which shipped once:
@@ -18,7 +18,15 @@
 #    segment stalled the run for hours with nothing printed.
 #
 set -uo pipefail
-SRC="${1:-$(dirname "$0")/../KameKi.sh}"
+# The script has been both KameKi.sh and kameki.sh. Resolve whichever is
+# present, because a case-insensitive filesystem hides a wrong name and a
+# case-sensitive one fails on it.
+SRC="${1:-}"
+if [ -z "$SRC" ]; then
+  for _c in "$(dirname "$0")/../kameki.sh" "$(dirname "$0")/../KameKi.sh"; do
+    [ -f "$_c" ] && { SRC="$_c"; break; }
+  done
+fi
 [ -f "$SRC" ] || { echo "no such file: $SRC" >&2; exit 2; }
 
 HELPERS=$(mktemp); trap 'rm -f "$HELPERS"' EXIT
