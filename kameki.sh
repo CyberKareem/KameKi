@@ -2466,11 +2466,14 @@ if is_done nse; then info "skipped (resume)"; else
     nmap -sV -Pn -n -p "$ports" --script "$SCRIPTS" $SARGS --script-timeout 90s \
          --host-timeout "$HOST_TIMEOUT" "$ip" -oN "$out" >/dev/null 2>&1
     rc=$?
-    { [ "$rc" -eq 0 ] && [ -s "$out" ]; } && return 0
+    # The same test the counting uses: nmap's own footer, not the file's
+    # existence, because -oN creates the file before it scans anything.
+    { [ "$rc" -eq 0 ] && grep -qE '^#?[[:space:]]*Nmap done' "$out" 2>/dev/null; } \
+      && return 0
     printf '%s\trc=%s\n' "$ip" "$rc" >> "$RAW/nse-failed.txt"
     if nmap -sV -Pn -n -p "$ports" --script "$NSE_SET" --script-timeout 90s \
             --host-timeout "$HOST_TIMEOUT" "$ip" -oN "$out" >/dev/null 2>&1 \
-       && [ -s "$out" ]; then
+       && grep -qE '^#?[[:space:]]*Nmap done' "$out" 2>/dev/null; then
       printf '%s\n' "$ip" >> "$RAW/nse-degraded.txt"
     fi
     return 0
@@ -2485,7 +2488,7 @@ if is_done nse; then info "skipped (resume)"; else
   # Only mark the stage done if it produced something. Marking a stage that
   # failed on every host means a resumed run skips it and keeps the empty
   # output, which is how a crash becomes a permanent clean result.
-  if ls "$RAW"/nse/*.txt >/dev/null 2>&1; then mark_done nse
+  if grep -lqE '^#?[[:space:]]*Nmap done' "$RAW"/nse/*.txt >/dev/null 2>&1; then mark_done nse
   else warn "no host produced NSE output, not marking the stage done so a"
        dim "re-run will attempt it again rather than skipping it"; fi
 fi
@@ -2495,15 +2498,35 @@ grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/nse-all.txt" 2>/dev/null | sort -u > "$RAW/
 SVC_CVES=$(cnt "$RAW/cve-service.txt")
 NSE_FAILED=$(cnt "$RAW/nse-failed.txt")
 NSE_DEGRADED=$(cnt "$RAW/nse-degraded.txt")
-NSE_SCANNED=$(ls -1 "$RAW"/nse/*.txt 2>/dev/null | wc -l | tr -d ' ')
+# Count hosts nmap FINISHED, not files it created. -oN opens the file before
+# scanning and writes its "# Nmap done at ..." footer only on a clean exit, so
+# a segfault leaves a file behind that is not a scan. Counting files made 39
+# crashed hosts read as "hosts with output 39 of 39" and the disclaimer below
+# never fired -- the hole this check existed to close, still open.
+NSE_SCANNED=$(grep -lE '^#?[[:space:]]*Nmap done' "$RAW"/nse/*.txt 2>/dev/null \
+              | wc -l | tr -d ' ')
+NSE_PRESENT=$(ls -1 "$RAW"/nse/*.txt 2>/dev/null | wc -l | tr -d ' ')
+NSE_PARTIAL=$(( NSE_PRESENT - NSE_SCANNED )); [ "$NSE_PARTIAL" -lt 0 ] && NSE_PARTIAL=0
 info "NSE vulnerable states $NSE_HITS   service CVEs $SVC_CVES"
-info "hosts with output $NSE_SCANNED of $HOSTS_OPEN"
+info "hosts nmap finished $NSE_SCANNED of $HOSTS_OPEN"
+[ "$NSE_PARTIAL" -gt 0 ] && \
+  warn "$NSE_PARTIAL host file(s) exist but carry no completion marker, so nmap died mid-scan"
 if [ "$NSE_SCANNED" -eq 0 ] && [ "$HOSTS_OPEN" -gt 0 ]; then
-  err "Stage 3B produced no output for any host. The zeros above are not a"
+  err "Stage 3B finished on no host at all. The zeros above are not a"
   dim "result: nothing was assessed. Do not report them as an absence of"
-  dim "findings. See $RAW/nse-failed.txt for nmap's exit status per host."
+  dim "findings."
+  [ "$NSE_PARTIAL" -gt 0 ] && \
+    dim "$NSE_PARTIAL file(s) were created and then abandoned mid-scan."
   dim "nmap exiting 139 is a segmentation fault, usually the service-CVE"
   dim "script. Re-run with SVC_CVE_ENGINE=none to drop it."
+  if is_done nse; then
+    dim ""
+    dim "this stage was SKIPPED by RESUME=1 and its stored output is unusable."
+    dim "the marker is from the failed run. clear it and scan again:"
+    dim "  rm -f $RAW/.done-nse && sudo SVC_CVE_ENGINE=none RESUME=1 $0 run"
+  else
+    dim "exit status per host in $RAW/nse-failed.txt"
+  fi
 elif [ "$NSE_FAILED" -gt 0 ]; then
   warn "nmap failed on $NSE_FAILED of $HOSTS_OPEN host(s) with the full script set"
   [ "$NSE_DEGRADED" -gt 0 ] \
@@ -3391,9 +3414,10 @@ elif [ "${NSE_SCANNED:-0}" -eq 0 ] && [ "$HOSTS_OPEN" -gt 0 ]; then
   # Never "nothing found" when nothing was looked at. nmap segfaulted on
   # every host once and this section said no vulnerable state was reported,
   # which a reader would take as an assessment rather than a tool failure.
-  echo "**Not assessed.** nmap produced no output for any of the $HOSTS_OPEN"
-  echo "hosts with open ports, so this is a coverage gap and not a finding of"
-  echo "absence. Per-host exit status is in \`$RAW/nse-failed.txt\`; status 139"
+  echo "**Not assessed.** nmap did not complete on any of the $HOSTS_OPEN hosts"
+  echo "with open ports, so this is a coverage gap and not a finding of"
+  echo "absence. ${NSE_PARTIAL:-0} output file(s) were created and abandoned"
+  echo "mid-scan. Per-host exit status is in \`$RAW/nse-failed.txt\`; status 139"
   echo "is a segmentation fault. Re-run with \`SVC_CVE_ENGINE=none\` to drop the"
   echo "service-CVE script, which is the usual cause."
 else

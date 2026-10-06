@@ -473,6 +473,13 @@ service-CVE script (the usual culprit), what failed and what was degraded is
 counted and printed, the stage is not marked done if it produced nothing, and
 the report says **"Not assessed"** with the remedy instead of "nothing found".
 
+A host counts as scanned only if nmap wrote its own `# Nmap done` footer.
+`-oN` opens the output file *before* scanning, so a segfault leaves a file
+behind that is not a scan — counting files instead of completions let 39
+crashed hosts report as \`hosts with output 39 of 39\` with no warning at all.
+If a stale `.done-nse` marker from a failed run causes `RESUME=1` to skip the
+stage over unusable output, the run says so and prints the command to clear it.
+
 `SVC_CVE_ENGINE` is `auto` (prefer the local `vulscan`, since `vulners` calls
 out to its API and has crashed nmap on a whole estate), `vulscan`, `vulners`,
 or `none`. Neither is load-bearing for patch level — that comes from the MSRC
