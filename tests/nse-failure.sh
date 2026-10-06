@@ -66,9 +66,9 @@ P
     printf 'RAW=%q\nHOSTS_OPEN=3\n' "$w/raw"
     sed -n "${s},$((e-3))p" "$SRC"
     cat <<'T'
-printf 'RETURNED hits=%s cves=%s scanned=%s failed=%s degraded=%s done=%s\n' \
+printf 'RETURNED hits=%s cves=%s scanned=%s failed=%s degraded=%s done=%s partial=%s\n' \
   "$NSE_HITS" "$SVC_CVES" "$NSE_SCANNED" "$NSE_FAILED" "$NSE_DEGRADED" \
-  "$([ -f "$RAW/.done-nse" ] && echo yes || echo no)"
+  "$([ -f "$RAW/.done-nse" ] && echo yes || echo no)" "$NSE_PARTIAL"
 T
   } > "$w/run.sh"
 
@@ -84,17 +84,30 @@ case "$SCENARIO" in
   allcrash)
     # Segmentation fault, every time, whatever the script set.
     exit 139 ;;
+  crashleavesfile)
+    # What actually happened: -oN opens the file and writes its header, then
+    # nmap dies. A file exists, carries no completion footer, and is not a
+    # scan. Counting files rather than completions made 39 of these read as
+    # "hosts with output 39 of 39" and the disclaimer never fired.
+    printf '# Nmap 7.94 scan initiated Mon as: nmap -sV ...\n' > "$out"
+    exit 139 ;;
   cvecrash)
     # Crashes only with the service-CVE script, which is the real pattern.
     case "$scripts" in
       *vulners*|*vulscan*) exit 139 ;;
-      *) printf 'Nmap scan report\n|_smb-vuln-ms17-010: VULNERABLE\n' > "$out"; exit 0 ;;
+      *) printf '# Nmap 7.94 scan initiated Mon as: nmap -sV ...\nNmap scan report for h\n|_smb-vuln-ms17-010: VULNERABLE\n# Nmap done at Mon -- 1 IP address (1 host up) scanned in 2.0 seconds\n' > "$out"; exit 0 ;;
     esac ;;
   clean)
-    printf 'Nmap scan report\n|_ssl-poodle: VULNERABLE\nCVE-2014-3566\n' > "$out"
+    printf '# Nmap 7.94 scan initiated Mon as: nmap -sV ...\nNmap scan report for h\n|_ssl-poodle: VULNERABLE\nCVE-2014-3566\n# Nmap done at Mon -- 1 IP address (1 host up) scanned in 2.0 seconds\n' > "$out"
     exit 0 ;;
   empty)
     # Exits 0 but writes nothing, which also means nothing was assessed.
+    exit 0 ;;
+  truncated0)
+    # Exits 0 having written only the header -- a full disk, or output cut
+    # off mid-write. The exit status says fine and the file is non-empty, so
+    # only nmap's own completion footer distinguishes it from a real scan.
+    printf '# Nmap 7.94 scan initiated Mon as: nmap -sV ...\n' > "$out"
     exit 0 ;;
 esac
 exit 0
@@ -103,9 +116,18 @@ NMAP
   printf '10.0.0.1 445,139\n10.0.0.2 443\n10.0.0.3 3389\n' > "$w/raw/ports/map.txt"
 }
 
-run(){ # $1 scenario [$2 extra env] -> the RETURNED line, plus the transcript
+run(){ # $1 scenario [$2 extra env] [$3 "stale" to pre-seed a finished run]
   local w; w=$(mktemp -d)
   build "$1" "$w"
+  if [ "${3:-}" = stale ]; then
+    # The state the failed run actually left behind: the done marker from a
+    # scan that crashed, plus the files it opened and abandoned. is_done needs
+    # the marker to exist, so a fresh directory cannot exercise this at all.
+    touch "$w/raw/.done-nse"
+    for ip in 10.0.0.1 10.0.0.2 10.0.0.3; do
+      printf '# Nmap 7.94 scan initiated Mon as: nmap -sV ...\n' > "$w/raw/nse/$ip.txt"
+    done
+  fi
   local out
   # env, not a bare assignment prefix: the value has to survive into run.sh,
   # whose prelude reads SVC_CVE from the environment.
@@ -130,13 +152,13 @@ echo "Stage 3B failure reporting, file under test: $SRC"
 echo
 echo "a scan that works"
 check "three hosts scanned, a finding, no failures" "$(run clean)" \
-      "hits=3 cves=1 scanned=3 failed=0 degraded=0 done=yes"
+      "hits=3 cves=1 scanned=3 failed=0 degraded=0 done=yes partial=0"
 
 echo
 echo "nmap segfaults on every host"
 R=$(run allcrash)
 check "zero findings, zero scanned, three failures" "$R" \
-      "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no"
+      "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no partial=0"
 checkout "the zeros are explicitly disclaimed" "The zeros above are not a"
 checkout "and the segfault is named"           "segmentation fault"
 checkout "with the remedy"                     "SVC_CVE_ENGINE=none"
@@ -151,21 +173,43 @@ echo
 echo "nmap crashes only with the service-CVE script"
 R=$(run cvecrash)
 check "recovered without it: findings present, coverage degraded" "$R" \
-      "hits=3 cves=0 scanned=3 failed=3 degraded=3 done=yes"
+      "hits=3 cves=0 scanned=3 failed=3 degraded=3 done=yes partial=0"
 checkout "the degradation is reported" "recovered without the service-CVE script"
 checkout "and what was lost is named"  "no CVE mapping"
+
+echo
+echo "nmap creates the output file and THEN segfaults"
+check "a file that is not a scan does not count as one" "$(run crashleavesfile)" \
+      "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no partial=3"
+checkout "the abandoned files are named"      "carry no completion marker"
+checkout "the zeros are still disclaimed"     "The zeros above are not a"
+checknot "and no absence of findings claimed" "No NSE script reported"
+
+echo
+echo "a stale resume marker over unusable output says how to clear it"
+# This is the state the eight-hour run left: .done-nse written by a scan that
+# segfaulted on every host, so RESUME=1 skips the stage and keeps the empty
+# result for good.
+_=$(run crashleavesfile "RESUME=1" stale)
+checkout "names the resume marker"  "SKIPPED by RESUME=1"
+checkout "and gives the rm command" "rm -f"
 
 echo
 echo "nmap exits 0 but writes nothing"
 R=$(run empty)
 check "treated as a failure, not as a clean host" "$R" \
-      "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no"
+      "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no partial=0"
+
+echo
+echo "nmap exits 0 having written only a header"
+check "a truncated file is not a scan, whatever the exit status" \
+      "$(run truncated0)" "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no partial=3"
 
 echo
 echo "the service-CVE script can be turned off"
 R=$(run clean "SVC_CVE=none")
 check "still scans, still finds, no CVE script" "$R" \
-      "hits=3 cves=1 scanned=3 failed=0 degraded=0 done=yes"
+      "hits=3 cves=1 scanned=3 failed=0 degraded=0 done=yes partial=0"
 checkout "and says so" "service-CVE mapping disabled"
 
 echo
