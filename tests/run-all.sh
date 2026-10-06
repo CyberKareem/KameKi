@@ -44,6 +44,7 @@ python3 -c 'import gvm, sys; sys.stdout.write("python-gvm: " + gvm.__version__ +
 
 run "bash syntax"               bash -n "$SRC"
 run "Stage 3A"                  bash tests/stage3a.sh
+run "Stage 3B failure report"   bash tests/nse-failure.sh
 run "bundle archive"            bash tests/bundle-archive.sh
 run "GMP helper fetch"          bash tests/gmp-helper-fetch.sh
 run "win_facts registry read"   bash tests/win-facts.sh

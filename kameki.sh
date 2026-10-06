@@ -510,6 +510,15 @@ need_root(){ [ "$(id -u)" -eq 0 ] || { err "this needs root: sudo $0 $*"; exit 1
 #  own port.
 # ---------------------------------------------------------------------
 NXC_CAP="${NXC_CAP:-15m}"
+# Stage 10's tools had no bound at all, and testssl.sh with --sneaky is
+# deliberately slow. On a filtered network a TLS handshake hangs rather than
+# being refused, so one endpoint can hold a worker indefinitely: an eight hour
+# Stage 10 on 39 hosts, with nothing on screen, was the result. Every external
+# call in that stage is now capped, and anything cut short is recorded rather
+# than counted as a clean endpoint.
+TLS_CAP="${TLS_CAP:-10m}"      # per TLS endpoint
+WEB_CAP="${WEB_CAP:-30m}"      # the whole nuclei run
+SNMP_CAP="${SNMP_CAP:-10m}"    # the whole onesixtyone sweep
 nxcq(){
   if have timeout; then timeout -k 20 "$NXC_CAP" nxc "$@"; else nxc "$@"; fi
 }
@@ -2131,10 +2140,24 @@ fi
 # --- standalone engine components
 WES=""; for c in wes wes.py; do command -v "$c" >/dev/null 2>&1 && { WES="$c"; break; }; done
 SVC_CVE="none"
-[ -d /usr/share/nmap/scripts/vulscan ]     && SVC_CVE="vulscan"
-[ -f /usr/share/nmap/scripts/vulners.nse ] && SVC_CVE="vulners"
+# vulners reaches out to its API for every service and has segfaulted nmap on
+# a whole estate; vulscan is a local CSV lookup and cannot. Both are NVD
+# version matching and so share the same false-positive profile, which is why
+# neither is load-bearing for patch level -- that comes from the MSRC build
+# comparison. Reliability decides the default, so the local one wins.
+# SVC_CVE_ENGINE=vulners|vulscan|none overrides.
+SVC_CVE_ENGINE="${SVC_CVE_ENGINE:-auto}"
+case "$SVC_CVE_ENGINE" in
+  none)    SVC_CVE="none" ;;
+  vulners) [ -f /usr/share/nmap/scripts/vulners.nse ] && SVC_CVE="vulners" \
+             || { warn "SVC_CVE_ENGINE=vulners but vulners.nse is not installed"; } ;;
+  vulscan) [ -d /usr/share/nmap/scripts/vulscan ] && SVC_CVE="vulscan" \
+             || { warn "SVC_CVE_ENGINE=vulscan but vulscan is not installed"; } ;;
+  *)       [ -f /usr/share/nmap/scripts/vulners.nse ] && SVC_CVE="vulners"
+           [ -d /usr/share/nmap/scripts/vulscan ]     && SVC_CVE="vulscan" ;;
+esac
 SA_READY=0
-[ -n "$WES" ] && [ "$SVC_CVE" != "none" ] && SA_READY=1
+[ -n "$WES" ] && SA_READY=1
 printf "    %-14s %s\n" "standalone" "$([ $SA_READY -eq 1 ] && echo "ok  (wes: $WES, svc-cve: $SVC_CVE)" || echo "incomplete")"
 [ -z "$WES" ] && dim "wes missing -> pipx install wesng && wes --update"
 [ "$SVC_CVE" = "none" ] && dim "svc-cve missing -> sudo git clone https://github.com/scipag/vulscan /usr/share/nmap/scripts/vulscan && sudo nmap --script-updatedb"
@@ -2173,7 +2196,9 @@ case "$ENGINE" in
   both)       RUN_NVT=1; RUN_SA=1 ;;
 esac
 if [ "$RUN_SA" -eq 1 ] && [ "$SA_READY" -eq 0 ]; then
-  err "standalone engine selected but wes or the service CVE engine is missing"; exit 1
+  err "standalone engine selected but WES-NG is not installed"
+  dim "it is what maps a host's patch level to CVEs: pipx install wesng && wes --update"
+  exit 1
 fi
 info "engine: ${CYN}$ENGINE${RST}"
 
@@ -2420,10 +2445,36 @@ if [ "$RUN_SA" -eq 1 ]; then
 step "Stage 3B  NSE vulnerability scripts and service CVE mapping"
 if is_done nse; then info "skipped (resume)"; else
   dim "targeting only discovered ports, $JOBS parallel workers"
-  if [ "$SVC_CVE" = "vulners" ]; then SCRIPTS="$NSE_SET,vulners"; SARGS="--script-args mincvss=$MIN_CVSS"
-  else SCRIPTS="$NSE_SET,vulscan/vulscan.nse"; SARGS="--script-args vulscandb=cve.csv"; fi
-  nse_host(){ nmap -sV -Pn -n -p "$2" --script "$SCRIPTS" $SARGS --script-timeout 90s \
-                   --host-timeout "$HOST_TIMEOUT" "$1" -oN "$RAW/nse/$1.txt" >/dev/null 2>&1; }
+  case "$SVC_CVE" in
+    vulners) SCRIPTS="$NSE_SET,vulners"; SARGS="--script-args mincvss=$MIN_CVSS" ;;
+    vulscan) SCRIPTS="$NSE_SET,vulscan/vulscan.nse"; SARGS="--script-args vulscandb=cve.csv" ;;
+    *)       SCRIPTS="$NSE_SET"; SARGS=""
+             dim "service-CVE mapping disabled, vulnerability scripts only" ;;
+  esac
+  : > "$RAW/nse-failed.txt"; : > "$RAW/nse-degraded.txt"
+  # nmap's exit status was discarded, so a scan that crashed on every host
+  # still reported "NSE vulnerable states 0  service CVEs 0" -- a tool failure
+  # presented as a finding of absence. On a real engagement nmap segfaulted on
+  # all 39 hosts and the stage reported zero as though it had looked.
+  #
+  # The CVE-mapping script is the usual culprit: vulners reaches out to its
+  # API and has crashed whole estates. So a failed host is retried with just
+  # the vulnerability scripts, which are the part worth having, and both the
+  # failure and the reduced coverage are recorded.
+  nse_host(){
+    local ip="$1" ports="$2" out="$RAW/nse/$1.txt" rc
+    nmap -sV -Pn -n -p "$ports" --script "$SCRIPTS" $SARGS --script-timeout 90s \
+         --host-timeout "$HOST_TIMEOUT" "$ip" -oN "$out" >/dev/null 2>&1
+    rc=$?
+    { [ "$rc" -eq 0 ] && [ -s "$out" ]; } && return 0
+    printf '%s\trc=%s\n' "$ip" "$rc" >> "$RAW/nse-failed.txt"
+    if nmap -sV -Pn -n -p "$ports" --script "$NSE_SET" --script-timeout 90s \
+            --host-timeout "$HOST_TIMEOUT" "$ip" -oN "$out" >/dev/null 2>&1 \
+       && [ -s "$out" ]; then
+      printf '%s\n' "$ip" >> "$RAW/nse-degraded.txt"
+    fi
+    return 0
+  }
   N=0
   while read -r ip ports; do
     [ -z "$ip" ] && continue
@@ -2431,13 +2482,36 @@ if is_done nse; then info "skipped (resume)"; else
     pool nse_host "$ip" "$ports"
   done < "$RAW/ports/map.txt"
   finish; echo
-  mark_done nse
+  # Only mark the stage done if it produced something. Marking a stage that
+  # failed on every host means a resumed run skips it and keeps the empty
+  # output, which is how a crash becomes a permanent clean result.
+  if ls "$RAW"/nse/*.txt >/dev/null 2>&1; then mark_done nse
+  else warn "no host produced NSE output, not marking the stage done so a"
+       dim "re-run will attempt it again rather than skipping it"; fi
 fi
 cat "$RAW"/nse/*.txt > "$RAW/nse-all.txt" 2>/dev/null || : > "$RAW/nse-all.txt"
 NSE_HITS=$(gcntiE 'VULNERABLE' "$RAW/nse-all.txt")
 grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/nse-all.txt" 2>/dev/null | sort -u > "$RAW/cve-service.txt" || true
 SVC_CVES=$(cnt "$RAW/cve-service.txt")
+NSE_FAILED=$(cnt "$RAW/nse-failed.txt")
+NSE_DEGRADED=$(cnt "$RAW/nse-degraded.txt")
+NSE_SCANNED=$(ls -1 "$RAW"/nse/*.txt 2>/dev/null | wc -l | tr -d ' ')
 info "NSE vulnerable states $NSE_HITS   service CVEs $SVC_CVES"
+info "hosts with output $NSE_SCANNED of $HOSTS_OPEN"
+if [ "$NSE_SCANNED" -eq 0 ] && [ "$HOSTS_OPEN" -gt 0 ]; then
+  err "Stage 3B produced no output for any host. The zeros above are not a"
+  dim "result: nothing was assessed. Do not report them as an absence of"
+  dim "findings. See $RAW/nse-failed.txt for nmap's exit status per host."
+  dim "nmap exiting 139 is a segmentation fault, usually the service-CVE"
+  dim "script. Re-run with SVC_CVE_ENGINE=none to drop it."
+elif [ "$NSE_FAILED" -gt 0 ]; then
+  warn "nmap failed on $NSE_FAILED of $HOSTS_OPEN host(s) with the full script set"
+  [ "$NSE_DEGRADED" -gt 0 ] \
+    && dim "$NSE_DEGRADED recovered without the service-CVE script, so those" \
+    && dim "hosts have vulnerability-script coverage but no CVE mapping"
+  dim "exit status per host in $RAW/nse-failed.txt. 139 is a segmentation"
+  dim "fault; SVC_CVE_ENGINE=none drops the script that usually causes it"
+fi
 
 if [ "$HAVE_SPLOIT" -eq 1 ] && [ -s "$RAW/services.xml" ]; then
   searchsploit --nmap "$RAW/services.xml" > "$RAW/searchsploit.txt" 2>&1 || true
@@ -2789,12 +2863,36 @@ awk '{split($2,p,","); for(i in p) if(p[i]=="443"||p[i]=="8443"||p[i]=="636"||p[
 TLSN=$(cnt "$RAW/tls-endpoints.txt"); TLS_ISSUES=0
 if [ "$TLSN" -gt 0 ]; then
   if [ "$HAVE_TESTSSL" -eq 1 ]; then
-    tl(){ testssl.sh --quiet --color 0 --severity MEDIUM --sneaky "$1" > "$RAW/tls/$(echo "$1"|tr ':' '_').txt" 2>&1 || true; }
+    : > "$RAW/tls-timeout.txt"
+    tl(){
+      local e="$1" f rc
+      f="$RAW/tls/$(echo "$e" | tr ':' '_').txt"
+      if have timeout; then
+        timeout -k 20 "$TLS_CAP" testssl.sh --quiet --color 0 --severity MEDIUM \
+          --sneaky "$e" > "$f" 2>&1
+        rc=$?
+      else
+        testssl.sh --quiet --color 0 --severity MEDIUM --sneaky "$e" > "$f" 2>&1
+        rc=$?
+      fi
+      # 124 is timeout(1) killing it. An endpoint that was cut short has NOT
+      # been assessed, and must not be read as one with no issues.
+      [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] && printf '%s\n' "$e" >> "$RAW/tls-timeout.txt"
+      return 0
+    }
+    dim "each endpoint capped at $TLS_CAP"
     while read -r e; do [ -n "$e" ] && pool tl "$e"; done < "$RAW/tls-endpoints.txt"
     finish
     TLS_ISSUES=$(grep -rhE 'VULNERABLE|NOT ok' "$RAW/tls/" 2>/dev/null | wc -l)
+    TLS_CUT=$(cnt "$RAW/tls-timeout.txt")
+    if [ "$TLS_CUT" -gt 0 ]; then
+      warn "$TLS_CUT of $TLSN TLS endpoint(s) hit the ${TLS_CAP} cap and are not assessed"
+      dim "listed in $RAW/tls-timeout.txt. raise with TLS_CAP=20m, or the"
+      dim "endpoint is accepting connections and never completing a handshake"
+    fi
   else
     nmap -Pn -n --script ssl-enum-ciphers,ssl-cert,ssl-dh-params,sslv2,ssl-heartbleed,ssl-poodle,ssl-ccs-injection,rdp-enum-encryption \
+         --script-timeout 90s --host-timeout "$HOST_TIMEOUT" \
          -p 443,8443,636,993,995,3389 -iL "$RAW/live.txt" -oN "$RAW/tls/nmap-ssl.txt" >/dev/null 2>&1
     TLS_ISSUES=$(gcntE 'VULNERABLE|SSLv2|SSLv3|TLSv1\.0|weak' "$RAW/tls/nmap-ssl.txt")
   fi
@@ -2802,15 +2900,33 @@ fi
 SNMPN=0
 if [ "$HAVE_SNMP" -eq 1 ]; then
   printf 'public\nprivate\ncisco\nmanager\nadmin\ncommunity\nsecret\n' > "$RAW/snmp-strings.txt"
-  onesixtyone -c "$RAW/snmp-strings.txt" -i "$RAW/live.txt" > "$RAW/snmp.txt" 2>&1 || true
+  if have timeout; then
+    timeout -k 20 "$SNMP_CAP" onesixtyone -c "$RAW/snmp-strings.txt" \
+      -i "$RAW/live.txt" > "$RAW/snmp.txt" 2>&1 || true
+  else
+    onesixtyone -c "$RAW/snmp-strings.txt" -i "$RAW/live.txt" > "$RAW/snmp.txt" 2>&1 || true
+  fi
   SNMPN=$(gcnt '^\[' "$RAW/snmp.txt")
 fi
 awk '{split($2,p,","); for(i in p) if(p[i]=="80"||p[i]=="443"||p[i]=="8000"||p[i]=="8080"||p[i]=="8443"||p[i]=="9443"){print $1; break}}' \
     "$RAW/ports/map.txt" 2>/dev/null | sort -u > "$RAW/web-hosts.txt" || : > "$RAW/web-hosts.txt"
 WEBN=$(cnt "$RAW/web-hosts.txt"); NC=0; NH=0; NM=0; NL=0; : > "$RAW/cve-web.txt"
 if [ "$WEBN" -gt 0 ]; then
-  nuclei -l "$RAW/web-hosts.txt" -severity critical,high,medium,low -j -o "$RAW/nuclei.json" \
-         -rl 100 -c "$JOBS" -silent >/dev/null 2>&1 || true
+  WEB_CUT=0
+  if have timeout; then
+    timeout -k 20 "$WEB_CAP" nuclei -l "$RAW/web-hosts.txt" \
+      -severity critical,high,medium,low -j -o "$RAW/nuclei.json" \
+      -rl 100 -c "$JOBS" -timeout 10 -retries 1 -silent >/dev/null 2>&1
+    [ "$?" -eq 124 ] && WEB_CUT=1
+  else
+    nuclei -l "$RAW/web-hosts.txt" -severity critical,high,medium,low -j \
+      -o "$RAW/nuclei.json" -rl 100 -c "$JOBS" -timeout 10 -retries 1 \
+      -silent >/dev/null 2>&1 || true
+  fi
+  [ "$WEB_CUT" -eq 1 ] && {
+    warn "the web scan hit the ${WEB_CAP} cap, its findings are partial"
+    dim "raise with WEB_CAP=60m"
+  }
   if [ -s "$RAW/nuclei.json" ]; then
     NC=$(jq -r 'select(.info.severity=="critical")|.host' "$RAW/nuclei.json" 2>/dev/null | wc -l)
     NH=$(jq -r 'select(.info.severity=="high")|.host'     "$RAW/nuclei.json" 2>/dev/null | wc -l)
@@ -3271,7 +3387,19 @@ else echo "_No data. No hosts authenticated, or remote command execution was blo
 echo
 echo "## 3C. NSE Vulnerability Findings"; echo
 if [ "$NSE_HITS" -gt 0 ]; then echo '```'; grep -B6 'VULNERABLE' "$RAW/nse-all.txt" 2>/dev/null | head -150; echo '```'
-else echo "_No NSE script reported a vulnerable state._"; fi
+elif [ "${NSE_SCANNED:-0}" -eq 0 ] && [ "$HOSTS_OPEN" -gt 0 ]; then
+  # Never "nothing found" when nothing was looked at. nmap segfaulted on
+  # every host once and this section said no vulnerable state was reported,
+  # which a reader would take as an assessment rather than a tool failure.
+  echo "**Not assessed.** nmap produced no output for any of the $HOSTS_OPEN"
+  echo "hosts with open ports, so this is a coverage gap and not a finding of"
+  echo "absence. Per-host exit status is in \`$RAW/nse-failed.txt\`; status 139"
+  echo "is a segmentation fault. Re-run with \`SVC_CVE_ENGINE=none\` to drop the"
+  echo "service-CVE script, which is the usual cause."
+else
+  echo "_No NSE script reported a vulnerable state on the ${NSE_SCANNED:-0} host(s) assessed._"
+  [ "${NSE_FAILED:-0}" -gt 0 ] && { echo; echo "${NSE_FAILED} host(s) failed the full script set; see \`$RAW/nse-failed.txt\`."; }
+fi
 echo
 if [ "$SPLOIT" -gt 0 ]; then echo "### Public exploits"; echo; echo '```'; head -60 "$RAW/searchsploit.txt"; echo '```'; echo; fi
 fi
@@ -3334,6 +3462,17 @@ echo "MSSQL authenticated: **$MSSQL_OK**  "
 echo "WinRM authenticated: **$WINRM_OK**  "
 echo "SNMP default strings: **$SNMPN**"; echo
 [ "$SNMPN" -gt 0 ] && { echo '```'; cat "$RAW/snmp.txt"; echo '```'; echo; }
+
+if [ "${NSE_FAILED:-0}" -gt 0 ] || [ "${TLS_CUT:-0}" -gt 0 ]; then
+  echo "### Tooling that did not complete"; echo
+  [ "${NSE_FAILED:-0}" -gt 0 ] && {
+    echo "nmap failed on ${NSE_FAILED} of $HOSTS_OPEN host(s) with the full"
+    echo "script set. ${NSE_DEGRADED:-0} recovered with the vulnerability"
+    echo "scripts alone, so those hosts have no service-CVE mapping."; echo; }
+  [ "${TLS_CUT:-0}" -gt 0 ] && {
+    echo "${TLS_CUT} TLS endpoint(s) exceeded the ${TLS_CAP} cap and were not"
+    echo "assessed; they are listed in \`$RAW/tls-timeout.txt\`."; echo; }
+fi
 
 echo "---"; echo
 echo "## 10B. Vulnerability Data Provenance"; echo
