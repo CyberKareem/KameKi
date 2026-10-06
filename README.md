@@ -441,6 +441,43 @@ security team the dates. Run `cleanup` before you leave.
 
 ---
 
+## Time limits
+
+Every external call is bounded, because each one has hung a live engagement at
+least once:
+
+| variable | default | bounds |
+|---|---|---|
+| `NXC_CAP` | 15m | each NetExec call |
+| `TLS_CAP` | 10m | each TLS endpoint |
+| `WEB_CAP` | 30m | the whole nuclei run |
+| `SNMP_CAP` | 10m | the onesixtyone sweep |
+| `NVT_MAX_MIN` | 0 (unlimited) | the Greenbone poll |
+| `HOST_TIMEOUT` | profile | each nmap host |
+
+`testssl.sh --sneaky` had no bound at all, and on a filtered network a TLS
+handshake hangs rather than being refused — one endpoint held a worker for
+eight hours with nothing on screen. Anything cut short by a cap is **recorded
+and reported as unassessed**, never counted as an endpoint with no issues.
+
+## When a tool fails
+
+A tool that crashed is not a finding of absence. nmap segfaulted on all 39
+hosts of one estate and the stage printed `NSE vulnerable states 0  service
+CVEs 0`, which the report rendered as *"No NSE script reported a vulnerable
+state"* — a scanner failure presented as a clean result, and the stage was
+still marked done so a resume would keep it.
+
+Now: exit status is checked per host, a failed host is retried without the
+service-CVE script (the usual culprit), what failed and what was degraded is
+counted and printed, the stage is not marked done if it produced nothing, and
+the report says **"Not assessed"** with the remedy instead of "nothing found".
+
+`SVC_CVE_ENGINE` is `auto` (prefer the local `vulscan`, since `vulners` calls
+out to its API and has crashed nmap on a whole estate), `vulscan`, `vulners`,
+or `none`. Neither is load-bearing for patch level — that comes from the MSRC
+build comparison — so reliability decides the default.
+
 ## The Greenbone feed, over HTTPS
 
 The community feed is published as container images with the data baked in,
@@ -548,12 +585,13 @@ so the evidence is printed rather than asserted.
 ./tests/run-all.sh
 ```
 
-Twelve suites, no Greenbone, no root and no network. Each one slices the real
+Thirteen suites, no Greenbone, no root and no network. Each one slices the real
 functions out of `kameki.sh` with `sed` and drives them against stubs, so what
 is tested is what ships rather than a copy that drifts.
 
 | Suite | Covers |
 |---|---|
+| `tests/nse-failure.sh` | that a crashed scan is reported as a coverage gap, never as zero findings: nmap segfaulting on every host, crashing only with the service-CVE script, and exiting 0 while writing nothing |
 | `tests/stage3a.sh` | the NVT stage: every way it can abandon, and that the scan credential travels by path, never in `argv`, and is deleted afterwards |
 | `tests/gmp-client.py` | `kameki_gmp.py` against a stubbed gvmd: the one-line XML, the `<owner><name>` trap, overlapping config names, the report blob's real position |
 | `tests/gmp-live.py` | the same client against a fake gvmd on a real Unix socket, using the real `python-gvm`, so a library change is noticed |
