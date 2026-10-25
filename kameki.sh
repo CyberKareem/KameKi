@@ -2,7 +2,7 @@
 #
 #  kameki.sh  -  Authenticated vulnerability assessment, self provisioning
 #
-#  Subcommands
+#  Subcommands:
 #    install            install every dependency (needs internet)
 #    install --bundle F install from an offline bundle (no internet)
 #    install --no-nvt   install without the Greenbone/NVT backend, the
