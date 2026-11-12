@@ -89,8 +89,8 @@ sudo ./kameki.sh install
 ```
 
 That installs nmap, NetExec, nuclei and its templates, WES-NG with
-definitions, vulscan, testssl.sh, searchsploit, onesixtyone, the KEV
-catalogue and the Microsoft patch data. One command, no manual steps.
+definitions, testssl.sh, onesixtyone, the KEV catalogue and the Microsoft
+patch data. One command, no manual steps.
 
 `kameki_msrc.py` must stay next to `kameki.sh`; the clone puts it there and
 `bundle` carries it along. `./kameki.sh doctor` says so plainly when it is
@@ -122,7 +122,7 @@ to open the bundle to reach it. `install --bundle` still accepts the older
 ```
 
 Produces `kameki-bundle-<date>.tar.gz`, a few hundred MB. It contains the
-python wheels, system packages, the nuclei binary and templates, vulscan,
+python wheels, system packages, the nuclei binary and templates,
 testssl.sh, WES-NG definitions, the KEV catalogue and the compiled Microsoft
 patch table.
 
@@ -201,7 +201,6 @@ host that refuses command execution.
 
 ```bash
 PROFILE=deep JOBS=24 ./kameki.sh run    # all 65535 ports, more workers
-SVC_CVE_ENGINE=none ./kameki.sh run     # skip service-version CVE mapping
 RESUME=1 ./kameki.sh run                # continue after an interruption
 ```
 
@@ -259,12 +258,10 @@ Environment variables, all optional.
 | `PROFILE` | `standard` | `quick` (top 1000 ports), `standard` (top 5000), `deep` (all 65535) |
 | `JOBS` | `16` | parallel workers |
 | `NXC_THREADS` | `32` | NetExec internal threads |
-| `MIN_CVSS` | `4.0` | service CVE reporting floor |
 | `NMAP_RATE` | `2000` | minimum packet rate |
 | `HOST_TIMEOUT` | `20m` | per host nmap timeout |
 | `DEPTH_WARN` | `3` | authenticated findings per host below which the self check warns |
 | `RESUME` | `0` | set to `1` to skip completed stages |
-| `SVC_CVE_ENGINE` | `auto` | `auto`, `vulscan`, `vulners`, `none` |
 | `MSRC_MONTHS` | `6` | months of Microsoft patch data to compile |
 
 ---
@@ -456,10 +453,11 @@ CVEs 0`, which the report rendered as *"No NSE script reported a vulnerable
 state"* — a scanner failure presented as a clean result, and the stage was
 still marked done so a resume would keep it.
 
-Now: exit status is checked per host, a failed host is retried without the
-service-CVE script (the usual culprit), what failed and what was degraded is
-counted and printed, the stage is not marked done if it produced nothing, and
-the report says **"Not assessed"** with the remedy instead of "nothing found".
+Now: exit status is checked per host, failures are counted and printed, the
+stage is not marked done if it produced nothing, and the report says
+**"Not assessed"** with the remedy instead of "nothing found". The script
+that caused those segfaults — `vulners`, which calls out to its API for every
+service — has since been removed outright, along with `vulscan`; see below.
 
 A host counts as scanned only if nmap wrote its own `# Nmap done` footer.
 `-oN` opens the output file *before* scanning, so a segfault leaves a file
@@ -468,10 +466,30 @@ crashed hosts report as \`hosts with output 39 of 39\` with no warning at all.
 If a stale `.done-nse` marker from a failed run causes `RESUME=1` to skip the
 stage over unusable output, the run says so and prints the command to clear it.
 
-`SVC_CVE_ENGINE` is `auto` (prefer the local `vulscan`, since `vulners` calls
-out to its API and has crashed nmap on a whole estate), `vulscan`, `vulners`,
-or `none`. Neither is load-bearing for patch level — that comes from the MSRC
-build comparison — so reliability decides the default.
+**Service-version CVE mapping is gone.** `vulners` and `vulscan` both match
+NVD records against a banner version string, which is the same inference, and
+the same false-positive profile, as the commercial scanners this tool exists
+to check. Neither was load-bearing: Windows patch level comes from the MSRC
+build comparison. Against that, `vulners` segfaulted nmap on all 39 hosts of
+one estate, and across every kameKi run whose evidence survives
+`cve-service.txt` was **empty** — the mechanism produced no finding at all.
+It and the crash-and-retry machinery built around it have been deleted.
+
+`cve-service.txt` still exists and is still filled, by collecting the CVE ids
+that ordinary NSE scripts name in their own output. Those come with a script's
+own evidence rather than from a version guess.
+
+**`searchsploit` is gone** for the same reason: it matches exploit titles
+against banner strings, `exploitdb` is a large apt package that a filtering
+mirror would not serve on a live engagement, and no finding in either recent
+report rested on it.
+
+**`nuclei` and WES-NG are no longer required.** A missing nuclei means the web
+assessment did not run, which is reported as a coverage gap rather than as an
+absence of web findings. A missing WES-NG means Windows patch level rests on
+the MSRC comparison alone, which is the authoritative source anyway. Neither
+aborts the run — exiting over a missing second opinion is how a usable
+assessment gets refused.
 
 ---
 
@@ -564,10 +582,10 @@ Linux. Tested on Ubuntu and Debian.
 
 Core: `nmap`, `nxc` (NetExec), `python3`, `jq`, `awk`.
 
-Also used: `nuclei` (web), `wes` (WES-NG, Windows patch inference),
-`vulscan` or `vulners` (service-version CVE mapping), `curl`.
-
-Optional: `testssl.sh`, `searchsploit`, `onesixtyone`.
+Optional, each reported as a coverage gap when absent rather than aborting
+the run: `nuclei` (web applications), `wes` (WES-NG, a second opinion on
+Windows patch level), `testssl.sh` (TLS depth, nmap's ssl scripts are the
+fallback), `onesixtyone` (SNMP community strings), `curl`.
 
 `kameki_msrc.py` from this repository has to sit beside `kameki.sh`. It is
 stdlib-only — no third-party library, which is the point: on a client box

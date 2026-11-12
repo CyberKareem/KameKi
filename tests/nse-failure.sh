@@ -24,6 +24,10 @@
 #    a filtering device voided a port scan and the dropped packets read as
 #    clean. Zero must never be printed as a result when nothing was assessed.
 #
+#    The service-CVE script that caused those segfaults has since been
+#    removed, and so has the retry that worked around it. There is one
+#    script set now: a host completes, or it is a recorded coverage gap.
+#
 set -uo pipefail
 SRC="${1:-}"
 if [ -z "$SRC" ]; then
@@ -60,14 +64,14 @@ pool(){ "$@"; }
 finish(){ :; }
 is_done(){ [ "${RESUME:-0}" = "1" ] && [ -f "$RAW/.done-$1" ]; }
 mark_done(){ touch "$RAW/.done-$1"; }
-RUN_SA=1; JOBS=4; HOST_TIMEOUT=5m; MIN_CVSS=0
-NSE_SET="vuln,safe"; SVC_CVE="${SVC_CVE:-vulners}"; HAVE_SPLOIT=0
+RUN_SA=1; JOBS=4; HOST_TIMEOUT=5m
+NSE_SET="vuln,safe"
 P
     printf 'RAW=%q\nHOSTS_OPEN=3\n' "$w/raw"
     sed -n "${s},$((e-3))p" "$SRC"
     cat <<'T'
-printf 'RETURNED hits=%s cves=%s scanned=%s failed=%s degraded=%s done=%s partial=%s\n' \
-  "$NSE_HITS" "$SVC_CVES" "$NSE_SCANNED" "$NSE_FAILED" "$NSE_DEGRADED" \
+printf 'RETURNED hits=%s cves=%s scanned=%s failed=%s done=%s partial=%s\n' \
+  "$NSE_HITS" "$SVC_CVES" "$NSE_SCANNED" "$NSE_FAILED" \
   "$([ -f "$RAW/.done-nse" ] && echo yes || echo no)" "$NSE_PARTIAL"
 T
   } > "$w/run.sh"
@@ -75,9 +79,9 @@ T
   # A stubbed nmap. SCENARIO decides how it behaves.
   cat > "$w/bin/nmap" <<'NMAP'
 #!/usr/bin/env bash
-out=""; scripts=""
+out=""
 while [ $# -gt 0 ]; do
-  case "$1" in -oN) out="$2"; shift ;; --script) scripts="$2"; shift ;; esac
+  case "$1" in -oN) out="$2"; shift ;; esac
   shift
 done
 case "$SCENARIO" in
@@ -91,12 +95,6 @@ case "$SCENARIO" in
     # "hosts with output 39 of 39" and the disclaimer never fired.
     printf '# Nmap 7.94 scan initiated Mon as: nmap -sV ...\n' > "$out"
     exit 139 ;;
-  cvecrash)
-    # Crashes only with the service-CVE script, which is the real pattern.
-    case "$scripts" in
-      *vulners*|*vulscan*) exit 139 ;;
-      *) printf '# Nmap 7.94 scan initiated Mon as: nmap -sV ...\nNmap scan report for h\n|_smb-vuln-ms17-010: VULNERABLE\n# Nmap done at Mon -- 1 IP address (1 host up) scanned in 2.0 seconds\n' > "$out"; exit 0 ;;
-    esac ;;
   clean)
     printf '# Nmap 7.94 scan initiated Mon as: nmap -sV ...\nNmap scan report for h\n|_ssl-poodle: VULNERABLE\nCVE-2014-3566\n# Nmap done at Mon -- 1 IP address (1 host up) scanned in 2.0 seconds\n' > "$out"
     exit 0 ;;
@@ -152,16 +150,16 @@ echo "Stage 3 failure reporting, file under test: $SRC"
 echo
 echo "a scan that works"
 check "three hosts scanned, a finding, no failures" "$(run clean)" \
-      "hits=3 cves=1 scanned=3 failed=0 degraded=0 done=yes partial=0"
+      "hits=3 cves=1 scanned=3 failed=0 done=yes partial=0"
 
 echo
 echo "nmap segfaults on every host"
 R=$(run allcrash)
 check "zero findings, zero scanned, three failures" "$R" \
-      "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no partial=0"
+      "hits=0 cves=0 scanned=0 failed=3 done=no partial=0"
 checkout "the zeros are explicitly disclaimed" "The zeros above are not a"
 checkout "and the segfault is named"           "segmentation fault"
-checkout "with the remedy"                     "SVC_CVE_ENGINE=none"
+checkout "with the remedy"                     "PROFILE=quick"
 # The whole point. Without this the report says "no vulnerable state found".
 checknot "it does NOT claim an absence of findings" "No NSE script reported"
 
@@ -170,17 +168,9 @@ echo "and the stage is NOT marked done, so a re-run tries again"
 checkout "says why it is not marking it done" "not marking the stage done"
 
 echo
-echo "nmap crashes only with the service-CVE script"
-R=$(run cvecrash)
-check "recovered without it: findings present, coverage degraded" "$R" \
-      "hits=3 cves=0 scanned=3 failed=3 degraded=3 done=yes partial=0"
-checkout "the degradation is reported" "recovered without the service-CVE script"
-checkout "and what was lost is named"  "no CVE mapping"
-
-echo
 echo "nmap creates the output file and THEN segfaults"
 check "a file that is not a scan does not count as one" "$(run crashleavesfile)" \
-      "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no partial=3"
+      "hits=0 cves=0 scanned=0 failed=3 done=no partial=3"
 checkout "the abandoned files are named"      "carry no completion marker"
 checkout "the zeros are still disclaimed"     "The zeros above are not a"
 checknot "and no absence of findings claimed" "No NSE script reported"
@@ -198,19 +188,12 @@ echo
 echo "nmap exits 0 but writes nothing"
 R=$(run empty)
 check "treated as a failure, not as a clean host" "$R" \
-      "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no partial=0"
+      "hits=0 cves=0 scanned=0 failed=3 done=no partial=0"
 
 echo
 echo "nmap exits 0 having written only a header"
 check "a truncated file is not a scan, whatever the exit status" \
-      "$(run truncated0)" "hits=0 cves=0 scanned=0 failed=3 degraded=0 done=no partial=3"
-
-echo
-echo "the service-CVE script can be turned off"
-R=$(run clean "SVC_CVE=none")
-check "still scans, still finds, no CVE script" "$R" \
-      "hits=3 cves=1 scanned=3 failed=0 degraded=0 done=yes partial=0"
-checkout "and says so" "service-CVE mapping disabled"
+      "$(run truncated0)" "hits=0 cves=0 scanned=0 failed=3 done=no partial=3"
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
