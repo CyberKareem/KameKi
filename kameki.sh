@@ -59,7 +59,6 @@ T0=$(date +%s)
 PROFILE="${PROFILE:-standard}"
 JOBS="${JOBS:-16}"
 NXC_THREADS="${NXC_THREADS:-32}"
-MIN_CVSS="${MIN_CVSS:-4.0}"
 NMAP_RATE="${NMAP_RATE:-2000}"
 HOST_TIMEOUT="${HOST_TIMEOUT:-20m}"
 RESUME="${RESUME:-0}"
@@ -101,7 +100,6 @@ LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
 
 NUCLEI_VER="${NUCLEI_VER:-3.4.10}"
 NUCLEI_URL="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VER}/nuclei_${NUCLEI_VER}_linux_amd64.zip"
-VULSCAN_REPO="https://github.com/scipag/vulscan"
 TESTSSL_REPO="https://github.com/drwetter/testssl.sh"
 NETEXEC_REPO="git+https://github.com/Pennyw0rth/NetExec"
 
@@ -536,7 +534,6 @@ cmd_install(){
     fi
     [ -f "$B/nuclei" ]        && { install -m755 "$B/nuclei" /usr/local/bin/nuclei; info "nuclei installed"; }
     [ -d "$B/nuclei-templates" ] && { mkdir -p /root/.local/nuclei-templates; cp -r "$B/nuclei-templates/." /root/.local/nuclei-templates/; info "nuclei templates installed"; }
-    [ -d "$B/vulscan" ]      && { cp -r "$B/vulscan" /usr/share/nmap/scripts/; nmap --script-updatedb >/dev/null 2>&1; info "vulscan installed"; }
     [ -d "$B/testssl.sh" ]   && { cp -r "$B/testssl.sh" /opt/; ln -sf /opt/testssl.sh/testssl.sh /usr/local/bin/testssl.sh; info "testssl.sh installed"; }
     [ -f "$B/definitions.zip" ] && { cp "$B/definitions.zip" "${SUDO_USER:+/home/$SUDO_USER/}definitions.zip" 2>/dev/null || cp "$B/definitions.zip" /root/; info "WES-NG definitions installed"; }
     [ -f "$B/kev.json" ]     && { cp "$B/kev.json" "${SUDO_USER:+/home/$SUDO_USER/}.kameki-kev.json" 2>/dev/null || cp "$B/kev.json" /root/.kameki-kev.json; info "KEV catalogue installed"; }
@@ -576,7 +573,7 @@ cmd_install(){
   # the old code warned once and moved on, so a missing package was only
   # discovered later by doctor. Retry individually and name what is missing.
   local -a SYS_PKGS=(nmap jq gawk curl git zstd unzip python3-pip pipx
-                     exploitdb onesixtyone poppler-utils)
+                     onesixtyone poppler-utils)
   local MISSING_PKGS="" pkg
   if ! apt-get install -y -qq "${SYS_PKGS[@]}" >/dev/null 2>&1; then
     warn "bulk package install failed, retrying one at a time"
@@ -611,13 +608,6 @@ cmd_install(){
     fi
     rm -rf "$T"
   fi
-  if [ ! -d /usr/share/nmap/scripts/vulscan ]; then
-    info "installing vulscan offline CVE database"
-    git clone -q --depth 1 "$VULSCAN_REPO" /usr/share/nmap/scripts/vulscan >/dev/null 2>&1 \
-      && nmap --script-updatedb >/dev/null 2>&1 && info "vulscan installed" \
-      || warn "vulscan clone failed"
-  fi
-
   if [ ! -d /opt/testssl.sh ]; then
     info "installing testssl.sh"
     git clone -q --depth 1 "$TESTSSL_REPO" /opt/testssl.sh >/dev/null 2>&1 \
@@ -654,7 +644,7 @@ cmd_bundle(){
   info "collecting system packages"
   mkdir -p "$B/deb"
   ( cd "$B/deb" && apt-get download nmap jq gawk curl git zstd unzip \
-      exploitdb onesixtyone poppler-utils >/dev/null 2>&1 ) || warn "deb download incomplete"
+      onesixtyone poppler-utils >/dev/null 2>&1 ) || warn "deb download incomplete"
 
   if have nuclei; then
     info "including nuclei binary and templates"
@@ -663,7 +653,6 @@ cmd_bundle(){
       [ -d "$d" ] && { cp -r "$d" "$B/nuclei-templates"; break; }
     done
   fi
-  [ -d /usr/share/nmap/scripts/vulscan ] && { info "including vulscan"; cp -r /usr/share/nmap/scripts/vulscan "$B/"; }
   [ -d /opt/testssl.sh ] && { info "including testssl.sh"; cp -r /opt/testssl.sh "$B/"; }
   for f in definitions.zip "$HOME/definitions.zip"; do
     [ -f "$f" ] && { info "including WES-NG definitions"; cp "$f" "$B/definitions.zip"; break; }
@@ -715,12 +704,11 @@ cmd_doctor(){
   done
   local WES=""; for c in wes wes.py; do have "$c" && { WES="$c"; break; }; done
   [ -n "$WES" ] && printf "    %-14s ok (%s)\n" "wes" "$WES" || { printf "    %-14s ${RED}missing${RST}\n" "wes"; ISSUES=$((ISSUES+1)); }
-  for t in testssl.sh searchsploit onesixtyone; do
+  for t in testssl.sh onesixtyone; do
     have "$t" && printf "    %-14s ok\n" "$t" || printf "    %-14s ${YEL}absent (optional)${RST}\n" "$t"
   done
   echo
   echo "  data"
-  [ -d /usr/share/nmap/scripts/vulscan ] && printf "    %-14s ok\n" "vulscan" || printf "    %-14s ${YEL}absent${RST}\n" "vulscan"
   { [ -f definitions.zip ] || [ -f "$HOME/definitions.zip" ]; } && printf "    %-14s ok\n" "wes defs" || printf "    %-14s ${YEL}run: wes --update${RST}\n" "wes defs"
   [ -f "$HOME/.kameki-kev.json" ] && printf "    %-14s ok\n" "KEV" || printf "    %-14s ${YEL}absent${RST}\n" "KEV"
   if msrc_ready; then
@@ -919,7 +907,7 @@ cmd_cleanup(){
     read -rp "    proceed? [y/N] " A
     if [ "${A,,}" = "y" ]; then
       need_root cleanup --purge
-      rm -rf /usr/share/nmap/scripts/vulscan /opt/testssl.sh /usr/local/bin/nuclei /usr/local/bin/testssl.sh
+      rm -rf /opt/testssl.sh /usr/local/bin/nuclei /usr/local/bin/testssl.sh
       su "${SUDO_USER:-root}" -c "pipx uninstall netexec; pipx uninstall wesng" >/dev/null 2>&1
       info "tooling removed"
     fi
@@ -958,13 +946,6 @@ cmd_update(){
     printf "    %-22s" "nuclei templates"
     if nuclei -update-templates -silent >/dev/null 2>&1; then echo "${GRN}ok${RST}"
     else echo "${YEL}failed${RST}"; FAILED="$FAILED nuclei-templates"; fi
-  fi
-
-  if [ -d /usr/share/nmap/scripts/vulscan/.git ]; then
-    printf "    %-22s" "vulscan CVE database"
-    if ( cd /usr/share/nmap/scripts/vulscan && git pull -q ) >/dev/null 2>&1 \
-       && nmap --script-updatedb >/dev/null 2>&1; then echo "${GRN}ok${RST}"
-    else echo "${YEL}failed${RST}"; FAILED="$FAILED vulscan"; fi
   fi
 
   if [ -d /opt/testssl.sh/.git ]; then
@@ -1054,50 +1035,28 @@ chk(){ if command -v "$1" >/dev/null 2>&1; then printf "    %-14s ok\n" "$1"; re
 
 chk nmap   "sudo apt install nmap -y"                               || MISS=1
 chk nxc    "pipx install git+https://github.com/Pennyw0rth/NetExec"  || MISS=1
-chk nuclei "github.com/projectdiscovery/nuclei/releases"             || MISS=1
 chk jq     "sudo apt install jq -y"                                  || MISS=1
+chk python3 "sudo apt install python3 -y"                            || MISS=1
 [ "$MISS" -eq 1 ] && { err "Install the core tools above, then re-run."; exit 1; }
 
-# --- assessment components
+# --- optional components
+# None of these stop a run. The MSRC build comparison is the authoritative
+# source for Windows patch level and needs only python3 and a registry read,
+# so WES-NG is a second opinion rather than a requirement -- and exiting 1
+# over a missing second opinion is how a usable assessment gets refused.
 WES=""; for c in wes wes.py; do command -v "$c" >/dev/null 2>&1 && { WES="$c"; break; }; done
-SVC_CVE="none"
-# vulners reaches out to its API for every service and has segfaulted nmap on
-# a whole estate; vulscan is a local CSV lookup and cannot. Both are NVD
-# version matching and so share the same false-positive profile, which is why
-# neither is load-bearing for patch level -- that comes from the MSRC build
-# comparison. Reliability decides the default, so the local one wins.
-# SVC_CVE_ENGINE=vulners|vulscan|none overrides.
-SVC_CVE_ENGINE="${SVC_CVE_ENGINE:-auto}"
-case "$SVC_CVE_ENGINE" in
-  none)    SVC_CVE="none" ;;
-  vulners) [ -f /usr/share/nmap/scripts/vulners.nse ] && SVC_CVE="vulners" \
-             || { warn "SVC_CVE_ENGINE=vulners but vulners.nse is not installed"; } ;;
-  vulscan) [ -d /usr/share/nmap/scripts/vulscan ] && SVC_CVE="vulscan" \
-             || { warn "SVC_CVE_ENGINE=vulscan but vulscan is not installed"; } ;;
-  *)       [ -f /usr/share/nmap/scripts/vulners.nse ] && SVC_CVE="vulners"
-           [ -d /usr/share/nmap/scripts/vulscan ]     && SVC_CVE="vulscan" ;;
-esac
-SA_READY=0
-[ -n "$WES" ] && SA_READY=1
-printf "    %-14s %s\n" "patch engine" "$([ $SA_READY -eq 1 ] && echo "ok  (wes: $WES, svc-cve: $SVC_CVE)" || echo "incomplete")"
-[ -z "$WES" ] && dim "wes missing -> pipx install wesng && wes --update"
-[ "$SVC_CVE" = "none" ] && dim "svc-cve missing -> sudo git clone https://github.com/scipag/vulscan /usr/share/nmap/scripts/vulscan && sudo nmap --script-updatedb"
-
-# --- optional
-HAVE_TESTSSL=0; HAVE_SPLOIT=0; HAVE_SNMP=0; HAVE_CURL=0
+HAVE_TESTSSL=0; HAVE_SNMP=0; HAVE_CURL=0; HAVE_NUCLEI=0; HAVE_WES=0
 command -v testssl.sh   >/dev/null 2>&1 && HAVE_TESTSSL=1
-command -v searchsploit >/dev/null 2>&1 && HAVE_SPLOIT=1
 command -v onesixtyone  >/dev/null 2>&1 && HAVE_SNMP=1
 command -v curl         >/dev/null 2>&1 && HAVE_CURL=1
-echo "    ${DIM}optional: testssl.sh $HAVE_TESTSSL  searchsploit $HAVE_SPLOIT  onesixtyone $HAVE_SNMP${RST}"
-
-# One assessment path now, so there is nothing to resolve.
+command -v nuclei       >/dev/null 2>&1 && HAVE_NUCLEI=1
+[ -n "$WES" ] && HAVE_WES=1
+printf "    %-14s %s\n" "wes" "$([ "$HAVE_WES" -eq 1 ] && echo "ok ($WES)" || echo "absent, MSRC alone")"
+printf "    %-14s %s\n" "nuclei" "$([ "$HAVE_NUCLEI" -eq 1 ] && echo "ok" || echo "absent, no web scan")"
+echo "    ${DIM}optional: testssl.sh $HAVE_TESTSSL  onesixtyone $HAVE_SNMP${RST}"
+[ "$HAVE_WES" -eq 0 ]    && dim "wes missing -> pipx install wesng && wes --update"
+[ "$HAVE_NUCLEI" -eq 0 ] && dim "nuclei missing -> github.com/projectdiscovery/nuclei/releases"
 RUN_SA=1
-if [ "$SA_READY" -eq 0 ]; then
-  err "WES-NG is not installed"
-  dim "it is what maps a host's patch level to CVEs: pipx install wesng && wes --update"
-  exit 1
-fi
 
 # nmap needs raw sockets for the ICMP, ACK and UDP probes in Stage 1 and for
 # -sS and -O in Stage 2. Unprivileged it silently falls back to TCP connect,
@@ -1214,32 +1173,26 @@ info "hosts with open ports $HOSTS_OPEN   total open ports $TOTAL_PORTS   possib
 # =====================================================================
 #  Stage 3  Vulnerability scripts
 # =====================================================================
-NSE_HITS=0; SVC_CVES=0; SPLOIT=0; WIN_CVES=0; WIN_CRIT=0; SYSOK=0
+NSE_HITS=0; SVC_CVES=0; WIN_CVES=0; WIN_CRIT=0; SYSOK=0
 : > "$RAW/cve-service.txt"; : > "$RAW/cve-windows.txt"; : > "$RAW/nse-all.txt"
 
 if [ "$RUN_SA" -eq 1 ]; then
-step "Stage 3  NSE vulnerability scripts and service CVE mapping"
+step "Stage 3  NSE vulnerability scripts"
 if is_done nse; then info "skipped (resume)"; else
   dim "targeting only discovered ports, $JOBS parallel workers"
-  case "$SVC_CVE" in
-    vulners) SCRIPTS="$NSE_SET,vulners"; SARGS="--script-args mincvss=$MIN_CVSS" ;;
-    vulscan) SCRIPTS="$NSE_SET,vulscan/vulscan.nse"; SARGS="--script-args vulscandb=cve.csv" ;;
-    *)       SCRIPTS="$NSE_SET"; SARGS=""
-             dim "service-CVE mapping disabled, vulnerability scripts only" ;;
-  esac
-  : > "$RAW/nse-failed.txt"; : > "$RAW/nse-degraded.txt"
+  : > "$RAW/nse-failed.txt"
   # nmap's exit status was discarded, so a scan that crashed on every host
   # still reported "NSE vulnerable states 0  service CVEs 0" -- a tool failure
   # presented as a finding of absence. On a real engagement nmap segfaulted on
   # all 39 hosts and the stage reported zero as though it had looked.
   #
-  # The CVE-mapping script is the usual culprit: vulners reaches out to its
-  # API and has crashed whole estates. So a failed host is retried with just
-  # the vulnerability scripts, which are the part worth having, and both the
-  # failure and the reduced coverage are recorded.
+  # There used to be a retry here with the service-CVE script dropped, which
+  # was the usual cause of that crash. The script is gone, so there is one
+  # script set and nothing to fall back to: a host either completes or is
+  # recorded as a coverage gap.
   nse_host(){
     local ip="$1" ports="$2" out="$RAW/nse/$1.txt" rc
-    nmap -sV -Pn -n -p "$ports" --script "$SCRIPTS" $SARGS --script-timeout 90s \
+    nmap -sV -Pn -n -p "$ports" --script "$NSE_SET" --script-timeout 90s \
          --host-timeout "$HOST_TIMEOUT" "$ip" -oN "$out" >/dev/null 2>&1
     rc=$?
     # The same test the counting uses: nmap's own footer, not the file's
@@ -1247,11 +1200,6 @@ if is_done nse; then info "skipped (resume)"; else
     { [ "$rc" -eq 0 ] && grep -qE '^#?[[:space:]]*Nmap done' "$out" 2>/dev/null; } \
       && return 0
     printf '%s\trc=%s\n' "$ip" "$rc" >> "$RAW/nse-failed.txt"
-    if nmap -sV -Pn -n -p "$ports" --script "$NSE_SET" --script-timeout 90s \
-            --host-timeout "$HOST_TIMEOUT" "$ip" -oN "$out" >/dev/null 2>&1 \
-       && grep -qE '^#?[[:space:]]*Nmap done' "$out" 2>/dev/null; then
-      printf '%s\n' "$ip" >> "$RAW/nse-degraded.txt"
-    fi
     return 0
   }
   N=0
@@ -1273,7 +1221,6 @@ NSE_HITS=$(gcntiE 'VULNERABLE' "$RAW/nse-all.txt")
 grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/nse-all.txt" 2>/dev/null | sort -u > "$RAW/cve-service.txt" || true
 SVC_CVES=$(cnt "$RAW/cve-service.txt")
 NSE_FAILED=$(cnt "$RAW/nse-failed.txt")
-NSE_DEGRADED=$(cnt "$RAW/nse-degraded.txt")
 # Count hosts nmap FINISHED, not files it created. -oN opens the file before
 # scanning and writes its "# Nmap done at ..." footer only on a clean exit, so
 # a segfault leaves a file behind that is not a scan. Counting files made 39
@@ -1283,7 +1230,7 @@ NSE_SCANNED=$(grep -lE '^#?[[:space:]]*Nmap done' "$RAW"/nse/*.txt 2>/dev/null \
               | wc -l | tr -d ' ')
 NSE_PRESENT=$(ls -1 "$RAW"/nse/*.txt 2>/dev/null | wc -l | tr -d ' ')
 NSE_PARTIAL=$(( NSE_PRESENT - NSE_SCANNED )); [ "$NSE_PARTIAL" -lt 0 ] && NSE_PARTIAL=0
-info "NSE vulnerable states $NSE_HITS   service CVEs $SVC_CVES"
+info "NSE vulnerable states $NSE_HITS   CVEs named by NSE $SVC_CVES"
 info "hosts nmap finished $NSE_SCANNED of $HOSTS_OPEN"
 [ "$NSE_PARTIAL" -gt 0 ] && \
   warn "$NSE_PARTIAL host file(s) exist but carry no completion marker, so nmap died mid-scan"
@@ -1293,30 +1240,23 @@ if [ "$NSE_SCANNED" -eq 0 ] && [ "$HOSTS_OPEN" -gt 0 ]; then
   dim "findings."
   [ "$NSE_PARTIAL" -gt 0 ] && \
     dim "$NSE_PARTIAL file(s) were created and then abandoned mid-scan."
-  dim "nmap exiting 139 is a segmentation fault, usually the service-CVE"
-  dim "script. Re-run with SVC_CVE_ENGINE=none to drop it."
+  dim "nmap exiting 139 is a segmentation fault. Narrow the script set with"
+  dim "PROFILE=quick, which uses the vuln category alone."
   if is_done nse; then
     dim ""
     dim "this stage was SKIPPED by RESUME=1 and its stored output is unusable."
     dim "the marker is from the failed run. clear it and scan again:"
-    dim "  rm -f $RAW/.done-nse && sudo SVC_CVE_ENGINE=none RESUME=1 $0 run"
+    dim "  rm -f $RAW/.done-nse && sudo RESUME=1 $0 run"
   else
     dim "exit status per host in $RAW/nse-failed.txt"
   fi
 elif [ "$NSE_FAILED" -gt 0 ]; then
-  warn "nmap failed on $NSE_FAILED of $HOSTS_OPEN host(s) with the full script set"
-  [ "$NSE_DEGRADED" -gt 0 ] \
-    && dim "$NSE_DEGRADED recovered without the service-CVE script, so those" \
-    && dim "hosts have vulnerability-script coverage but no CVE mapping"
-  dim "exit status per host in $RAW/nse-failed.txt. 139 is a segmentation"
-  dim "fault; SVC_CVE_ENGINE=none drops the script that usually causes it"
+  warn "nmap failed on $NSE_FAILED of $HOSTS_OPEN host(s)"
+  dim "those hosts have no NSE coverage and are reported as a gap, not as"
+  dim "clean. exit status per host in $RAW/nse-failed.txt; 139 is a"
+  dim "segmentation fault"
 fi
 
-if [ "$HAVE_SPLOIT" -eq 1 ] && [ -s "$RAW/services.xml" ]; then
-  searchsploit --nmap "$RAW/services.xml" > "$RAW/searchsploit.txt" 2>&1 || true
-  SPLOIT=$(gcnt 'Exploit Title' "$RAW/searchsploit.txt")
-  info "public exploit matches $SPLOIT"
-fi
 fi
 
 # =====================================================================
@@ -1485,19 +1425,23 @@ fi
 info "systeminfo collected $SYSOK of $AUTH_OK authenticated"
 : > "$RAW/windows-cves.csv"
 if [ "$SYSOK" -gt 0 ]; then
-  { [ -f definitions.zip ] || [ -f "$HOME/definitions.zip" ]; } || { warn "fetching WES-NG definitions"; "$WES" --update >/dev/null 2>&1 || warn "definition update failed"; }
-  echo "Host,CVE,Severity,AffectedProduct,MissingKB,Title" > "$RAW/windows-cves.csv"
-  wr(){ "$WES" "$1" -o "$RAW/wes/$(basename "$1" .txt).csv" >/dev/null 2>&1; }
-  for f in "$RAW"/sysinfo/*.txt; do [ -e "$f" ] && pool wr "$f"; done
-  finish
-  for c in "$RAW"/wes/*.csv; do [ -e "$c" ] || continue
-    h=$(basename "$c" .csv)
-    tail -n +2 "$c" | awk -F',' -v H="$h" '{print H","$3","$7","$2","$8","$4}' >> "$RAW/windows-cves.csv" 2>/dev/null || true
-  done
-  WIN_CVES=$(( $(wc -l < "$RAW/windows-cves.csv") - 1 )); [ "$WIN_CVES" -lt 0 ] && WIN_CVES=0
-  WIN_CRIT=$(gcnti 'critical' "$RAW/windows-cves.csv")
-  grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/windows-cves.csv" 2>/dev/null | sort -u > "$RAW/cve-windows.txt" || true
-  info "windows CVEs $WIN_CVES   critical $WIN_CRIT"
+  if [ "$HAVE_WES" -eq 0 ]; then
+    dim "WES-NG absent, Windows patch level comes from the MSRC comparison alone"
+  else
+    { [ -f definitions.zip ] || [ -f "$HOME/definitions.zip" ]; } || { warn "fetching WES-NG definitions"; "$WES" --update >/dev/null 2>&1 || warn "definition update failed"; }
+    echo "Host,CVE,Severity,AffectedProduct,MissingKB,Title" > "$RAW/windows-cves.csv"
+    wr(){ "$WES" "$1" -o "$RAW/wes/$(basename "$1" .txt).csv" >/dev/null 2>&1; }
+    for f in "$RAW"/sysinfo/*.txt; do [ -e "$f" ] && pool wr "$f"; done
+    finish
+    for c in "$RAW"/wes/*.csv; do [ -e "$c" ] || continue
+      h=$(basename "$c" .csv)
+      tail -n +2 "$c" | awk -F',' -v H="$h" '{print H","$3","$7","$2","$8","$4}' >> "$RAW/windows-cves.csv" 2>/dev/null || true
+    done
+    WIN_CVES=$(( $(wc -l < "$RAW/windows-cves.csv") - 1 )); [ "$WIN_CVES" -lt 0 ] && WIN_CVES=0
+    WIN_CRIT=$(gcnti 'critical' "$RAW/windows-cves.csv")
+    grep -oE 'CVE-[0-9]{4}-[0-9]+' "$RAW/windows-cves.csv" 2>/dev/null | sort -u > "$RAW/cve-windows.txt" || true
+    info "windows CVEs $WIN_CVES   critical $WIN_CRIT"
+  fi
 fi
 fi
 
@@ -1710,7 +1654,11 @@ fi
 awk '{split($2,p,","); for(i in p) if(p[i]=="80"||p[i]=="443"||p[i]=="8000"||p[i]=="8080"||p[i]=="8443"||p[i]=="9443"){print $1; break}}' \
     "$RAW/ports/map.txt" 2>/dev/null | sort -u > "$RAW/web-hosts.txt" || : > "$RAW/web-hosts.txt"
 WEBN=$(cnt "$RAW/web-hosts.txt"); NC=0; NH=0; NM=0; NL=0; : > "$RAW/cve-web.txt"
-if [ "$WEBN" -gt 0 ]; then
+if [ "$WEBN" -gt 0 ] && [ "$HAVE_NUCLEI" -eq 0 ]; then
+  warn "$WEBN host(s) serve web ports but nuclei is not installed"
+  dim "the web application assessment did not run. this is a coverage gap,"
+  dim "not an absence of web findings"
+elif [ "$WEBN" -gt 0 ]; then
   WEB_CUT=0
   if have timeout; then
     timeout -k 20 "$WEB_CAP" nuclei -l "$RAW/web-hosts.txt" \
@@ -2060,8 +2008,6 @@ echo "| Check | Method | Result |"
 echo "| --- | --- | --- |"
 [ "$RUN_SA" -eq 1 ]  && echo "| Windows patch level | WES-NG vs MSRC | $WIN_CVES CVEs, $WIN_CRIT critical |"
 [ "$RUN_SA" -eq 1 ]  && echo "| NSE vulnerability scripts | nmap \`$NSE_SET\` | $NSE_HITS vulnerable states |"
-[ "$RUN_SA" -eq 1 ]  && echo "| Service version CVEs | nmap $SVC_CVE | $SVC_CVES CVEs |"
-[ "$SPLOIT" -gt 0 ]  && echo "| Public exploits | searchsploit | $SPLOIT matches |"
 echo "| Windows exploit modules | NetExec, 9 modules | $MOD_VULN vulnerable |"
 echo "| ADCS | NetExec adcs | $ADCS_H findings |"
 echo "| Kerberoasting | NetExec | $KERB_H accounts |"
@@ -2075,7 +2021,8 @@ echo "| GPP credentials | NetExec | $GPP findings |"
 echo "| Config baseline | NetExec wcc | $WCC_FAIL failures |"
 echo "| Writable shares | NetExec | $WRITABLE |"
 echo "| TLS | $([ "$HAVE_TESTSSL" -eq 1 ] && echo testssl.sh || echo "nmap ssl scripts") | $TLS_ISSUES issues, $TLSN endpoints |"
-echo "| Web applications | nuclei | C:$NC H:$NH M:$NM L:$NL |"
+[ "$HAVE_NUCLEI" -eq 1 ] && echo "| Web applications | nuclei | C:$NC H:$NH M:$NM L:$NL |"
+[ "$HAVE_NUCLEI" -eq 0 ] && echo "| Web applications | **not assessed, nuclei absent** | - |"
 echo "| SNMP | onesixtyone | $SNMPN default strings |"
 echo "| End of life OS | nmap fingerprint | $EOL windows, $LINUX_EOL linux |"
 echo "| Linux inventory | SSH | $LINUX_OK hosts |"
@@ -2151,14 +2098,12 @@ elif [ "${NSE_SCANNED:-0}" -eq 0 ] && [ "$HOSTS_OPEN" -gt 0 ]; then
   echo "with open ports, so this is a coverage gap and not a finding of"
   echo "absence. ${NSE_PARTIAL:-0} output file(s) were created and abandoned"
   echo "mid-scan. Per-host exit status is in \`$RAW/nse-failed.txt\`; status 139"
-  echo "is a segmentation fault. Re-run with \`SVC_CVE_ENGINE=none\` to drop the"
-  echo "service-CVE script, which is the usual cause."
+  echo "is a segmentation fault."
 else
   echo "_No NSE script reported a vulnerable state on the ${NSE_SCANNED:-0} host(s) assessed._"
-  [ "${NSE_FAILED:-0}" -gt 0 ] && { echo; echo "${NSE_FAILED} host(s) failed the full script set; see \`$RAW/nse-failed.txt\`."; }
+  [ "${NSE_FAILED:-0}" -gt 0 ] && { echo; echo "${NSE_FAILED} host(s) failed; see \`$RAW/nse-failed.txt\`."; }
 fi
 echo
-if [ "$SPLOIT" -gt 0 ]; then echo "### Public exploits"; echo; echo '```'; head -60 "$RAW/searchsploit.txt"; echo '```'; echo; fi
 fi
 
 echo "---"; echo
@@ -2223,9 +2168,8 @@ echo "SNMP default strings: **$SNMPN**"; echo
 if [ "${NSE_FAILED:-0}" -gt 0 ] || [ "${TLS_CUT:-0}" -gt 0 ]; then
   echo "### Tooling that did not complete"; echo
   [ "${NSE_FAILED:-0}" -gt 0 ] && {
-    echo "nmap failed on ${NSE_FAILED} of $HOSTS_OPEN host(s) with the full"
-    echo "script set. ${NSE_DEGRADED:-0} recovered with the vulnerability"
-    echo "scripts alone, so those hosts have no service-CVE mapping."; echo; }
+    echo "nmap failed on ${NSE_FAILED} of $HOSTS_OPEN host(s), which therefore"
+    echo "have no NSE coverage at all."; echo; }
   [ "${TLS_CUT:-0}" -gt 0 ] && {
     echo "${TLS_CUT} TLS endpoint(s) exceeded the ${TLS_CAP} cap and were not"
     echo "assessed; they are listed in \`$RAW/tls-timeout.txt\`."; echo; }
