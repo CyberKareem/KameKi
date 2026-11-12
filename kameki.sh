@@ -5,29 +5,19 @@
 #  Subcommands:
 #    install            install every dependency (needs internet)
 #    install --bundle F install from an offline bundle (no internet)
-#    install --no-nvt   install without the Greenbone/NVT backend, the
-#                       standalone engine is used instead
 #    update             refresh templates, CVE data and definitions
-#    setup-greenbone    certificates, services, admin user and GMP
-#                       credentials. run by install automatically
 #    bundle             build an offline bundle at the office
 #    doctor             diagnose what is missing or broken, including auth
 #    preflight          test credential formats safely against one host
 #    run                run the assessment (default)
 #    cleanup            shred credentials and remove artifacts
 #
-#  Engines
-#    nvt         full Greenbone NVT feed (~100k scripts) over the gvmd
-#                socket. No web UI.
-#    standalone  WES-NG patch mapping, nmap NSE, service CVE mapping.
-#    both        run both. ENGINE=auto picks this whenever Greenbone is
-#                usable, because the two cover different ground and the
-#                standalone results are not reproduced by the NVT feed.
+#  Needs nmap, nxc, python3 and jq. No server, no daemon, no feed sync.
 #
-#  On top of whichever engine runs, always: Active Directory assessment,
-#  configuration audit, TLS, web, SNMP, CISA KEV correlation, attack path
-#  derivation, risk scoring, and a self check on its own authentication
-#  depth.
+#  Always: Windows patch level from Microsoft's own data, Active Directory
+#  assessment, configuration audit, TLS, web, SNMP, CISA KEV correlation,
+#  attack path derivation, risk scoring, and a self check on its own
+#  authentication depth.
 #
 #  Typical first use:
 #    ./kameki.sh install                   # at the office, with internet
@@ -66,7 +56,6 @@ RUN_NAME="kameki-${DATE}-$$"
 T0=$(date +%s)
 
 # ---- tunables -------------------------------------------------------
-ENGINE="${ENGINE:-auto}"
 PROFILE="${PROFILE:-standard}"
 JOBS="${JOBS:-16}"
 NXC_THREADS="${NXC_THREADS:-32}"
@@ -74,13 +63,6 @@ MIN_CVSS="${MIN_CVSS:-4.0}"
 NMAP_RATE="${NMAP_RATE:-2000}"
 HOST_TIMEOUT="${HOST_TIMEOUT:-20m}"
 RESUME="${RESUME:-0}"
-POLL="${POLL:-60}"
-# 0 means wait as long as the scan takes. A full NVT run against a large
-# scope legitimately takes many hours, so this is not capped by default,
-# but it is here for a link that drops mid-scan and leaves the task idle.
-NVT_MAX_MIN="${NVT_MAX_MIN:-0}"
-SCAN_CONFIG="${SCAN_CONFIG:-fast}"
-ALIVE_TEST="${ALIVE_TEST:-ICMP, TCP-ACK Service & ARP Ping}"
 DEPTH_WARN="${DEPTH_WARN:-3}"      # authenticated findings per host below which we warn
 KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
@@ -129,16 +111,21 @@ warn(){ echo "${YEL}[!]${RST} $*"; }
 err(){  echo "${RED}[-]${RST} $*"; }
 step(){ echo; echo "${CYN}── $* ${RST}"; }
 dim(){  echo "${DIM}    $*${RST}"; }
+# Report a captured failure. A tool that fails silently is worse than one
+# that fails loudly, because the blank line reads as a display bug rather
+# than a missing message, so silence is named as silence.
+say_err(){   # $1: captured output, $2.. a hint to print when it is empty
+  if [ -n "${1:-}" ]; then printf '%s\n' "$1" | tail -8 | sed 's/^/      /'
+  else shift; dim "the command printed nothing."; [ $# -gt 0 ] && dim "$*"; fi
+}
 have(){ command -v "$1" >/dev/null 2>&1; }
 
-# zstd compresses the Greenbone feed far better than gzip, but it is not always
-# installable on a client box -- on a recent Ubuntu behind a filtering proxy the
-# apt mirror timed out and zstd was one of the packages that did not arrive.
-# The bundle ships zstd's own .deb, which is no help at all when you need zstd
-# to unpack the bundle to reach it. So the OUTER archive is always gzip, which
-# every box already has, and only the inner feed archives use zstd when it is
-# available. GNU tar sniffs the compression on extraction, so both old
-# .tar.zst bundles and new .tar.gz ones unpack with the same command.
+# The bundle is gzip. It used to be zstd, and zstd is itself one of the
+# packages a filtering apt mirror will not give you -- the bundle carried
+# zstd's own .deb, which is no help when you need zstd to open the bundle to
+# reach it. On a live PCI engagement that shut the escape hatch. Extraction
+# still accepts the older .tar.zst bundles: GNU tar sniffs the compression,
+# so one plain `tar -xf` reads both.
 tar_in(){       # $1 archive, rest: passed to tar -> extract, whatever it is
   local a="$1"; shift
   case "$a" in
@@ -153,114 +140,9 @@ tar_in(){       # $1 archive, rest: passed to tar -> extract, whatever it is
   esac
   tar -xf "$a" "$@"
 }
-# tar_out BASE ARGS... -> writes BASE.tar.zst or BASE.tar.gz, echoes which
-tar_out(){
-  local base="$1"; shift
-  if have zstd && tar --zstd -cf "$base.tar.zst" "$@" 2>/dev/null; then
-    printf '%s' "$base.tar.zst"
-  elif tar -czf "$base.tar.gz" "$@" 2>/dev/null; then
-    printf '%s' "$base.tar.gz"
-  else
-    return 1
-  fi
-}
-# Everything that talks to gvmd goes through kameki_gmp.py, which speaks GMP
-# with python-gvm and parses the replies as XML.
-#
-# This used to be gvm-cli plus sed and grep, and it was wrong in ways that only
-# showed up at client sites. gvmd puts an entire response on one line, so
-# `grep -c '<config id='` answered 1 however many configs existed and the
-# operator was told the feed had not imported. Worse, the first <name> inside a
-# <config> is <owner><name>admin</name>, so every scan config was read as being
-# called "admin" and the requested one never matched. The report blob sits after
-# </report_format>, not inside <report>, so reading the wrong one wrote an empty
-# CSV. None of that is fixable in a shell pipeline; it is three lines of
-# ElementTree.
-#
-# gvm-cli also refuses to run as root by design, which forced a runuser wrapper
-# that had to guess which account to drop to, and it took the GMP password as a
-# command-line argument -- visible in `ps` to every user on the box, and left
-# behind in shell history. python-gvm needs neither: the socket is opened as
-# whoever invoked the script, and credentials are read from files.
-KAMEKI_GMP=""
-GMP_PY_INTERP=""
-
-# kameki_gmp.py ships beside this script. When the script has been copied
-# somewhere on its own, the usual install locations are tried before giving up.
-gmp_py_find(){
-  [ -n "$KAMEKI_GMP" ] && { printf '%s' "$KAMEKI_GMP"; return 0; }
-  local self d c
-  self="${BASH_SOURCE[0]:-$0}"
-  # Follow a symlink, so /usr/local/bin/kameki -> /opt/kameki/kameki.sh works.
-  while [ -L "$self" ]; do
-    d=$(dirname -- "$self")
-    self=$(readlink -- "$self")
-    case "$self" in /*) ;; *) self="$d/$self" ;; esac
-  done
-  d=$(CDPATH= cd -- "$(dirname -- "$self")" 2>/dev/null && pwd -P) || d=""
-  for c in "$d/kameki_gmp.py" /opt/kameki/kameki_gmp.py \
-           /usr/local/lib/kameki/kameki_gmp.py \
-           /usr/local/share/kameki/kameki_gmp.py; do
-    [ -f "$c" ] && { KAMEKI_GMP="$c"; printf '%s' "$c"; return 0; }
-  done
-  return 1
-}
-
-# python-gvm has to be importable by whichever interpreter runs the helper.
-# `pipx install gvm-tools` puts it in an isolated venv that the system python3
-# cannot see, so that venv is one of the candidates rather than a reason to
-# report the library missing.
-gmp_py_interp(){
-  [ -n "$GMP_PY_INTERP" ] && { printf '%s' "$GMP_PY_INTERP"; return 0; }
-  local p
-  for p in python3 python \
-           "$HOME/.local/share/pipx/venvs/gvm-tools/bin/python" \
-           "${SUDO_USER:+/home/$SUDO_USER/.local/share/pipx/venvs/gvm-tools/bin/python}" \
-           /root/.local/share/pipx/venvs/gvm-tools/bin/python; do
-    [ -n "$p" ] || continue
-    command -v "$p" >/dev/null 2>&1 || [ -x "$p" ] || continue
-    if "$p" -c 'import gvm' >/dev/null 2>&1; then
-      GMP_PY_INTERP="$p"; printf '%s' "$p"; return 0
-    fi
-  done
-  return 1
-}
-
-# 0 when a GMP conversation is actually possible.
-gmp_py_ready(){ gmp_py_find >/dev/null 2>&1 && gmp_py_interp >/dev/null 2>&1; }
-
 KAMEKI_RAW="${KAMEKI_RAW:-https://raw.githubusercontent.com/CyberKareem/KameKi/main}"
-# kameki is routinely installed by wget-ing the one script, which leaves the
-# GMP client behind. That is not a harmless omission: with no client to check
-# with, setup-greenbone cannot verify the account it just created, takes its
-# "created, unverified" branch, and writes a harvested password to
-# gmp-pass.txt that gvmd never accepted. Every later Greenbone check then
-# fails in a way that reads as a credential problem rather than a missing
-# file. So fetch the helper next to ourselves when it is absent.
-fetch_gmp_helper(){
-  gmp_py_find >/dev/null 2>&1 && return 0
-  local self d
-  self="${BASH_SOURCE[0]:-$0}"
-  d=$(CDPATH= cd -- "$(dirname -- "$self")" 2>/dev/null && pwd -P) || return 1
-  [ -w "$d" ] || return 1
-  if   have curl; then curl -fsSL "$KAMEKI_RAW/kameki_gmp.py" -o "$d/kameki_gmp.py" 2>/dev/null
-  elif have wget; then wget -qO   "$d/kameki_gmp.py" "$KAMEKI_RAW/kameki_gmp.py" 2>/dev/null
-  else return 1
-  fi
-  # A captive portal or an error page saved to that name is worse than nothing:
-  # it would be found and then fail with a syntax error instead of a clear
-  # missing-file message. Require it to look like the module it claims to be.
-  if ! { [ -s "$d/kameki_gmp.py" ] \
-         && head -1 "$d/kameki_gmp.py" | grep -q 'python' \
-         && grep -q 'def main' "$d/kameki_gmp.py"; }; then
-    rm -f "$d/kameki_gmp.py"
-    return 1
-  fi
-  KAMEKI_GMP=""          # clear the cached miss so discovery runs again
-  gmp_py_find >/dev/null 2>&1
-}
 
-# kameki_msrc.py sits beside this script, like the GMP client.
+# kameki_msrc.py sits beside this script.
 KAMEKI_MSRC=""
 msrc_py_find(){
   [ -n "$KAMEKI_MSRC" ] && { printf '%s' "$KAMEKI_MSRC"; return 0; }
@@ -277,11 +159,11 @@ msrc_py_find(){
   done
   return 1
 }
-# Unlike the GMP client this needs no third-party library, only python3.
+# It needs no third-party library, only python3.
 msrc_ready(){ have python3 && msrc_py_find >/dev/null 2>&1 && [ -s "$MSRC_DB" ]; }
 msrc_py(){ python3 "$(msrc_py_find)" "$@"; }
 
-# Same story as the GMP client: a one-file wget install leaves this behind,
+# A one-file wget install leaves this behind,
 # and then the whole Windows assessment silently falls back to WES-NG alone
 # with nothing to say the authoritative check never ran.
 fetch_msrc_helper(){
@@ -442,33 +324,6 @@ PYFACTS
 }
 
 
-# gmp_py SOCKET SUBCOMMAND... -> the helper's JSON on stdout, its exit status.
-# Progress goes to stderr, so stdout stays a single parseable object.
-gmp_py(){
-  local sock="$1"; shift
-  local py helper
-  helper=$(gmp_py_find) || {
-    printf '{"ok":false,"error":"kameki_gmp.py was not found next to %s"}\n' \
-      "${BASH_SOURCE[0]:-$0}"
-    return 1
-  }
-  py=$(gmp_py_interp) || {
-    printf '%s\n' '{"ok":false,"error":"python-gvm is not installed for any python on this box","hint":"sudo pip3 install --break-system-packages python-gvm"}'
-    return 1
-  }
-  "$py" "$helper" --socket "$sock" \
-    --user-file "${GMP_UF:-gmp-user.txt}" \
-    --pass-file "${GMP_PF:-gmp-pass.txt}" "$@"
-}
-# Point gmp_py at a different credential pair. setup-greenbone has to verify an
-# account it has only just created, before gmp-user.txt exists, so the pair is
-# written to a private directory instead of being passed as arguments.
-GMP_UF=""
-GMP_PF=""
-
-# jgmp JSON FILTER -> that field, or empty. Keeps the jq noise in one place.
-jgmp(){ printf '%s' "$1" | jq -r "$2" 2>/dev/null || true; }
-# net_open HOST PORT -> 0 when a TCP connection succeeds inside five seconds.
 # Client networks routinely block outbound 80 and 873, and finding that out
 # after a long apt run or a 5 GB rsync attempt wastes site time.
 net_open(){
@@ -645,11 +500,10 @@ llm_ask(){
 #  install
 # =====================================================================
 cmd_install(){
-  local BUNDLE="" WITH_NVT=1
+  local BUNDLE=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --bundle) BUNDLE="$2"; shift 2 ;;
-      --no-nvt) WITH_NVT=0; shift ;;
       *) shift ;;
     esac
   done
@@ -677,7 +531,7 @@ cmd_install(){
     fi
     if [ -d "$B/wheels" ]; then
       info "installing python tools from bundle"
-      pip3 install --break-system-packages --no-index --find-links "$B/wheels" netexec wesng gvm-tools python-gvm >/dev/null 2>&1 \
+      pip3 install --break-system-packages --no-index --find-links "$B/wheels" netexec wesng >/dev/null 2>&1 \
         || warn "python tool install reported errors"
     fi
     [ -f "$B/nuclei" ]        && { install -m755 "$B/nuclei" /usr/local/bin/nuclei; info "nuclei installed"; }
@@ -694,24 +548,6 @@ cmd_install(){
     fi
     [ -f "$B/kameki_msrc.py" ] && { cp "$B/kameki_msrc.py" "$(dirname -- "${BASH_SOURCE[0]:-$0}")/" 2>/dev/null && info "Windows patch engine installed"; }
 
-    for FEEDTAR in "$B/openvas-feed.tar.zst" "$B/openvas-feed.tar.gz"; do
-      [ -f "$FEEDTAR" ] && break
-    done
-    if [ -f "$FEEDTAR" ]; then
-      info "restoring Greenbone NVT feed, this takes a few minutes"
-      mkdir -p /var/lib/openvas
-      tar_in "$FEEDTAR" -C /var/lib/openvas
-      chown -R _gvm:_gvm /var/lib/openvas 2>/dev/null || true
-      info "feed restored: $(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l) NVTs"
-    fi
-    for GVMTAR in "$B/gvm-data.tar.zst" "$B/gvm-data.tar.gz"; do
-      [ -f "$GVMTAR" ] && break
-    done
-    if [ -f "$GVMTAR" ]; then
-      info "restoring gvmd data"
-      tar_in "$GVMTAR" -C /var/lib
-      chown -R _gvm:_gvm /var/lib/gvm 2>/dev/null || true
-    fi
     rm -rf "$B"
     info "offline install complete"
     dim "run: $0 doctor"
@@ -731,13 +567,6 @@ cmd_install(){
     dim "  sudo $0 install --bundle <file>"
     DEGRADED=1
   fi
-  if [ "$WITH_NVT" -eq 1 ] && ! net_open feed.community.greenbone.net 873; then
-    warn "no outbound access to the Greenbone feed on rsync port 873"
-    dim "the NVT feed cannot sync on this network. the standalone engine"
-    dim "needs no feed and produces a full assessment without it:"
-    dim "  sudo $0 install --no-nvt"
-  fi
-
   info "updating package lists"
   apt-get update -qq || { warn "apt update had errors"; DEGRADED=1; }
 
@@ -764,60 +593,12 @@ cmd_install(){
     DEGRADED=1
   fi
 
-  if [ "$WITH_NVT" -eq 1 ]; then
-    info "installing Greenbone scanner backend"
-    apt-get install -y -qq openvas-scanner ospd-openvas gvmd redis-server >/dev/null 2>&1 \
-      || warn "Greenbone packages unavailable in this repo, standalone engine will be used"
-  fi
-
   info "installing python tools"
   local PIPX_HOME_DIR="${SUDO_USER:+/home/$SUDO_USER/.local}"
   su "${SUDO_USER:-root}" -c "pipx install $NETEXEC_REPO" >/dev/null 2>&1 || \
     pip3 install --break-system-packages "$NETEXEC_REPO" >/dev/null 2>&1 || warn "netexec install failed"
   su "${SUDO_USER:-root}" -c "pipx install wesng" >/dev/null 2>&1 || \
     pip3 install --break-system-packages wesng >/dev/null 2>&1 || warn "wesng install failed"
-  su "${SUDO_USER:-root}" -c "pipx install gvm-tools" >/dev/null 2>&1 || \
-    pip3 install --break-system-packages gvm-tools >/dev/null 2>&1 || warn "gvm-tools install failed"
-  # kameki_gmp.py needs the python-gvm LIBRARY importable, not the gvm-cli
-  # binary. pipx hides gvm-tools' dependencies inside its own venv, which the
-  # system interpreter cannot see -- but gmp_py_interp knows to look in that
-  # venv, so a successful `pipx install gvm-tools` is already enough.
-  #
-  # Every route is tried because on a restricted client network the apt mirror
-  # may not answer: python3-pip was one of the packages that failed to arrive
-  # on a recent Ubuntu behind a filtering proxy, which left no pip to install
-  # python-gvm with, and the old code then declared the NVT engine dead when
-  # the pipx venv had the library all along.
-  if fetch_gmp_helper; then dim "GMP client present ($(gmp_py_find))"
-  else warn "kameki_gmp.py is missing and could not be fetched"
-       dim "the NVT engine needs it. put it beside this script:"
-       dim "  wget -O $(dirname -- "${BASH_SOURCE[0]:-$0}")/kameki_gmp.py \\"
-       dim "    $KAMEKI_RAW/kameki_gmp.py"
-  fi
-  install_python_gvm(){
-    gmp_py_interp >/dev/null 2>&1 && return 0
-    pip3 install --break-system-packages python-gvm >/dev/null 2>&1 && return 0
-    python3 -m pip install --break-system-packages python-gvm >/dev/null 2>&1 && return 0
-    # Debian and Ubuntu package the library itself, no pip needed.
-    apt-get install -y -qq python3-gvm >/dev/null 2>&1 && return 0
-    # No pip at all? bootstrap one and retry.
-    python3 -m ensurepip --upgrade >/dev/null 2>&1 \
-      && python3 -m pip install --break-system-packages python-gvm >/dev/null 2>&1 \
-      && return 0
-    python3 -m pip install python-gvm >/dev/null 2>&1 && return 0
-    GMP_PY_INTERP=""     # discovery may have cached a miss
-    gmp_py_interp >/dev/null 2>&1
-  }
-  if install_python_gvm; then
-    dim "python-gvm ok ($(gmp_py_interp))"
-  else
-    warn "python-gvm could not be installed, so the NVT engine is unavailable"
-    dim "the standalone engine is unaffected and the run will still work"
-    dim "to fix it later, any one of these is enough:"
-    dim "  sudo apt install python3-gvm -y"
-    dim "  sudo pip3 install --break-system-packages python-gvm"
-    dim "  pipx install gvm-tools      (kameki finds the library in its venv)"
-  fi
   su "${SUDO_USER:-root}" -c "pipx ensurepath" >/dev/null 2>&1 || true
 
   if ! have nuclei; then
@@ -848,15 +629,6 @@ cmd_install(){
   # cannot drift apart and each result is reported individually.
   cmd_update || DEGRADED=1
 
-  if have gvmd && [ "$WITH_NVT" -eq 1 ]; then
-    echo
-    cmd_setup_greenbone || {
-      warn "Greenbone is not usable yet; the standalone engine is unaffected"
-      dim "retry later with: sudo $0 setup-greenbone"
-    }
-  fi
-
-  echo
   if [ "$DEGRADED" -eq 1 ]; then
     warn "install finished with errors, some components are missing"
   else
@@ -876,7 +648,7 @@ cmd_bundle(){
 
   info "collecting python wheels"
   mkdir -p "$B/wheels"
-  pip3 download -q -d "$B/wheels" "$NETEXEC_REPO" wesng gvm-tools python-gvm >/dev/null 2>&1 \
+  pip3 download -q -d "$B/wheels" "$NETEXEC_REPO" wesng >/dev/null 2>&1 \
     || warn "wheel download incomplete"
 
   info "collecting system packages"
@@ -898,23 +670,7 @@ cmd_bundle(){
   done
   [ -f "$HOME/.kameki-kev.json" ] && cp "$HOME/.kameki-kev.json" "$B/kev.json"
 
-  local NVTN=0
-  [ -d /var/lib/openvas/plugins ] && NVTN=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
-  if [ "$NVTN" -gt 10000 ]; then
-    info "including Greenbone NVT feed ($NVTN scripts), this is the large part"
-    tar_out "$B/openvas-feed" -C /var/lib/openvas plugins >/dev/null \
-      || warn "feed archive failed, may need sudo"
-    [ -d /var/lib/gvm ] && tar_out "$B/gvm-data" -C /var/lib gvm >/dev/null || true
-  else
-    warn "NVT feed not present or incomplete ($NVTN scripts), bundle will be standalone only"
-    dim "run: sudo greenbone-feed-sync    then rebuild the bundle"
-  fi
-
   cp "$0" "$B/kameki.sh"
-  # The GMP client is not optional any more: without it the bundle installs a
-  # kameKi that can only run the standalone engine.
-  if P=$(gmp_py_find); then cp "$P" "$B/kameki_gmp.py"
-  else warn "kameki_gmp.py not found, the bundle will have no NVT engine"; fi
   if P=$(msrc_py_find); then cp "$P" "$B/kameki_msrc.py"
   else warn "kameki_msrc.py not found, the bundle will have no Windows patch engine"; fi
   # The compiled table is a couple of MB and is the whole Windows patch engine,
@@ -929,7 +685,6 @@ cmd_bundle(){
   fi
   cat > "$B/README.txt" <<EOF
 kameki offline bundle, built $STAMP
-NVT scripts included: $NVTN
 
 On the target machine:
   sudo ./kameki.sh install --bundle $OUT
@@ -963,25 +718,8 @@ cmd_doctor(){
   for t in testssl.sh searchsploit onesixtyone; do
     have "$t" && printf "    %-14s ok\n" "$t" || printf "    %-14s ${YEL}absent (optional)${RST}\n" "$t"
   done
-  # The NVT engine needs python-gvm and the helper, not gvm-cli.
-  if gmp_py_ready; then
-    printf "    %-14s ok (%s)\n" "python-gvm" "$(gmp_py_interp)"
-  elif gmp_py_find >/dev/null 2>&1; then
-    printf "    %-14s ${YEL}no python has it: sudo pip3 install --break-system-packages python-gvm${RST}\n" "python-gvm"
-  else
-    printf "    %-14s ${YEL}kameki_gmp.py is not beside this script${RST}\n" "kameki_gmp.py"
-  fi
-
   echo
   echo "  data"
-  local NVTN=0
-  [ -d /var/lib/openvas/plugins ] && NVTN=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
-  if [ "$NVTN" -ge 10000 ]; then printf "    %-14s ok (%s scripts)\n" "NVT feed" "$NVTN"
-  else
-    printf "    %-14s ${YEL}%s scripts, run: sudo greenbone-feed-sync${RST}\n" "NVT feed" "$NVTN"
-    dim "with no feed the NVT engine cannot run whatever else is configured;"
-    dim "the standalone engine is unaffected and needs no feed"
-  fi
   [ -d /usr/share/nmap/scripts/vulscan ] && printf "    %-14s ok\n" "vulscan" || printf "    %-14s ${YEL}absent${RST}\n" "vulscan"
   { [ -f definitions.zip ] || [ -f "$HOME/definitions.zip" ]; } && printf "    %-14s ok\n" "wes defs" || printf "    %-14s ${YEL}run: wes --update${RST}\n" "wes defs"
   [ -f "$HOME/.kameki-kev.json" ] && printf "    %-14s ok\n" "KEV" || printf "    %-14s ${YEL}absent${RST}\n" "KEV"
@@ -999,43 +737,6 @@ cmd_doctor(){
   fi
 
   echo
-  echo "  greenbone"
-  local SOCK=""
-  for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock /var/run/gvm/gvmd.sock; do
-    [ -S "$s" ] && { SOCK="$s"; break; }
-  done
-  if [ -n "$SOCK" ]; then
-    printf "    %-14s ok (%s)\n" "gvmd socket" "$SOCK"
-    if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] && gmp_py_ready; then
-      local R; R=$(gmp_py "$SOCK" check 2>&1)
-      if printf '%s' "$R" | grep -q '"ok": *true'; then
-        printf "    %-14s ok\n" "gmp auth"
-      else
-        printf "    %-14s ${RED}failed${RST}\n" "gmp auth"
-        # Throwing this away made every GMP problem look identical and had to
-        # be re-diagnosed by hand on site. Print what gvmd actually said.
-        local GE; GE=$(jgmp "$R" '.error // empty')
-        [ -z "$GE" ] && GE=$(printf '%s' "$R" | head -2 | tr '\n' ' ')
-        dim "$GE"
-        case "$GE" in
-          *uthentication*|*uthenticate*)
-            dim "gmp-pass.txt holds a password gvmd does not accept. The usual"
-            dim "cause is an account created while no GMP client was installed,"
-            dim "so it was written without ever being verified. Recreate it:"
-            dim "  sudo FEED_SYNC=0 $0 setup-greenbone" ;;
-          *)
-            dim "recreate the account with: sudo FEED_SYNC=0 $0 setup-greenbone" ;;
-        esac
-        ISSUES=$((ISSUES+1))
-      fi
-    else
-      printf "    %-14s ${YEL}gmp-user.txt / gmp-pass.txt not set${RST}\n" "gmp auth"
-    fi
-  else
-    printf "    %-14s ${YEL}not running, standalone engine will be used${RST}\n" "gvmd socket"
-  fi
-
-  echo
   echo "  inputs"
   for f in targets.txt user.txt pass.txt; do
     if [ -s "$f" ]; then
@@ -1045,7 +746,7 @@ cmd_doctor(){
       else printf "    %-14s ${YEL}mode %s, run: chmod 600 %s${RST}\n" "$f" "$m" "$f"; fi
     else printf "    %-14s ${RED}missing${RST}\n" "$f"; ISSUES=$((ISSUES+1)); fi
   done
-  for f in ssh-user.txt ssh-pass.txt gmp-user.txt gmp-pass.txt; do
+  for f in ssh-user.txt ssh-pass.txt; do
     [ -s "$f" ] && printf "    %-14s ok\n" "$f" || printf "    %-14s ${DIM}absent (optional)${RST}\n" "$f"
   done
 
@@ -1137,9 +838,9 @@ cmd_preflight(){
   else
     echo "${YEL}blocked${RST}"
     warn "authentication works but remote execution does not"
-    dim "the standalone engine cannot read patch level without it"
-    dim "likely EDR or policy. the Greenbone NVT engine uses registry reads"
-    dim "instead and may still work, so prefer ENGINE=nvt on this estate"
+    dim "patch level cannot be read without it"
+    dim "likely EDR or policy. configuration, AD and service checks still run,"
+    dim "but this host's patch level will be absent from the report"
   fi
 
   echo
@@ -1170,7 +871,7 @@ cmd_cleanup(){
   local SHRED="rm -f"; have shred && SHRED="shred -u -n3"
 
   echo "  credentials"
-  for f in user.txt pass.txt ssh-user.txt ssh-pass.txt gmp-user.txt gmp-pass.txt; do
+  for f in user.txt pass.txt ssh-user.txt ssh-pass.txt; do
     if [ -f "$f" ]; then $SHRED "$f" 2>/dev/null && printf "    %-18s shredded\n" "$f"; fi
   done
 
@@ -1193,17 +894,9 @@ cmd_cleanup(){
   echo
   echo "  shell history"
   if [ -f "$HOME/.bash_history" ]; then
-    # kameKi no longer puts a GMP password in argv, but an older run may have
-    # left one in this file, so the pattern stays.
-    local H; H=$(gcntiE 'kameki|nxc |gvm-cli' "$HOME/.bash_history")
-    sed -i '/nxc .*-p /d;/gvm-cli.*--gmp-password/d' "$HOME/.bash_history" 2>/dev/null
+    local H; H=$(gcntiE 'kameki|nxc ' "$HOME/.bash_history")
+    sed -i '/nxc .*-p /d' "$HOME/.bash_history" 2>/dev/null
     printf "    %-18s %s line(s) scrubbed\n" "bash_history" "$H"
-  fi
-
-  if [ -d /run/gvmd ] && [ -s gmp-user.txt ]; then
-    echo
-    echo "  gvmd objects"
-    dim "scan credentials are already deleted at the end of each run"
   fi
 
   if [ "$KEEP" -eq 0 ]; then
@@ -1226,10 +919,8 @@ cmd_cleanup(){
     read -rp "    proceed? [y/N] " A
     if [ "${A,,}" = "y" ]; then
       need_root cleanup --purge
-      apt-get remove -y -qq openvas-scanner ospd-openvas gvmd >/dev/null 2>&1
       rm -rf /usr/share/nmap/scripts/vulscan /opt/testssl.sh /usr/local/bin/nuclei /usr/local/bin/testssl.sh
-      rm -rf /var/lib/openvas/plugins
-      su "${SUDO_USER:-root}" -c "pipx uninstall netexec; pipx uninstall wesng; pipx uninstall gvm-tools" >/dev/null 2>&1
+      su "${SUDO_USER:-root}" -c "pipx uninstall netexec; pipx uninstall wesng" >/dev/null 2>&1
       info "tooling removed"
     fi
   fi
@@ -1320,732 +1011,10 @@ cmd_update(){
 }
 
 # =====================================================================
-#  setup-greenbone   (certificates, services, admin user, GMP credentials)
-# =====================================================================
-# Everything here is idempotent and fail-soft. Greenbone is optional, so a
-# failure at any step leaves the standalone engine perfectly usable and must
-# never abort the install. The feed itself is deliberately NOT synced here:
-# it is ~5 GB over rsync/873 and routinely blocked on client networks, so it
-# stays an explicit decision.
-GVM_ACCOUNT=""            # the system account gvmd runs as
-gvm_service_account(){
-  local u
-  for u in _gvm gvm; do id -u "$u" >/dev/null 2>&1 && { echo "$u"; return 0; }; done
-  return 1
-}
-
-# Report a captured failure. A tool that fails silently is worse than one
-# that fails loudly, because the blank line reads as a display bug rather
-# than a missing message, so silence is named as silence.
-say_err(){   # $1: captured output, $2.. a hint to print when it is empty
-  if [ -n "${1:-}" ]; then printf '%s\n' "$1" | tail -8 | sed 's/^/      /'
-  else shift; dim "the command printed nothing."; [ $# -gt 0 ] && dim "$*"; fi
-}
-
-# gvmd keeps every object it owns in PostgreSQL: the role, the database and
-# two extensions. Without them it exits immediately at startup, which showed
-# up only as "gvmd failed" with no reason, because nothing started postgres
-# and nothing printed gvmd's own error.
-gvmd_db_ready(){      # $1: the gvm service account, e.g. _gvm
-  local acct="$1" out=""
-  have psql || { dim "psql not found. install: apt-get install -y postgresql"; return 1; }
-  id -u postgres >/dev/null 2>&1 || { dim "no postgres system account"; return 1; }
-  _pg(){ runuser -u postgres -- "$@"; }
-
-  if ! _pg psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$acct'" 2>/dev/null \
-       | grep -q 1; then
-    printf "    %-24s" "postgres role $acct"
-    if out=$(_pg createuser -DRS "$acct" 2>&1); then echo "${GRN}created${RST}"
-    else echo "${YEL}failed${RST}"; say_err "$out" "check: systemctl is-active postgresql"; return 1; fi
-  fi
-
-  if ! _pg psql -tAc "SELECT 1 FROM pg_database WHERE datname='gvmd'" 2>/dev/null \
-       | grep -q 1; then
-    printf "    %-24s" "gvmd database"
-    if out=$(_pg createdb -O "$acct" gvmd 2>&1); then echo "${GRN}created${RST}"
-    else echo "${YEL}failed${RST}"; say_err "$out" "check: systemctl is-active postgresql"; return 1; fi
-  fi
-
-  # Idempotent, so a partially provisioned box is repaired rather than
-  # refused. gvmd needs the dba role and both extensions present.
-  printf "    %-24s" "database extensions"
-  out=$(_pg psql -q -d gvmd \
-          -c 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp";' \
-          -c 'CREATE EXTENSION IF NOT EXISTS "pgcrypto";' 2>&1)
-  if [ -n "$out" ] && printf '%s' "$out" | grep -qi 'error'; then
-    echo "${YEL}failed${RST}"; say_err "$out"; return 1
-  fi
-  _pg psql -q -d gvmd -c 'CREATE ROLE dba WITH SUPERUSER NOINHERIT;' >/dev/null 2>&1 || true
-  _pg psql -q -d gvmd -c "GRANT dba TO \"$acct\";"             >/dev/null 2>&1 || true
-  echo "${GRN}ok${RST}"
-
-  # The schema is created by gvmd itself the first time it runs, so --migrate
-  # is only meaningful once one exists. On a database created a moment ago
-  # there is nothing to migrate and gvmd exits non-zero, which is not a
-  # fault. Reporting that as "schema migration failed" sent the operator
-  # looking for a database problem that was not there.
-  printf "    %-24s" "schema"
-  if ! _pg psql -d gvmd -tAc \
-        "SELECT 1 FROM information_schema.tables WHERE table_name='meta'" \
-        2>/dev/null | grep -q 1; then
-    echo "${DIM}empty, gvmd creates it on first start${RST}"
-    return 0
-  fi
-  if out=$(runuser -u "$acct" -- gvmd --migrate 2>&1); then
-    echo "${GRN}up to date${RST}"
-  else
-    echo "${YEL}migration failed${RST}"
-    say_err "$out" "gvmd will not migrate while an instance is running. \
-stop it and re-run: systemctl stop gvmd"
-    return 1
-  fi
-  return 0
-}
-# gvmd asks ospd-openvas for the VT list while it is starting. With an empty
-# plugin directory, or a feed large enough to take minutes to enumerate, that
-# request does not return inside systemd's default 90-second start timeout.
-# systemd then kills gvmd and restarts it, forever: one site reached restart
-# counter 493. Raising the timeout is what breaks the loop, and the loop has
-# to be broken before a feed import, because an import takes longer than 90
-# seconds and gets killed half way through every time.
-GVMD_START_TIMEOUT="${GVMD_START_TIMEOUT:-1800}"
-gvmd_fix_start_timeout(){
-  local d=/etc/systemd/system/gvmd.service.d
-  printf "    %-24s" "gvmd start timeout"
-  mkdir -p "$d" 2>/dev/null || { echo "${YEL}cannot write $d${RST}"; return 1; }
-  cat > "$d/kameki-timeout.conf" <<CONF
-# Written by kameki. gvmd queries ospd-openvas for the VT list during start,
-# which exceeds the packaged 90s TimeoutStartSec on a fresh or large feed.
-# systemd killed and restarted gvmd indefinitely as a result.
-[Unit]
-StartLimitIntervalSec=0
-[Service]
-TimeoutStartSec=${GVMD_START_TIMEOUT}
-Restart=on-failure
-RestartSec=30
-CONF
-  systemctl daemon-reload >/dev/null 2>&1
-  echo "${GRN}${GVMD_START_TIMEOUT}s${RST}"
-}
-
-# A gvmd already in a restart loop must be stopped before the feed work, or
-# every import is cut short by the next restart.
-gvmd_break_restart_loop(){
-  local n
-  n=$(systemctl show -p NRestarts --value gvmd 2>/dev/null | tr -cd '0-9')
-  systemctl stop gvmd    >/dev/null 2>&1 || true
-  systemctl reset-failed gvmd >/dev/null 2>&1 || true
-  if [ -n "${n:-}" ] && [ "${n:-0}" -gt 3 ]; then
-    printf "    %-24s" "restart loop"
-    echo "${YEL}stopped after ${n} restarts${RST}"
-  fi
-}
-
-nvt_count(){
-  local n=0
-  [ -d /var/lib/openvas/plugins ] \
-    && n=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l | tr -cd '0-9')
-  echo "${n:-0}"
-}
-
-# The feed is what every other number depends on. Nothing in this script used
-# to fetch it, so a clean machine reached the end of setup with 0 plugins, 0
-# scan configs and 0 report formats, and was told to go and run the sync by
-# hand. It is run here instead. Output is not captured, so rsync progress is
-# visible rather than the terminal appearing dead for an hour.
-# ---------------------------------------------------------------------------
-#  Greenbone feed over HTTPS, as OCI images, instead of rsync
-#
-#  The community feed is published as container images with the data baked in,
-#  anonymous-pullable over 443 and rebuilt daily. That matters because rsync to
-#  873 is what fails at client sites: it connects, starts transferring, and the
-#  filtering device kills it -- "safe_read failed to read 1 bytes: Connection
-#  timed out (110)". Registry blobs answer Range requests with 206, so a killed
-#  transfer resumes where it stopped and is verified against its own digest.
-#
-#  Without SCAP the required set is about 270 MiB in resumable chunks rather
-#  than several GB in one stream. SCAP is another 1.5 GiB and is NOT fetched by
-#  default: gvmd runs without it, logging "No SCAP database found" and
-#  continuing, and CVE references come from each test's own script_cve_id.
-#
-#  This does not make Greenbone a Windows engine. Its newest Windows
-#  cumulative-update test is dated 2025-10-15 and Server 2022 has two tests in
-#  total, so Windows patch level comes from the MSRC comparison. What this
-#  rescues is the part of Greenbone that is genuinely current: Debian, Ubuntu,
-#  SUSE and Fedora-family Linux via Notus.
-# ---------------------------------------------------------------------------
-GB_REGISTRY="${GB_REGISTRY:-registry.community.greenbone.net}"
-GB_REPOS="${GB_REPOS:-vulnerability-tests notus-data data-objects report-formats cert-bund-data dfn-cert-data}"
-GB_WITH_SCAP="${GB_WITH_SCAP:-0}"
-# Back-off between resume attempts. Configurable so the regression suite
-# can drive the failure paths without waiting out real sleeps.
-GB_RETRY_SLEEP="${GB_RETRY_SLEEP:-3}"
-GB_RETRIES="${GB_RETRIES:-5}"
-
-# A pull token lasts 1800s and is re-minted for every attempt, because a blob
-# that needs resuming is exactly the blob whose transfer outlived its token.
-gb_oci_token(){
-  curl -fsSL --max-time 60 \
-    "https://$GB_REGISTRY/service/token?service=harbor-registry&scope=repository:community/$1:pull" \
-    2>/dev/null | python3 -c 'import json,sys
-try: sys.stdout.write(json.load(sys.stdin)["token"])
-except Exception: sys.exit(1)'
-}
-
-# gb_oci_layers REPO -> "digest<TAB>size" a line, for the amd64 image.
-gb_oci_layers(){
-  local repo="$1" tok child
-  tok=$(gb_oci_token "$repo") || return 1
-  child=$(curl -fsSL --max-time 60 -H "Authorization: Bearer $tok" \
-    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-    "https://$GB_REGISTRY/v2/community/$repo/manifests/latest" 2>/dev/null \
-    | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-for m in d.get("manifests") or []:
-    if (m.get("platform") or {}).get("architecture") == "amd64":
-        sys.stdout.write(m["digest"]); break
-else:
-    sys.exit(1)') || return 1
-  curl -fsSL --max-time 60 -H "Authorization: Bearer $tok" \
-    -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-    "https://$GB_REGISTRY/v2/community/$repo/manifests/$child" 2>/dev/null \
-    | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-for l in d.get("layers") or []:
-    print("%s\t%d" % (l["digest"], l["size"]))'
-}
-
-# gb_oci_blob REPO DIGEST OUT SIZE -> resumable download, verified against the
-# digest the registry itself published. A blob that fails verification is
-# deleted: a half-written feed file is worse than none, because gvmd will load
-# it and report whatever it happens to contain.
-gb_oci_blob(){
-  local repo="$1" dig="$2" out="$3" want="${4:-0}" try tok have
-  for try in $(seq 1 "$GB_RETRIES"); do
-    have=0; [ -f "$out" ] && have=$(wc -c < "$out" | tr -d ' ')
-    [ "$want" -gt 0 ] && [ "$have" -eq "$want" ] && break
-    tok=$(gb_oci_token "$repo") || { sleep "$GB_RETRY_SLEEP"; continue; }
-    curl -fsSL --max-time 1800 --speed-time 60 --speed-limit 1024 \
-      -C - -H "Authorization: Bearer $tok" \
-      "https://$GB_REGISTRY/v2/community/$repo/blobs/$dig" -o "$out" 2>/dev/null
-    have=0; [ -f "$out" ] && have=$(wc -c < "$out" | tr -d ' ')
-    [ "$want" -gt 0 ] && [ "$have" -eq "$want" ] && break
-    [ "$want" -eq 0 ] && [ "$have" -gt 0 ] && break
-    dim "  resuming $(printf '%.20s' "${dig#sha256:}") at ${have} of ${want} bytes"
-    sleep "$GB_RETRY_SLEEP"
-  done
-  [ -s "$out" ] || return 1
-  if have sha256sum; then
-    [ "sha256:$(sha256sum "$out" | cut -d' ' -f1)" = "$dig" ] && return 0
-    err "digest mismatch on $(printf '%.20s' "${dig#sha256:}"), discarding"
-    rm -f "$out"
-    return 1
-  fi
-  return 0
-}
-
-# gb_oci_pull REPO STAGING -> every layer fetched and its var/ tree unpacked
-# into STAGING, later layers overlaying earlier ones the way a container image
-# is assembled.
-#
-# Only var/ is taken. Each image is built on busybox, so the first layer is a
-# whole root filesystem -- 2.2 MiB of /bin that is not feed data and must not
-# be written anywhere near /var/lib. Choosing "the biggest layer" would be
-# worse than useless: for data-objects the base image IS the biggest layer, so
-# that heuristic downloads the wrong thing and extracts nothing.
-gb_oci_pull(){
-  local repo="$1" stage="$2" dig size n=0 ok=0 tmp
-  tmp="$stage/.blobs"; mkdir -p "$tmp" "$stage" || return 1
-  local layers; layers=$(gb_oci_layers "$repo") || { err "$repo: no manifest"; return 1; }
-  [ -n "$layers" ] || { err "$repo: manifest lists no layers"; return 1; }
-  while IFS=$'\t' read -r dig size; do
-    [ -n "$dig" ] || continue
-    n=$((n+1))
-    if gb_oci_blob "$repo" "$dig" "$tmp/${dig#sha256:}.tgz" "$size"; then
-      # A layer with no var/ is the base image or a metadata layer; tar exits
-      # non-zero and that is the expected, uninteresting case.
-      tar -xzf "$tmp/${dig#sha256:}.tgz" -C "$stage" var 2>/dev/null && ok=$((ok+1))
-      rm -f "$tmp/${dig#sha256:}.tgz"
-    else
-      err "$repo: layer $n could not be fetched"
-      return 1
-    fi
-  done <<< "$layers"
-  rmdir "$tmp" 2>/dev/null
-  [ "$ok" -gt 0 ] || { err "$repo: no layer carried feed data"; return 1; }
-  return 0
-}
-
-# Move a staged tree into place. Separate from the download so the placement
-# rules can be tested without a network.
-gb_oci_place(){
-  local stage="$1" rel moved=0
-  # The release directory inside each image is NOT fixed and is not the same
-  # across repositories: the tests ship under var/lib/openvas/24.10/ while the
-  # gvmd data objects ship under var/lib/gvm/data-objects/gvmd/20.08/. It is
-  # discovered rather than assumed, so a Greenbone release bump does not
-  # silently produce an empty feed.
-  for rel in "$stage"/var/lib/openvas/*/vt-data/nasl; do
-    [ -d "$rel" ] || continue
-    mkdir -p /var/lib/openvas/plugins
-    cp -a "$rel/." /var/lib/openvas/plugins/ 2>/dev/null && moved=$((moved+1))
-    dim "  tests from $(basename "$(dirname "$(dirname "$rel")")")"
-  done
-  # Notus ships its advisories as a tarball inside the image.
-  if [ -f "$stage/var/lib/notus/notus-data.tar.gz" ]; then
-    mkdir -p /var/lib/notus
-    tar -xzf "$stage/var/lib/notus/notus-data.tar.gz" -C /var/lib/notus/ 2>/dev/null \
-      && moved=$((moved+1))
-  fi
-  for sub in data-objects cert-data scap-data report-formats; do
-    [ -d "$stage/var/lib/gvm/$sub" ] || continue
-    mkdir -p "/var/lib/gvm/$sub"
-    cp -a "$stage/var/lib/gvm/$sub/." "/var/lib/gvm/$sub/" 2>/dev/null \
-      && moved=$((moved+1))
-  done
-  # gvmd and the scanner run as the service account, not as root.
-  local g; g=$(gb_account 2>/dev/null || echo _gvm)
-  chown -R "$g:$g" /var/lib/openvas /var/lib/gvm /var/lib/notus 2>/dev/null || true
-  [ "$moved" -gt 0 ]
-}
-
-# The service account the Greenbone packages use. Debian and Ubuntu use _gvm.
-gb_account(){
-  local a
-  for a in _gvm gvm; do id -u "$a" >/dev/null 2>&1 && { printf '%s' "$a"; return 0; }; done
-  printf '_gvm'
-}
-
-# Fetch the whole feed over HTTPS. Returns 0 when at least the vulnerability
-# tests and Notus arrived, which is what an authenticated Linux scan needs.
-gb_feed_oci(){
-  local stage repo failed="" got=0
-  stage=$(mktemp -d) || return 1
-  local repos="$GB_REPOS"
-  [ "$GB_WITH_SCAP" = "1" ] && repos="$repos scap-data"
-  info "fetching the Greenbone feed over HTTPS from $GB_REGISTRY"
-  dim "resumable, digest-verified, and about 270 MiB without SCAP"
-  [ "$GB_WITH_SCAP" = "1" ] \
-    && dim "SCAP included, another 1.5 GiB: GB_WITH_SCAP=0 to skip it" \
-    || dim "SCAP skipped (1.5 GiB). gvmd runs without it; CVE references come"
-  [ "$GB_WITH_SCAP" = "1" ] || dim "from each test's own script_cve_id. GB_WITH_SCAP=1 to include it"
-  for repo in $repos; do
-    printf "    %-22s" "$repo"
-    if gb_oci_pull "$repo" "$stage" >/dev/null 2>&1; then
-      echo "${GRN}ok${RST}"; got=$((got+1))
-    else
-      echo "${YEL}failed${RST}"; failed="$failed $repo"
-    fi
-  done
-  if [ -n "$failed" ]; then
-    warn "not fetched:$failed"
-    dim "re-run to resume; partial blobs are discarded, completed ones are not"
-  fi
-  if [ "$got" -eq 0 ]; then rm -rf "$stage"; return 1; fi
-  if gb_oci_place "$stage"; then
-    local n=0
-    [ -d /var/lib/openvas/plugins ] \
-      && n=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l | tr -d ' ')
-    info "feed in place, $n test scripts"
-    rm -rf "$stage"
-    [ -n "$failed" ] && return 1
-    return 0
-  fi
-  err "nothing could be moved into place"
-  rm -rf "$stage"
-  return 1
-}
-
-FEED_SYNC="${FEED_SYNC:-1}"
-# gvmd-data is a few megabytes and carries the scan configs, report formats
-# and port lists, so it goes first: the operator sees "scan configs" stop
-# reading zero within a minute instead of after the multi-gigabyte NVT
-# download. nvt is what an actual scan needs. scap and cert are large and
-# add CVE and advisory metadata only, so they come last and an interrupted
-# run still leaves a usable scanner behind.
-FEED_TYPES="${FEED_TYPES:-gvmd-data nvt scap cert}"
-# auto  : HTTPS from the registry, rsync only if that cannot complete
-# https : registry only, never rsync
-# rsync : the old behaviour
-FEED_TRANSPORT="${FEED_TRANSPORT:-auto}"
-greenbone_sync_feeds(){
-  have greenbone-feed-sync || {
-    warn "greenbone-feed-sync is not installed, the feed cannot be fetched"
-    dim "install the Greenbone tooling, or run with FEED_SYNC=0 to skip"
-    return 1
-  }
-  local t rc=0 before after
-  before=$(nvt_count)
-  dim "fetching the Greenbone feeds. First run is several GB and can take"
-  dim "a long time on a client link. Skip with FEED_SYNC=0 $0 setup-greenbone"
-  dim "order: $FEED_TYPES. rsync resumes, so an interrupted sync continues"
-  dim "where it stopped rather than starting again."
-  for t in $FEED_TYPES; do
-    echo
-    dim "--- feed: $t"
-    if greenbone-feed-sync --type "$t"; then dim "$t ok"
-    else warn "$t sync failed or was incomplete"; rc=1; fi
-  done
-  after=$(nvt_count)
-  echo
-  printf "    %-24s%s\n" "NVT plugins" "$before -> $after"
-  # ospd-openvas caches the plugin set in redis and only rereads it on start,
-  # so gvmd would otherwise ask about a feed ospd has not loaded yet.
-  if systemctl list-unit-files ospd-openvas.service >/dev/null 2>&1; then
-    printf "    %-24s" "ospd-openvas reload"
-    if systemctl restart ospd-openvas >/dev/null 2>&1; then echo "${GRN}ok${RST}"
-    else echo "${YEL}failed${RST}"; fi
-  fi
-  return $rc
-}
-gvmd_socket(){
-  local s
-  for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock \
-           /var/run/gvm/gvmd.sock "$HOME/.gvm/gvmd/gvmd.sock"; do
-    [ -S "$s" ] && { echo "$s"; return 0; }
-  done
-  return 1
-}
-
-greenbone_ready_report(){
-  local NVTS=0
-  [ -d /var/lib/openvas/plugins ] \
-    && NVTS=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
-
-  # Scan configs, report formats and port lists come from the GVMD data feed,
-  # which syncs separately from the NVT plugins. A machine can hold a hundred
-  # thousand NVTs and still be unable to create a task because that feed never
-  # arrived, so it is checked here rather than discovered mid-scan.
-  local CFGS=0 RFMTS=0 SCANNERS=0 CFG_LIST="" FMT_LIST=""
-  local WANT_CFG="${CFG_NAME:-Full and fast}" HAVE_CFG="" HAVE_CSV=""
-  if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
-    CFG_LIST=$(jgmp "$(gmp_py "$SOCK" list --kind configs 2>/dev/null)" \
-                     '(.items // [])[].name')
-    FMT_LIST=$(jgmp "$(gmp_py "$SOCK" list --kind formats 2>/dev/null)" \
-                     '(.items // [])[].name')
-    SCANNERS=$(jgmp "$(gmp_py "$SOCK" list --kind scanners 2>/dev/null)" \
-                     '(.items // []) | length' | tr -cd '0-9')
-    CFGS=$(printf '%s' "$CFG_LIST" | grep -c . | tr -cd '0-9')
-    RFMTS=$(printf '%s' "$FMT_LIST" | grep -c . | tr -cd '0-9')
-    HAVE_CFG=$(printf '%s\n' "$CFG_LIST" | grep -Fxi "$WANT_CFG")
-    HAVE_CSV=$(printf '%s\n' "$FMT_LIST" | grep -Fxi "CSV Results")
-  fi
-  CFGS="${CFGS:-0}"; RFMTS="${RFMTS:-0}"; SCANNERS="${SCANNERS:-0}"
-  printf "    %-24s%s\n" "scan configs" \
-    "$CFGS  ($(printf '%s' "$CFG_LIST" | paste -sd, - | cut -c1-64))"
-  printf "    %-24s%s\n" "report formats" \
-    "$RFMTS  ($(printf '%s' "$FMT_LIST" | paste -sd, - | cut -c1-64))"
-  printf "    %-24s%s\n" "scanners" "$SCANNERS"
-
-  if [ -z "$HAVE_CFG" ] || [ -z "$HAVE_CSV" ]; then
-    echo
-    warn "the GVMD data feed has not been imported, the NVT scan cannot run"
-    [ -z "$HAVE_CFG" ] && dim "missing scan config:   \"$WANT_CFG\""
-    [ -z "$HAVE_CSV" ] && dim "missing report format: \"CSV Results\""
-    dim "$NVTS NVT plugins are present, but those come from a different feed."
-    dim "scan configs, report formats and port lists live in"
-    dim "/var/lib/gvm/data-objects/gvmd and sync separately:"
-    dim "  sudo greenbone-feed-sync --type gvmd-data"
-    dim "  sudo systemctl restart gvmd     # gvmd imports on start"
-    dim "if the counts do not move after both, gvmd downloaded the data but"
-    dim "did not import it. The usual reason is that systemd killed gvmd"
-    dim "mid-import on its start timeout, which looks like a restart loop:"
-    dim "  systemctl show -p NRestarts --value gvmd"
-    dim "  journalctl -u gvmd --since '10 min ago'"
-    return 1
-  fi
-  echo
-  if [ "$NVTS" -ge 10000 ]; then
-    info "Greenbone ready, $NVTS NVTs. the next run uses both engines"
-    dim "confirm any time with: $0 doctor"
-  else
-    warn "Greenbone authenticates but the feed holds only $NVTS scripts"
-    dim "the engine needs 10000. sudo greenbone-feed-sync   # ~5 GB, not run for you"
-    dim "blocked on site? the standalone engine needs no feed"
-  fi
-}
-
-# Before any credential work: without the helper the verification below cannot
-# run, and an unverified password would be written as though it worked.
-GMP_LAST=""        # whatever the helper said on the most recent check
-GMP_BROKEN=0       # 1 when the client could not run, as opposed to being refused
-# A helper that cannot run is not a bad account. The two are reported
-# separately so a missing library is never presented as a wrong password,
-# which previously sent people off rotating credentials that were fine.
-gmp_auth_ok(){     # user pass socket -> 0 when gvmd actually accepts them
-  GMP_BROKEN=0
-  if ! gmp_py_ready; then
-    GMP_BROKEN=1
-    gmp_py_find >/dev/null 2>&1 \
-      && GMP_LAST="python-gvm is not installed for any python on this box" \
-      || GMP_LAST="kameki_gmp.py is not beside this script"
-    return 1
-  fi
-  # The account being checked may not be on disk yet, so the pair is written to
-  # a private directory and passed by path. It never appears in argv, which is
-  # what the old --gmp-password did, visible in ps to every user on the box.
-  local d o rc
-  d=$(mktemp -d 2>/dev/null) || {
-    GMP_LAST="cannot create a private directory to check the GMP credential"
-    GMP_BROKEN=1; return 1
-  }
-  chmod 700 "$d" 2>/dev/null || true
-  ( umask 077; printf '%s' "$1" > "$d/u"; printf '%s' "$2" > "$d/p" )
-  GMP_UF="$d/u"; GMP_PF="$d/p"
-  o=$(gmp_py "$3" check 2>&1); rc=$?
-  GMP_UF=""; GMP_PF=""
-  rm -rf "$d"
-  # Report gvmd's own sentence where there is one; the raw JSON otherwise.
-  local e; e=$(jgmp "$o" '.error // empty')
-  [ -n "$e" ] && GMP_LAST="$e" || GMP_LAST="$o"
-  [ "$rc" -eq 0 ] && return 0
-  # Exit 3 is the helper's "library missing"; anything else is gvmd's answer.
-  [ "$rc" -eq 3 ] && GMP_BROKEN=1
-  return 1
-}
-
-_trim(){ printf '%s' "$1" | tr '\n' ' ' | tr -s ' ' | cut -c1-150; }
-
-cmd_setup_greenbone(){
-  need_root setup-greenbone
-  step "Greenbone setup"
-
-  if ! have gvmd; then
-    warn "gvmd is not installed, nothing to set up"
-    dim "the standalone engine needs none of this: $0 run"
-    return 1
-  fi
-
-  # 1. certificates ---------------------------------------------------
-  if have gvm-manage-certs; then
-    printf "    %-24s" "certificates"
-    if gvm-manage-certs -a >/dev/null 2>&1; then echo "${GRN}ok${RST}"
-    else echo "${DIM}already present or not needed${RST}"; fi
-  fi
-
-  # 2. services -------------------------------------------------------
-  local svc
-  # redis ships under different unit names, and on some builds gvmd is happy
-  # without a dedicated one, so the first that exists is used and a miss is
-  # not an error.
-  local redis_unit=""
-  for svc in redis-server@openvas redis-server redis; do
-    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 \
-      && { redis_unit="$svc"; break; }
-  done
-  # postgresql first: gvmd will not start without its database, and gvmd is
-  # started last so the database exists by the time it runs.
-  local out=""
-  for svc in postgresql $redis_unit ospd-openvas; do
-    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || continue
-    printf "    %-24s" "$svc"
-    if out=$(systemctl enable --now "$svc" 2>&1); then echo "${GRN}started${RST}"
-    else
-      echo "${YEL}failed${RST}"
-      printf '%s\n' "$out" | tail -4 | sed 's/^/      /'
-      systemctl status "$svc" --no-pager -n 6 2>&1 | sed 's/^/      /'
-    fi
-  done
-
-  # Order matters from here, and this block has to come first. A gvmd in a
-  # restart loop holds the database, so gvmd --migrate below cannot run, and
-  # it truncates every feed import. The loop is broken and the start timeout
-  # raised before anything touches the database or the feed, and gvmd is
-  # started again only once the feed is on disk.
-  if systemctl list-unit-files gvmd.service >/dev/null 2>&1; then
-    gvmd_break_restart_loop
-    gvmd_fix_start_timeout || true
-  fi
-
-  local GVM_ACCT
-  if GVM_ACCT=$(gvm_service_account); then gvmd_db_ready "$GVM_ACCT" || true
-  else dim "no _gvm or gvm account yet, skipping the database step"; fi
-
-  # 3. feeds ----------------------------------------------------------
-  # HTTPS first. rsync to 873 is the transport that fails at client sites --
-  # it connects, transfers, and the filtering device kills it. The same data
-  # is published as OCI images over 443 in resumable, digest-verified chunks,
-  # so that is tried first and rsync is kept only as the fallback for a site
-  # where the registry is blocked but 873 is not.
-  if [ "$FEED_SYNC" = "1" ] && [ "$(nvt_count)" -lt 10000 ]; then
-    if [ "$FEED_TRANSPORT" = "rsync" ]; then
-      greenbone_sync_feeds || true
-    elif gb_feed_oci; then
-      :
-    elif [ "$FEED_TRANSPORT" = "auto" ]; then
-      warn "the registry did not serve the whole feed, falling back to rsync"
-      dim "rsync is the transport that tends to fail here, so expect this to"
-      dim "be slower and to need re-running. FEED_TRANSPORT=https to not try it"
-      greenbone_sync_feeds || true
-    fi
-  else
-    printf "    %-24s%s\n" "NVT plugins" "$(nvt_count)"
-    [ "$FEED_SYNC" = "1" ] || dim "feed sync skipped, FEED_SYNC=0"
-  fi
-
-  # 4. gvmd -----------------------------------------------------------
-  if systemctl list-unit-files gvmd.service >/dev/null 2>&1; then
-    printf "    %-24s" "gvmd"
-    # --now blocks until systemd decides the unit is up, which is now up to
-    # GVMD_START_TIMEOUT, so this is the step that waits.
-    if out=$(systemctl enable --now gvmd 2>&1); then echo "${GRN}started${RST}"
-    else
-      echo "${YEL}failed${RST}"
-      printf '%s\n' "$out" | tail -4 | sed 's/^/      /'
-      # Suppressing this is what made the failure unreadable before.
-      journalctl -u gvmd -n 15 --no-pager 2>/dev/null | sed 's/^/      /' \
-        || systemctl status gvmd --no-pager -n 10 2>&1 | sed 's/^/      /'
-    fi
-  fi
-
-  # 5. wait for the socket --------------------------------------------
-  # Thirty seconds was never enough on a first start: gvmd enumerates the VT
-  # set before it listens, which is minutes on a full feed.
-  printf "    %-24s" "gvmd socket"
-  local waited=0 SOCK="" SOCK_WAIT="${SOCK_WAIT:-300}"
-  while [ "$waited" -lt "$SOCK_WAIT" ]; do
-    SOCK=$(gvmd_socket) && break
-    sleep 3; waited=$((waited + 3))
-    [ $((waited % 30)) -eq 0 ] && printf "."
-  done
-  if [ -z "$SOCK" ]; then
-    echo "${YEL}not present after ${SOCK_WAIT}s${RST}"
-    dim "the lines above are gvmd's own output. check these in order:"
-    dim "  systemctl is-active postgresql ospd-openvas"
-    dim "  sudo journalctl -u gvmd -n 40 --no-pager"
-    dim "  systemctl show -p NRestarts --value gvmd    # a loop means it is"
-    dim "    being killed before it finishes starting; raise the timeout with"
-    dim "    GVMD_START_TIMEOUT=3600 sudo -E $0 setup-greenbone"
-    dim "on Kali the packaged helper does all of this: sudo gvm-setup"
-    dim "the standalone engine needs none of it: $0 run"
-    return 1
-  fi
-  echo "${GRN}$SOCK${RST}"
-
-  # 4. admin user and credentials -------------------------------------
-  if [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
-    printf "    %-24s" "GMP authentication"
-    if gmp_auth_ok "$(head -n1 gmp-user.txt)" "$(head -n1 gmp-pass.txt)" "$SOCK"; then
-      echo "${GRN}ok, existing credentials${RST}"
-      greenbone_ready_report; return 0
-    fi
-    echo "${YEL}existing credentials rejected, replacing them${RST}"
-  fi
-
-  GVM_ACCOUNT=$(gvm_service_account) || {
-    warn "no _gvm or gvm system account, cannot create the admin user"
-    return 1
-  }
-
-  local GU="kameki-admin" GP
-  GP=$(head -c 32 /dev/urandom | base64 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 24)
-  [ -n "$GP" ] || GP=$(date +%s%N | sha256sum | head -c 24)
-
-  printf "    %-24s" "admin user"
-  # gvmd --help: "--role=<role>  Role for --create-user". Without it the
-  # account is created, authenticates, and holds no permissions, so every GMP
-  # call fails. That, not the password flags, is what broke earlier attempts:
-  # --password and --new-password were valid all along.
-  local made=0 f out="" harvest="" tried=""
-
-  # 1. create with a role, then use the password gvmd prints
-  out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" --role=Admin 2>&1)
-  tried="$tried
-      create --role=Admin  : $(_trim "$out")"
-  harvest=$(printf '%s' "$out" \
-            | sed -n "s/.*[Pp]assword[: ]*['\"]\\([^'\"]*\\)['\"].*/\\1/p" | tail -1)
-  if [ -n "$harvest" ] && gmp_auth_ok "$GU" "$harvest" "$SOCK"; then
-    GP="$harvest"; made=1
-  else
-    [ -n "$harvest" ] && tried="$tried
-      auth as created      : $(_trim "$GMP_LAST")"
-  fi
-
-  # 2. account already existed: set a password we control
-  if [ "$made" -eq 0 ]; then
-    for f in --new-password --password; do
-      out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--user=$GU" "$f=$GP" 2>&1)
-      tried="$tried
-      $f            : $(_trim "$out")"
-      if gmp_auth_ok "$GU" "$GP" "$SOCK"; then made=1; break; fi
-      tried="$tried
-      auth after $f : $(_trim "$GMP_LAST")"
-    done
-  fi
-
-  # 3. create and set in one call, for builds that prefer it
-  if [ "$made" -eq 0 ]; then
-    out=$(runuser -u "$GVM_ACCOUNT" -- gvmd "--create-user=$GU" --role=Admin \
-                  "--password=$GP" 2>&1)
-    tried="$tried
-      create --password    : $(_trim "$out")"
-    gmp_auth_ok "$GU" "$GP" "$SOCK" && made=1
-  fi
-
-  # A GMP client that cannot run is not a bad account. If the credentials
-  # could not be checked because the checker is broken, keep them, say so
-  # plainly, and point at the thing that actually needs fixing.
-  if [ "$made" -eq 0 ] && [ "$GMP_BROKEN" -eq 1 ] && [ -n "$harvest" ]; then
-    GP="$harvest"
-    echo "${YEL}created, unverified${RST}"
-    printf '%s\n' "$tried" | sed '/^$/d'
-    echo
-    warn "the account was created, the GMP client could not be used to check it"
-    dim "$GMP_LAST"
-    dim "the client failed rather than being refused, so the fault is in the"
-    dim "client or its install, not in gvmd or the password. check by hand:"
-    dim "  sudo pip3 install --break-system-packages python-gvm"
-    dim "  $0 doctor"
-    dim "the standalone engine needs no GMP client and is unaffected"
-    made=1
-  fi
-
-  if [ "$made" -eq 0 ]; then
-    echo "${RED}failed${RST}"
-    dim "every attempt, in order:"
-    printf '%s\n' "$tried" | sed '/^$/d'
-    dim "recover by hand, then re-run this command:"
-    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --delete-user=$GU"
-    dim "  sudo runuser -u $GVM_ACCOUNT -- gvmd --create-user=$GU --role=Admin"
-    harvest=""; GP=""
-    return 1
-  fi
-  harvest=""
-  echo "${GRN}$GU${RST}"
-
-  printf '%s\n' "$GU" > gmp-user.txt
-  printf '%s\n' "$GP" > gmp-pass.txt
-  chmod 600 gmp-user.txt gmp-pass.txt
-  [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" gmp-user.txt gmp-pass.txt 2>/dev/null
-  GP=""
-
-  # 5. prove the files on disk work, not just the ones in memory --------
-  printf "    %-24s" "GMP authentication"
-  if gmp_auth_ok "$(head -n1 gmp-user.txt)" "$(head -n1 gmp-pass.txt)" "$SOCK"; then
-    echo "${GRN}ok${RST}"
-  elif [ "$GMP_BROKEN" -eq 1 ]; then
-    echo "${YEL}not checked, the GMP client could not run${RST}"
-    dim "$GMP_LAST"
-    dim "credentials kept. install python-gvm, then: $0 doctor"
-  else
-    echo "${RED}failed${RST}"
-    dim "gvmd refused these credentials:"
-    printf '%s\n' "$GMP_LAST" | head -3 | sed 's/^/      /'
-    dim "removing them so nothing later mistakes this for a working setup"
-    rm -f gmp-user.txt gmp-pass.txt
-    return 1
-  fi
-  printf "    %-24s%s\n" "credential files" "${GRN}gmp-user.txt, gmp-pass.txt, mode 600${RST}"
-
-  greenbone_ready_report
-  return 0
-}
-
-# =====================================================================
 #  usage
 # =====================================================================
 cmd_usage(){
-  sed -n '2,40p' "$0" | sed 's/^#//;s/^ //'
+  sed -n '2,${ /^[^#]/q; p; }' "$0" | sed 's/^#//;s/^ //'
   exit 0
 }
 
@@ -2056,14 +1025,12 @@ SUB="${1:-run}"
 case "$SUB" in
   install)   shift; cmd_install "$@"; exit $? ;;
   update)    shift; cmd_update "$@"; exit $? ;;
-  setup-greenbone) shift; cmd_setup_greenbone "$@"; exit $? ;;
   bundle)    shift; cmd_bundle "$@"; exit $? ;;
   doctor)    shift; cmd_doctor "$@"; exit $? ;;
   preflight) shift; cmd_preflight "$@"; exit $? ;;
   cleanup)   shift; cmd_cleanup "$@"; exit $? ;;
   -h|--help|help) cmd_usage ;;
   run)       shift ;;
-  --setup)   cmd_usage ;;
   *)         : ;;   # bare invocation means run
 esac
 
@@ -2077,24 +1044,10 @@ case "$PROFILE" in
   *) err "PROFILE must be quick, standard or deep"; exit 1 ;;
 esac
 
-CFG_FAST="daba56c8-73ec-11df-a475-002264764cea"
-CFG_ULTIMATE="698f691e-7489-11df-9d8c-002264764cea"
-CFG_DEEP="708f25c4-7489-11df-8094-002264764cea"
-CFG_DEEPULT="74db13d6-7489-11df-91b9-002264764cea"
-FMT_CSV="c1645568-627a-11e3-a660-406186ea4fc5"
-FMT_XML="a994b278-1f62-11e1-96ac-406186ea4fc5"
-case "$SCAN_CONFIG" in
-  fast)     CFG_ID="$CFG_FAST";     CFG_NAME="Full and fast" ;;
-  ultimate) CFG_ID="$CFG_ULTIMATE"; CFG_NAME="Full and fast ultimate" ;;
-  deep)     CFG_ID="$CFG_DEEP";     CFG_NAME="Full and very deep" ;;
-  deepult)  CFG_ID="$CFG_DEEPULT";  CFG_NAME="Full and very deep ultimate" ;;
-  *) err "SCAN_CONFIG must be fast, ultimate, deep or deepult"; exit 1 ;;
-esac
-
 # =====================================================================
-#  1. Dependency check and engine selection
+#  1. Dependency check
 # =====================================================================
-step "Dependencies and engine"
+step "Dependencies"
 MISS=0
 chk(){ if command -v "$1" >/dev/null 2>&1; then printf "    %-14s ok\n" "$1"; return 0
        else printf "    %-14s MISSING  ->  %s\n" "$1" "$2"; return 1; fi }
@@ -2105,39 +1058,7 @@ chk nuclei "github.com/projectdiscovery/nuclei/releases"             || MISS=1
 chk jq     "sudo apt install jq -y"                                  || MISS=1
 [ "$MISS" -eq 1 ] && { err "Install the core tools above, then re-run."; exit 1; }
 
-# --- nvt engine availability
-NVT_READY=0; SOCK=""; NVT_FILES=0
-# Count the feed unconditionally, the way doctor does. Counting it only when
-# GMP credentials happen to exist left NVT_FILES at 0 and made the diagnostic
-# below report "feed incomplete (0 NVTs)" on machines with a fully synced
-# feed, sending people to re-run a 5 GB greenbone-feed-sync they did not need.
-[ -d /var/lib/openvas/plugins ] \
-  && NVT_FILES=$(find /var/lib/openvas/plugins -name '*.nasl' 2>/dev/null | wc -l)
-if gmp_py_ready; then
-  for s in /run/gvmd/gvmd.sock /var/run/gvmd/gvmd.sock /run/gvm/gvmd.sock \
-           /var/run/gvm/gvmd.sock "$HOME/.gvm/gvmd/gvmd.sock"; do
-    [ -S "$s" ] && { SOCK="$s"; break; }
-  done
-  if [ -n "$SOCK" ] && [ "$NVT_FILES" -ge 10000 ] \
-     && [ -s gmp-user.txt ] && [ -s gmp-pass.txt ]; then
-    NVT_READY=1
-  fi
-fi
-if [ "$NVT_READY" -eq 1 ]; then
-  printf "    %-14s ok  (%s NVTs, %s)\n" "greenbone" "$NVT_FILES" "$SOCK"
-else
-  printf "    %-14s %s\n" "greenbone" "unavailable"
-  if ! gmp_py_ready; then
-    gmp_py_find >/dev/null 2>&1 \
-      && dim "python-gvm missing -> sudo pip3 install --break-system-packages python-gvm" \
-      || dim "kameki_gmp.py is not beside this script, re-clone or re-install"
-  fi
-  [ -z "$SOCK" ] && dim "no gvmd socket. run: $0 --setup"
-  [ -n "$SOCK" ] && [ "$NVT_FILES" -lt 10000 ] && dim "feed incomplete ($NVT_FILES NVTs). run: sudo greenbone-feed-sync"
-  [ -n "$SOCK" ] && { [ -s gmp-user.txt ] && [ -s gmp-pass.txt ] || dim "gmp-user.txt and gmp-pass.txt not found"; }
-fi
-
-# --- standalone engine components
+# --- assessment components
 WES=""; for c in wes wes.py; do command -v "$c" >/dev/null 2>&1 && { WES="$c"; break; }; done
 SVC_CVE="none"
 # vulners reaches out to its API for every service and has segfaulted nmap on
@@ -2158,7 +1079,7 @@ case "$SVC_CVE_ENGINE" in
 esac
 SA_READY=0
 [ -n "$WES" ] && SA_READY=1
-printf "    %-14s %s\n" "standalone" "$([ $SA_READY -eq 1 ] && echo "ok  (wes: $WES, svc-cve: $SVC_CVE)" || echo "incomplete")"
+printf "    %-14s %s\n" "patch engine" "$([ $SA_READY -eq 1 ] && echo "ok  (wes: $WES, svc-cve: $SVC_CVE)" || echo "incomplete")"
 [ -z "$WES" ] && dim "wes missing -> pipx install wesng && wes --update"
 [ "$SVC_CVE" = "none" ] && dim "svc-cve missing -> sudo git clone https://github.com/scipag/vulscan /usr/share/nmap/scripts/vulscan && sudo nmap --script-updatedb"
 
@@ -2170,37 +1091,13 @@ command -v onesixtyone  >/dev/null 2>&1 && HAVE_SNMP=1
 command -v curl         >/dev/null 2>&1 && HAVE_CURL=1
 echo "    ${DIM}optional: testssl.sh $HAVE_TESTSSL  searchsploit $HAVE_SPLOIT  onesixtyone $HAVE_SNMP${RST}"
 
-# --- resolve engine
-case "$ENGINE" in
-  auto)
-    # The two engines are complementary, not alternatives. Greenbone's NVTs do
-    # not replace WES-NG patch mapping, the NSE vulnerability scripts or the
-    # service version CVE mapping, so when both are usable, run both.
-    if   [ "$NVT_READY" -eq 1 ] && [ "$SA_READY" -eq 1 ]; then ENGINE=both
-    elif [ "$NVT_READY" -eq 1 ];                          then ENGINE=nvt
-    else                                                       ENGINE=standalone
-    fi ;;
-  nvt)        [ "$NVT_READY" -eq 1 ] || { err "ENGINE=nvt but Greenbone is not available. Run: $0 --setup"; exit 1; } ;;
-  standalone) : ;;
-  both)
-    if [ "$NVT_READY" -eq 0 ]; then
-      warn "ENGINE=both but Greenbone is not available, running the standalone engine alone"
-      ENGINE=standalone
-    fi ;;
-  *) err "ENGINE must be auto, nvt, standalone or both"; exit 1 ;;
-esac
-RUN_NVT=0; RUN_SA=0
-case "$ENGINE" in
-  nvt)        RUN_NVT=1 ;;
-  standalone) RUN_SA=1 ;;
-  both)       RUN_NVT=1; RUN_SA=1 ;;
-esac
-if [ "$RUN_SA" -eq 1 ] && [ "$SA_READY" -eq 0 ]; then
-  err "standalone engine selected but WES-NG is not installed"
+# One assessment path now, so there is nothing to resolve.
+RUN_SA=1
+if [ "$SA_READY" -eq 0 ]; then
+  err "WES-NG is not installed"
   dim "it is what maps a host's patch level to CVEs: pipx install wesng && wes --update"
   exit 1
 fi
-info "engine: ${CYN}$ENGINE${RST}"
 
 # nmap needs raw sockets for the ICMP, ACK and UDP probes in Stage 1 and for
 # -sS and -O in Stage 2. Unprivileged it silently falls back to TCP connect,
@@ -2231,14 +1128,9 @@ NTARGETS=$(nblines targets.txt)
 if [ "$UC" -eq 1 ] && [ "$PC" -eq 1 ]; then
   U=$(head -n1 user.txt | tr -d '\r\n'); P=$(head -n1 pass.txt | tr -d '\r\n')
   CREDLBL="$U"; MULTI=0
-  NVT_U="$U"; NVT_P="$P"
 else
   U="user.txt"; P="pass.txt"; CREDLBL="$UC user x $PC pass"; MULTI=1
-  # A GMP credential object holds exactly one pair, but the standalone engine
-  # iterates the files. Keep them separate so selecting the NVT engine no
-  # longer silently reduces the standalone engine to the first pair.
-  NVT_U=$(head -n1 user.txt | tr -d '\r\n'); NVT_P=$(head -n1 pass.txt | tr -d '\r\n')
-  [ "$RUN_NVT" -eq 1 ] && warn "nvt engine takes one credential pair, using the first line of each; the standalone engine still uses all of them"
+  # Every supplied pair is tried in turn.
   if [ "$MULTI" -eq 1 ] && [ "$RUN_SA" -eq 1 ]; then
     echo; warn "Multi-credential: $(( UC * PC * NTARGETS )) attempts. This is a spray and can lock accounts."
     read -rp "    Type YES to continue: " C; [ "$C" = "YES" ] || { err "Aborted."; exit 1; }
@@ -2250,11 +1142,11 @@ if [ -s ssh-user.txt ] && [ -s ssh-pass.txt ]; then
   SU=$(head -n1 ssh-user.txt | tr -d '\r\n'); SP=$(head -n1 ssh-pass.txt | tr -d '\r\n')
   SSH_ON=1
 fi
-for f in user.txt pass.txt ssh-user.txt ssh-pass.txt gmp-user.txt gmp-pass.txt; do
+for f in user.txt pass.txt ssh-user.txt ssh-pass.txt; do
   [ -f "$f" ] && [ "$(stat -c '%a' "$f")" != "600" ] && warn "$f is mode $(stat -c '%a' "$f"), run: chmod 600 $f"
 done
 
-mkdir -p "$RAW"/{sysinfo,wes,linux,tls,mods,nse,ports,ad,nvt}
+mkdir -p "$RAW"/{sysinfo,wes,linux,tls,mods,nse,ports,ad}
 info "profile $PROFILE   jobs $JOBS   targets $NTARGETS   windows creds $CREDLBL"
 [ "$SSH_ON" -eq 1 ] && info "linux creds supplied"
 
@@ -2320,129 +1212,13 @@ EOL=$(cnt "$RAW/eol-os.txt")
 info "hosts with open ports $HOSTS_OPEN   total open ports $TOTAL_PORTS   possible EOL $EOL"
 
 # =====================================================================
-#  Stage 3A  NVT engine  (Greenbone over the gvmd socket)
-# =====================================================================
-NVT_HIGH=0; NVT_MED=0; NVT_LOW=0; NVT_LOG=0; NVT_CVES=0
-NVT_AUTH_HOSTS=0; NVT_HOSTS_F=0; NVT_UNAUTH=0; NVT_ROWS=0
-# Every gvmd object id is declared here. Stage 3A can abandon at four
-# separate points, and each one leaves a later reference pointing at a
-# variable that was never assigned. Under set -u that is fatal, so a failed
-# create_task took stages 3B to 10 and the final report down with it.
-TASK=""; REPORT=""; TARGET=""; SMB_CRED=""; SSH_CRED=""
-NVT_CSV="$RAW/nvt/results.csv"
-: > "$RAW/cve-nvt.txt"
-
-if [ "$RUN_NVT" -eq 1 ]; then
-step "Stage 3A  Greenbone NVT scan  ($NVT_FILES scripts, $CFG_NAME)"
-
-# One process, one authenticated connection, for the whole scan: create the
-# credential and target, create and start the task, poll it, export the CSV and
-# XML, and delete the credential again. That last step runs even when the scan
-# fails, so an aborted run does not leave the client's domain password sitting
-# in gvmd.
-#
-# The scan credential reaches the helper through files in a private directory,
-# never through argv, so it is not visible in `ps` to anyone else on the box.
-NVT_SECRETS=$(mktemp -d 2>/dev/null) || NVT_SECRETS=""
-if [ -z "$NVT_SECRETS" ]; then
-  err "cannot create a private directory for the scan credential"
-  RUN_NVT=0
-else
-chmod 700 "$NVT_SECRETS" 2>/dev/null || true
-( umask 077
-  printf '%s' "$NVT_U" > "$NVT_SECRETS/smb-login"
-  printf '%s' "$NVT_P" > "$NVT_SECRETS/smb-pass" )
-NVT_SSH_ARGS=""
-if [ "$SSH_ON" -eq 1 ] && [ -n "$SU" ]; then
-  ( umask 077
-    printf '%s' "$SU" > "$NVT_SECRETS/ssh-login"
-    printf '%s' "$SP" > "$NVT_SECRETS/ssh-pass" )
-  NVT_SSH_ARGS="--ssh-login-file $NVT_SECRETS/ssh-login --ssh-pass-file $NVT_SECRETS/ssh-pass"
-fi
-
-# shellcheck disable=SC2086  # NVT_SSH_ARGS is a deliberate pair of flags
-SCAN_OUT=$(gmp_py "$SOCK" scan \
-  --run-name     "$RUN_NAME" \
-  --hosts-file   targets.txt \
-  --config-name  "$CFG_NAME" \
-  --config-id    "$CFG_ID" \
-  --alive-test   "$ALIVE_TEST" \
-  --smb-login-file "$NVT_SECRETS/smb-login" \
-  --smb-pass-file  "$NVT_SECRETS/smb-pass" \
-  $NVT_SSH_ARGS \
-  --poll         "$POLL" \
-  --max-minutes  "$NVT_MAX_MIN" \
-  --csv-out      "$NVT_CSV" \
-  --xml-out      "$RAW/nvt/report-full.xml")
-SCAN_RC=$?
-rm -rf "$NVT_SECRETS"
-NVT_SECRETS=""
-
-# Whatever happened, keep whichever ids the helper got as far as issuing. A
-# scan that died after create_task still leaves a task in gvmd, and the id is
-# what you need to find it.
-TASK=$(jgmp "$SCAN_OUT" '.task // ""')
-TARGET=$(jgmp "$SCAN_OUT" '.target // ""')
-REPORT=$(jgmp "$SCAN_OUT" '.report // ""')
-
-if [ "$SCAN_RC" -ne 0 ]; then
-  err "the Greenbone NVT scan did not run"
-  GMSG=$(jgmp "$SCAN_OUT" '.error // empty')
-  if [ -n "$GMSG" ]; then dim "$GMSG"
-  else printf '%s\n' "$SCAN_OUT" | head -3 | sed 's|^|      |'; fi
-  GAVAIL=$(jgmp "$SCAN_OUT" '(.available // [])[]')
-  if [ -n "$GAVAIL" ]; then
-    dim "configs this gvmd does have:"
-    printf '%s\n' "$GAVAIL" | head -12 | sed 's|^|        |'
-  fi
-  GHINT=$(jgmp "$SCAN_OUT" '.hint // empty')
-  [ -n "$GHINT" ] && printf '%s\n' "$GHINT" | fold -s -w 64 | sed 's|^|      |'
-  RUN_NVT=0
-else
-  NVT_STATUS=$(jgmp "$SCAN_OUT" '.status // ""')
-  case "$NVT_STATUS" in
-    Done) info "NVT scan complete" ;;
-    "")   warn "NVT scan finished with no status reported" ;;
-    *)    warn "NVT scan $NVT_STATUS, exporting what it produced" ;;
-  esac
-fi
-# Written whatever happened. A scan that died after creating the task still
-# leaves the ids behind, which is what you need to find it in gvmd afterwards.
-echo "task=$TASK target=$TARGET report=$REPORT" > "$RAW/nvt/ids.txt"
-
-if [ -s "$NVT_CSV" ]; then
-  NVT_ROWS=$(( $(wc -l < "$NVT_CSV") - 1 ))
-  NVT_HIGH=$(awk -F'","' 'NR>1 && tolower($6) ~ /high/'   "$NVT_CSV" 2>/dev/null | wc -l)
-  NVT_MED=$(awk  -F'","' 'NR>1 && tolower($6) ~ /medium/' "$NVT_CSV" 2>/dev/null | wc -l)
-  NVT_LOW=$(awk  -F'","' 'NR>1 && tolower($6) ~ /low/'    "$NVT_CSV" 2>/dev/null | wc -l)
-  NVT_LOG=$(awk  -F'","' 'NR>1 && tolower($6) ~ /log/'    "$NVT_CSV" 2>/dev/null | wc -l)
-  grep -oE 'CVE-[0-9]{4}-[0-9]+' "$NVT_CSV" 2>/dev/null | sort -u > "$RAW/cve-nvt.txt" || true
-  NVT_CVES=$(cnt "$RAW/cve-nvt.txt")
-  awk -F'","' 'NR>1{gsub(/^"/,"",$1); print $1}' "$NVT_CSV" 2>/dev/null | sort -uV > "$RAW/nvt/hosts-found.txt"
-  NVT_HOSTS_F=$(cnt "$RAW/nvt/hosts-found.txt")
-  grep -i 'Authenticated \(registry\|package\)-based' "$NVT_CSV" 2>/dev/null \
-    | awk -F'","' '{gsub(/^"/,"",$1); print $1}' | sort -uV > "$RAW/nvt/authenticated-hosts.txt" || : > "$RAW/nvt/authenticated-hosts.txt"
-  NVT_AUTH_HOSTS=$(cnt "$RAW/nvt/authenticated-hosts.txt")
-  if [ -s "$RAW/nvt/authenticated-hosts.txt" ]; then
-    grep -vxFf "$RAW/nvt/authenticated-hosts.txt" "$RAW/nvt/hosts-found.txt" > "$RAW/nvt/unauth-hosts.txt" 2>/dev/null || true
-  else cp "$RAW/nvt/hosts-found.txt" "$RAW/nvt/unauth-hosts.txt" 2>/dev/null || true; fi
-  NVT_UNAUTH=$(cnt "$RAW/nvt/unauth-hosts.txt")
-  info "findings  high $NVT_HIGH  medium $NVT_MED  low $NVT_LOW  log $NVT_LOG   cves $NVT_CVES"
-  info "authenticated checks on $NVT_AUTH_HOSTS of $NVT_HOSTS_F hosts with findings"
-else
-  err "CSV export failed, raw XML kept in $RAW/nvt/"
-fi
-fi
-fi
-
-# =====================================================================
-#  Stage 3B  Standalone engine
+#  Stage 3  Vulnerability scripts
 # =====================================================================
 NSE_HITS=0; SVC_CVES=0; SPLOIT=0; WIN_CVES=0; WIN_CRIT=0; SYSOK=0
 : > "$RAW/cve-service.txt"; : > "$RAW/cve-windows.txt"; : > "$RAW/nse-all.txt"
 
 if [ "$RUN_SA" -eq 1 ]; then
-step "Stage 3B  NSE vulnerability scripts and service CVE mapping"
+step "Stage 3  NSE vulnerability scripts and service CVE mapping"
 if is_done nse; then info "skipped (resume)"; else
   dim "targeting only discovered ports, $JOBS parallel workers"
   case "$SVC_CVE" in
@@ -2512,7 +1288,7 @@ info "hosts nmap finished $NSE_SCANNED of $HOSTS_OPEN"
 [ "$NSE_PARTIAL" -gt 0 ] && \
   warn "$NSE_PARTIAL host file(s) exist but carry no completion marker, so nmap died mid-scan"
 if [ "$NSE_SCANNED" -eq 0 ] && [ "$HOSTS_OPEN" -gt 0 ]; then
-  err "Stage 3B finished on no host at all. The zeros above are not a"
+  err "Stage 3 finished on no host at all. The zeros above are not a"
   dim "result: nothing was assessed. Do not report them as an absence of"
   dim "findings."
   [ "$NSE_PARTIAL" -gt 0 ] && \
@@ -2689,7 +1465,7 @@ WRITABLE=$(gcnti 'READ,WRITE' "$RAW/shares.txt")
 info "config failures $WCC_FAIL   writable shares $WRITABLE   gpp $GPP"
 
 # =====================================================================
-#  Stage 8  Patch level  (standalone engine only, NVT covers this itself)
+#  Stage 8  Patch level
 # =====================================================================
 if [ "$RUN_SA" -eq 1 ]; then
 step "Stage 8  Patch level collection and Windows CVE mapping"
@@ -2977,10 +1753,6 @@ fi
 while read -r ip _; do
   [ -z "$ip" ] && continue; s=0
   s=$((s + $(gcnt "^$ip," "$RAW/windows-cves.csv") * 2))
-  if [ -s "$NVT_CSV" ]; then
-    s=$((s + $(awk -F'","' -v I="$ip" 'NR>1{gsub(/^"/,"",$1); if($1==I && tolower($6)~/high/) c++} END{print c+0}' "$NVT_CSV") * 60))
-    s=$((s + $(awk -F'","' -v I="$ip" 'NR>1{gsub(/^"/,"",$1); if($1==I && tolower($6)~/medium/) c++} END{print c+0}' "$NVT_CSV") * 15))
-  fi
   grep -q "$ip" "$RAW/vuln-detail.txt" 2>/dev/null && s=$((s+300))
   grep -q "$ip.*signing:False" "$RAW/auth-smb.txt" 2>/dev/null && s=$((s+80))
   grep -q "$ip.*SMBv1:True"    "$RAW/auth-smb.txt" 2>/dev/null && s=$((s+120))
@@ -3011,18 +1783,14 @@ T1=$(date +%s); MINS=$(( (T1-T0)/60 ))
 # =====================================================================
 step "Self check"
 AUTH_FINDINGS=0; AUTH_DEPTH=0; DEPTH_VERDICT="unknown"
-if [ "$RUN_NVT" -eq 1 ] && [ -s "$NVT_CSV" ]; then
-  AUTH_FINDINGS=$(gcnti 'Authenticated \(registry\|package\)-based' "$NVT_CSV")
-  [ "$NVT_AUTH_HOSTS" -gt 0 ] && AUTH_DEPTH=$(( AUTH_FINDINGS * 100 / NVT_AUTH_HOSTS ))
-elif [ "$RUN_SA" -eq 1 ]; then
+if [ "$RUN_SA" -eq 1 ]; then
   AUTH_FINDINGS="$WIN_CVES"
   [ "$SYSOK" -gt 0 ] && AUTH_DEPTH=$(( AUTH_FINDINGS * 100 / SYSOK ))
 fi
 DEPTH_H=$(( AUTH_DEPTH / 100 ))
-APCT=0; SPCT=0; NVT_APCT=0
+APCT=0; SPCT=0
 [ "$LIVE" -gt 0 ] && { APCT=$(( AUTH_OK*100/LIVE )); SPCT=$(( SYSOK*100/LIVE )); }
-[ "$NVT_HOSTS_F" -gt 0 ] && NVT_APCT=$(( NVT_AUTH_HOSTS*100/NVT_HOSTS_F ))
-COVER_PCT=$([ "$RUN_NVT" -eq 1 ] && echo "$NVT_APCT" || echo "$SPCT")
+COVER_PCT="$SPCT"
 
 if [ "$AUTH_FINDINGS" -eq 0 ]; then
   DEPTH_VERDICT="none"
@@ -3150,7 +1918,7 @@ Rules:
 
   NAR_USR="Hosts in scope: $NTARGETS
 Hosts responding: $LIVE
-Hosts where credentials took effect: $([ "$RUN_NVT" -eq 1 ] && echo "$NVT_AUTH_HOSTS" || echo "$SYSOK")
+Hosts where credentials took effect: $SYSOK
 Authenticated coverage: ${COVER_PCT}%
 Authenticated findings per authenticated host: ${DEPTH_H}.$(printf '%02d' $((AUTH_DEPTH % 100)))
 Depth verdict: $DEPTH_VERDICT
@@ -3221,7 +1989,6 @@ echo "# Authenticated Vulnerability Assessment"
 echo
 echo "**Generated:** $STAMP  "
 echo "**Runtime:** ${MINS} minutes  "
-echo "**Engine:** \`$ENGINE\`$([ "$RUN_NVT" -eq 1 ] && echo "  (Greenbone $NVT_FILES NVTs, $CFG_NAME)")  "
 [ "$UNPRIV" -eq 1 ] && echo "**Scan privilege:** unprivileged. nmap used TCP connect probes, so live-host discovery undercounts and OS detection did not run.  "
 echo "**Profile:** \`$PROFILE\` ($PORTSPEC, $JOBS workers)  "
 echo "**Windows credentials:** $CREDLBL  "
@@ -3237,9 +2004,7 @@ echo "| --- | --- |"
 echo "| Hosts in scope | $NTARGETS |"
 echo "| Hosts responding | $LIVE |"
 echo "| SMB authenticated | $AUTH_OK (${APCT}% of live) |"
-[ "$RUN_NVT" -eq 1 ] && echo "| **NVT authenticated checks** | **$NVT_AUTH_HOSTS of $NVT_HOSTS_F hosts (${NVT_APCT}%)** |"
 [ "$RUN_SA" -eq 1 ]  && echo "| Patch level collected | $SYSOK (${SPCT}% of live) |"
-[ "$RUN_NVT" -eq 1 ] && echo "| NVT findings | high $NVT_HIGH, medium $NVT_MED, low $NVT_LOW |"
 echo "| Unique CVEs | $ALL_CVES |"
 echo "| **Actively exploited (CISA KEV)** | **$KEV_HITS** |"
 echo "| Confirmed exploitable services | $MOD_VULN |"
@@ -3293,7 +2058,6 @@ echo "---"; echo
 echo "## 2. Assessment Coverage"; echo
 echo "| Check | Method | Result |"
 echo "| --- | --- | --- |"
-[ "$RUN_NVT" -eq 1 ] && echo "| Full NVT scan | Greenbone $NVT_FILES scripts | $NVT_ROWS findings, $NVT_CVES CVEs |"
 [ "$RUN_SA" -eq 1 ]  && echo "| Windows patch level | WES-NG vs MSRC | $WIN_CVES CVEs, $WIN_CRIT critical |"
 [ "$RUN_SA" -eq 1 ]  && echo "| NSE vulnerability scripts | nmap \`$NSE_SET\` | $NSE_HITS vulnerable states |"
 [ "$RUN_SA" -eq 1 ]  && echo "| Service version CVEs | nmap $SVC_CVE | $SVC_CVES CVEs |"
@@ -3320,40 +2084,9 @@ echo
   echo "> list and does not fully model cumulative update supersedence. Fully patched"; \
   echo "> hosts can be reported as vulnerable. Validate against build and UBR."; echo; }
 
-if [ "$RUN_NVT" -eq 1 ] && [ -s "$NVT_CSV" ]; then
-echo "---"; echo
-echo "## 3. NVT Findings"; echo
-echo "### High severity"; echo
-echo '```'
-awk -F'","' 'NR>1 && tolower($6) ~ /high/ {gsub(/^"/,"",$1); printf "%-16s %-10s %-6s %s\n",$1,$3,$5,substr($9,1,78)}' "$NVT_CSV" 2>/dev/null | head -120
-echo '```'; echo
-echo "### Medium severity"; echo
-echo '```'
-awk -F'","' 'NR>1 && tolower($6) ~ /medium/ {gsub(/^"/,"",$1); printf "%-16s %-10s %-6s %s\n",$1,$3,$5,substr($9,1,78)}' "$NVT_CSV" 2>/dev/null | head -100
-echo '```'; echo
-echo "### Findings per host"; echo
-echo '```'
-awk -F'","' 'NR>1{gsub(/^"/,"",$1); if(tolower($6)~/high|medium/) print $1}' "$NVT_CSV" 2>/dev/null | sort | uniq -c | sort -rn | head -40
-echo '```'; echo
-echo "### Detection method breakdown"; echo
-echo "How each finding was actually determined. Authenticated checks are the ones that verify patch level."; echo
-echo '```'
-grep -oE 'Detection Reliability: [^"]*' "$NVT_CSV" 2>/dev/null | sort | uniq -c | sort -rn | head -12
-echo '```'; echo
-echo "### Hosts with authenticated checks"; echo
-echo '```'; [ -s "$RAW/nvt/authenticated-hosts.txt" ] && cat "$RAW/nvt/authenticated-hosts.txt" || echo "None. Credentials did not take effect."; echo '```'; echo
-echo "### Hosts assessed unauthenticated only"; echo
-echo "Patch level unverified on these."; echo
-echo '```'; [ -s "$RAW/nvt/unauth-hosts.txt" ] && head -80 "$RAW/nvt/unauth-hosts.txt" || echo "None"; echo '```'; echo
-echo "### Top NVTs by frequency"; echo
-echo '```'
-awk -F'","' 'NR>1 && tolower($6)~/high|medium/{print substr($9,1,70)}' "$NVT_CSV" 2>/dev/null | sort | uniq -c | sort -rn | head -40
-echo '```'; echo
-fi
-
 if [ "$RUN_SA" -eq 1 ]; then
 echo "---"; echo
-echo "## 3B. Windows Patch Level"; echo
+echo "## 3. Windows Patch Level"; echo
 echo "Two methods are reported separately because they have opposite error"
 echo "profiles and must not be read as one number."; echo
 echo "**MSRC build comparison** compares the OS build each host reports against"
@@ -3546,14 +2279,6 @@ for _f in "$HOME/.kameki-kev.json:CISA KEV catalogue" \
     printf "| %s | absent | - | - | - |\n" "$_n"
   fi
 done
-if [ "$RUN_NVT" -eq 1 ]; then
-  printf "| Greenbone NVT feed | %s scripts | - | - | - |\n" "$NVT_FILES"
-  echo
-  echo "> The Greenbone community feed's newest Windows cumulative-update check"
-  echo "> is dated 2025-10-15, so its Windows patch coverage is not current."
-  echo "> Windows patch level in this report rests on the MSRC build comparison"
-  echo "> above, not on the NVT feed."
-fi
 echo
 echo "---"; echo
 echo "## 11. Coverage Gaps"; echo
@@ -3620,9 +2345,6 @@ echo "| \`$RAW/cve-all.txt\` | Every unique CVE, all sources |"
 echo "| \`$RAW/cve-kev.txt\` | CVEs on the CISA exploited list |"
 echo "| \`$RAW/risk-scores.txt\` | Per host risk score |"
 echo "| \`$RAW/attack-paths.txt\` | Correlated attack paths |"
-[ "$RUN_NVT" -eq 1 ] && echo "| \`$NVT_CSV\` | Greenbone CSV, all findings |"
-[ "$RUN_NVT" -eq 1 ] && echo "| \`$RAW/nvt/report-full.xml\` | Greenbone XML, every field |"
-[ "$RUN_NVT" -eq 1 ] && echo "| \`$RAW/nvt/authenticated-hosts.txt\` | Hosts where credentials took effect |"
 [ "$RUN_SA" -eq 1 ]  && echo "| \`$RAW/windows-cves.csv\` | WES-NG Windows CVEs per host |"
 [ "$RUN_SA" -eq 1 ]  && echo "| \`$RAW/sysinfo/\` | Raw systeminfo per host |"
 [ "$RUN_SA" -eq 1 ]  && echo "| \`$RAW/nse/\` | NSE output per host |"
@@ -3650,8 +2372,7 @@ info "complete in ${MINS} minutes"
 echo "    report   $MD"
 echo "    evidence $RAW/"
 echo
-echo "    engine    $ENGINE"
-echo "    coverage  live $LIVE/$NTARGETS   smb-auth $AUTH_OK (${APCT}%)$([ "$RUN_NVT" -eq 1 ] && echo "   nvt-auth $NVT_AUTH_HOSTS/$NVT_HOSTS_F (${NVT_APCT}%)")$([ "$RUN_SA" -eq 1 ] && echo "   patch-data $SYSOK")"
-echo "    findings  cve $ALL_CVES   ${RED}kev $KEV_HITS${RST}   exploitable $MOD_VULN$([ "$RUN_NVT" -eq 1 ] && echo "   nvt high $NVT_HIGH med $NVT_MED")   web $((NC+NH+NM))   tls $TLS_ISSUES"
+echo "    coverage  live $LIVE/$NTARGETS   smb-auth $AUTH_OK (${APCT}%)$([ "$RUN_SA" -eq 1 ] && echo "   patch-data $SYSOK")"
+echo "    findings  cve $ALL_CVES   ${RED}kev $KEV_HITS${RST}   exploitable $MOD_VULN   web $((NC+NH+NM))   tls $TLS_ISSUES"
 echo "    ad        adcs $ADCS_H   kerberoast $KERB_H   asrep $ASREP_H   ldap-sign $LDAPSIGN"
 echo "    paths     $PATHS attack path(s)"

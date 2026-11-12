@@ -43,14 +43,16 @@ of its own report.
 
 ## What it does
 
-**Two detection engines, picked automatically.**
+**Four tools, no server.** `nmap` for reachability and vulnerability
+scripts, `nxc` (NetExec) for everything authenticated, `python3` for the
+Windows patch engine, `jq` for the JSON. Nothing to install as a service, no
+database, no multi-gigabyte feed, no daemon to keep running.
 
-| Engine | Detection | Used when |
-| --- | --- | --- |
-| `nvt` | Full Greenbone NVT feed, roughly 100,000 scripts, driven over the gvmd socket. No web UI required. | Greenbone backend is installed and the feed is synced |
-| `standalone` | WES-NG patch mapping against MSRC, nmap NSE vulnerability scripts, service version CVE mapping | Greenbone is unavailable |
+Windows patch level comes from Microsoft's own published data: per CVE, the
+exact OS build that fixes it, compared against the build the host reports.
+See [Windows patch level](#windows-patch-level).
 
-**On top of whichever engine runs, always:**
+**Always:**
 
 - Active Directory: ADCS (ESC1 to ESC8), Kerberoasting, AS-REP roasting,
   delegation, LDAP signing and channel binding, machine account quota,
@@ -88,20 +90,11 @@ sudo ./kameki.sh install
 
 That installs nmap, NetExec, nuclei and its templates, WES-NG with
 definitions, vulscan, testssl.sh, searchsploit, onesixtyone, the KEV
-catalogue, the Greenbone scanner backend, and `python-gvm`.
+catalogue and the Microsoft patch data. One command, no manual steps.
 
-`kameki_gmp.py` must stay next to `kameki.sh`; the clone puts it there and
-`bundle` carries it along. Without it the NVT engine is unavailable and
-runs fall back to the standalone engine.
-
-Greenbone needs two manual steps because `gvm-setup` prints a password you
-must save:
-
-```bash
-sudo gvm-setup                 # save the admin password it prints
-sudo greenbone-feed-sync       # about 5 GB, let it finish
-sudo systemctl enable --now ospd-openvas gvmd
-```
+`kameki_msrc.py` must stay next to `kameki.sh`; the clone puts it there and
+`bundle` carries it along. `./kameki.sh doctor` says so plainly when it is
+missing, and fetches it if it can.
 
 Verify:
 
@@ -109,7 +102,7 @@ Verify:
 ./kameki.sh doctor
 ```
 
-You want the NVT feed line showing 90,000 or more scripts.
+You want the `MSRC data` line showing a month range.
 
 ### Without internet
 
@@ -128,10 +121,10 @@ to open the bundle to reach it. `install --bundle` still accepts the older
 ./kameki.sh bundle
 ```
 
-Produces `kameki-bundle-<date>.tar.gz`, roughly 6 to 8 GB. It contains the
+Produces `kameki-bundle-<date>.tar.gz`, a few hundred MB. It contains the
 python wheels, system packages, the nuclei binary and templates, vulscan,
-testssl.sh, WES-NG definitions, the KEV catalogue, and the entire Greenbone
-NVT feed.
+testssl.sh, WES-NG definitions, the KEV catalogue and the compiled Microsoft
+patch table.
 
 On the target machine:
 
@@ -139,9 +132,10 @@ On the target machine:
 sudo ./kameki.sh install --bundle kameki-bundle-2026-09-23.tar.gz
 ```
 
-No network access required. This also pins the feed version for the
-engagement, which is better evidence practice than a feed that syncs
-differently on every run.
+No network access required. This also pins the data version for the
+engagement, which is better evidence practice than data that syncs
+differently on every run. Every source is listed in the report with its URL,
+release date, fetch time, size and SHA-256.
 
 ---
 
@@ -158,8 +152,6 @@ All in the working directory.
 | `pass.txt` | password(s), one per line | yes |
 | `ssh-user.txt` | Linux account | optional |
 | `ssh-pass.txt` | Linux password | optional |
-| `gmp-user.txt` | gvmd admin user | nvt engine only |
-| `gmp-pass.txt` | gvmd admin password | nvt engine only |
 
 ```bash
 cat > targets.txt << 'EOF'
@@ -170,10 +162,8 @@ EOF
 
 echo 'CORP\svc_scan'  > user.txt
 echo 'ThePassword'    > pass.txt
-echo 'admin'          > gmp-user.txt
-echo 'TheGvmdPass'    > gmp-pass.txt
 
-chmod 600 user.txt pass.txt gmp-user.txt gmp-pass.txt
+chmod 600 user.txt pass.txt
 ```
 
 ### Preflight, do not skip this
@@ -198,9 +188,10 @@ At most a handful of failed logins against one host, so no estate-wide
 lockout risk. It offers to write the working format back into `user.txt`.
 
 It also tests remote command execution separately, because that fails
-independently of login and is what patch level collection depends on. If
-execution is blocked by EDR, prefer `ENGINE=nvt`, which reads the registry
-directly instead of shelling out.
+independently of login and is what WES-NG depends on. Where EDR blocks it,
+the MSRC comparison still works: it reads the build and revision from one
+registry key over SMB rather than shelling out, so patch level survives a
+host that refuses command execution.
 
 ### Run
 
@@ -210,8 +201,7 @@ directly instead of shelling out.
 
 ```bash
 PROFILE=deep JOBS=24 ./kameki.sh run    # all 65535 ports, more workers
-ENGINE=nvt ./kameki.sh run              # force the Greenbone engine
-ENGINE=both ./kameki.sh run             # run both, compare coverage
+SVC_CVE_ENGINE=none ./kameki.sh run     # skip service-version CVE mapping
 RESUME=1 ./kameki.sh run                # continue after an interruption
 ```
 
@@ -266,17 +256,16 @@ Environment variables, all optional.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ENGINE` | `auto` | `auto`, `nvt`, `standalone`, `both` |
 | `PROFILE` | `standard` | `quick` (top 1000 ports), `standard` (top 5000), `deep` (all 65535) |
 | `JOBS` | `16` | parallel workers |
 | `NXC_THREADS` | `32` | NetExec internal threads |
 | `MIN_CVSS` | `4.0` | service CVE reporting floor |
 | `NMAP_RATE` | `2000` | minimum packet rate |
 | `HOST_TIMEOUT` | `20m` | per host nmap timeout |
-| `SCAN_CONFIG` | `fast` | Greenbone config: `fast`, `ultimate`, `deep`, `deepult` |
 | `DEPTH_WARN` | `3` | authenticated findings per host below which the self check warns |
 | `RESUME` | `0` | set to `1` to skip completed stages |
-| `POLL` | `60` | Greenbone progress poll interval, seconds |
+| `SVC_CVE_ENGINE` | `auto` | `auto`, `vulscan`, `vulners`, `none` |
+| `MSRC_MONTHS` | `6` | months of Microsoft patch data to compile |
 
 ---
 
@@ -354,7 +343,6 @@ kameki-raw-<date>/       evidence
 ├── auth-fail.txt        hosts with no authenticated assessment
 ├── no-response.txt      targets that never responded
 ├── windows-cves.csv     WES-NG findings per host
-├── nvt/                 Greenbone CSV and XML, authenticated host list
 ├── sysinfo/             raw systeminfo per host
 ├── nse/                 nmap NSE output per host
 ├── mods/                exploit module output
@@ -415,14 +403,15 @@ contract. Those are institutional properties, not technical ones, and no
 script provides them. If a regulated assessment is the end product, that is
 a decision for whoever owns the engagement, not for the tool.
 
-**The standalone engine needs remote command execution.** It collects
-`systeminfo` over SMB. Where EDR blocks that, use `ENGINE=nvt`, which reads
-the registry instead.
+**WES-NG needs remote command execution.** It parses the output of
+`systeminfo` collected over SMB. Where EDR blocks that, the MSRC comparison
+still runs — it needs only a registry read — so patch level is assessed
+either way, and the report says which method produced each finding.
 
-**Greenbone still has more per-product depth.** Its NVT feed covers
-thousands of specific enterprise products that the standalone engine does
-not. That is why KameKi drives Greenbone when it is available rather than
-reimplementing detection.
+**Per-product depth is narrower than a commercial feed.** KameKi assesses
+operating system patch level authoritatively and service exposure by
+version. It does not carry per-product detection for thousands of individual
+enterprise applications, and does not claim to.
 
 **Some checks are loud.** Remote command execution, exploit modules and
 Kerberoasting will light up any competent SOC. Confirm they are in scope and
@@ -452,7 +441,6 @@ least once:
 | `TLS_CAP` | 10m | each TLS endpoint |
 | `WEB_CAP` | 30m | the whole nuclei run |
 | `SNMP_CAP` | 10m | the onesixtyone sweep |
-| `NVT_MAX_MIN` | 0 (unlimited) | the Greenbone poll |
 | `HOST_TIMEOUT` | profile | each nmap host |
 
 `testssl.sh --sneaky` had no bound at all, and on a filtered network a TLS
@@ -484,45 +472,6 @@ stage over unusable output, the run says so and prints the command to clear it.
 out to its API and has crashed nmap on a whole estate), `vulscan`, `vulners`,
 or `none`. Neither is load-bearing for patch level — that comes from the MSRC
 build comparison — so reliability decides the default.
-
-## The Greenbone feed, over HTTPS
-
-The community feed is published as container images with the data baked in,
-anonymous-pullable over port 443 and rebuilt daily. `setup-greenbone` uses that
-by default and keeps rsync only as a fallback, because rsync to port 873 is the
-transport that actually fails at client sites — it connects, transfers, and a
-filtering device kills it mid-stream:
-
-```
-rsync: [Receiver] safe_read failed to read 1 bytes: Connection timed out (110)
-```
-
-Registry blobs answer Range requests with `206`, so a killed transfer resumes
-where it stopped and every blob is verified against the digest the registry
-itself published. A blob that fails verification is deleted rather than kept: a
-truncated feed file is worse than no feed, because gvmd will load it and report
-whatever it happens to contain.
-
-| set | size |
-|---|---|
-| vulnerability-tests | 224 MiB |
-| notus-data | 42 MiB |
-| data-objects, report-formats, cert data | ~5 MiB |
-| **default total** | **~270 MiB, resumable** |
-| scap-data, *not fetched by default* | 1,516 MiB |
-
-SCAP is skipped because gvmd runs without it — it logs `No SCAP database found`
-and continues, and CVE references come from each test's own `script_cve_id`.
-Add it with `GB_WITH_SCAP=1`. `FEED_TRANSPORT` is `auto` (HTTPS, then rsync),
-`https` (never rsync) or `rsync` (the old behaviour).
-
-**This does not make Greenbone a Windows engine.** Its newest Windows
-cumulative-update test is dated 2025-10-15 and Server 2022 has two tests in
-total, against 992 for Server 2008. Windows patch level comes from the MSRC
-comparison below. What the HTTPS transport rescues is the part of Greenbone
-that is genuinely current: Debian, Ubuntu, SUSE and Fedora-family Linux via
-Notus, which is backport-aware and rebuilt daily. RHEL, Rocky, Alma, Oracle and
-Amazon have **no** Notus coverage in the community feed at all.
 
 ---
 
@@ -592,22 +541,17 @@ so the evidence is printed rather than asserted.
 ./tests/run-all.sh
 ```
 
-Thirteen suites, no Greenbone, no root and no network. Each one slices the real
-functions out of `kameki.sh` with `sed` and drives them against stubs, so what
-is tested is what ships rather than a copy that drifts.
+Six suites, no root and no network. Each one slices the real functions out of
+`kameki.sh` with `sed` and drives them against stubs, so what is tested is
+what ships rather than a copy that drifts.
 
 | Suite | Covers |
 |---|---|
 | `tests/nse-failure.sh` | that a crashed scan is reported as a coverage gap, never as zero findings: nmap segfaulting on every host, crashing only with the service-CVE script, and exiting 0 while writing nothing |
-| `tests/stage3a.sh` | the NVT stage: every way it can abandon, and that the scan credential travels by path, never in `argv`, and is deleted afterwards |
-| `tests/gmp-client.py` | `kameki_gmp.py` against a stubbed gvmd: the one-line XML, the `<owner><name>` trap, overlapping config names, the report blob's real position |
-| `tests/gmp-live.py` | the same client against a fake gvmd on a real Unix socket, using the real `python-gvm`, so a library change is noticed |
 | `tests/msrc.py` | the Windows patch engine, against the real shapes from Microsoft's own 2026-Jul..Oct documents: the 26100 client/server collision, chronological month ordering, the empty current month, floor counts, and what it refuses to assess |
 | `tests/win-facts.sh` | the registry read, against a stubbed NetExec: hexadecimal `REG_DWORD` revisions, the transport ladder when EDR blocks command execution, and a partial read that must be refused rather than completed with a placeholder |
 | `tests/protocol-targets.sh` | per-protocol target lists and the Stage 4 wall-clock cap |
-| `tests/greenbone-db.sh` | the PostgreSQL role, database and extensions |
-| `tests/greenbone-feed.sh` | feed selection, the systemd restart loop, and the start timeout |
-| `tests/greenbone-oci.sh` | the HTTPS feed transport against a stubbed registry: the busybox base layer that must contribute nothing, release directories that differ per repository, resume after a killed transfer, and a valid tarball with the wrong digest |
+| `tests/bundle-archive.sh` | that the offline bundle opens with tools every box already has, and still accepts the older zstd bundles |
 
 Each suite was checked by reintroducing the bug it exists to catch and
 confirming it fails. A test that cannot fail is not a test.
@@ -618,14 +562,18 @@ confirming it fails. A test that cannot fail is not a test.
 
 Linux. Tested on Ubuntu and Debian.
 
-Core: `nmap`, `nxc` (NetExec), `nuclei`, `jq`, `awk`, `wes` (WES-NG), and
-either `vulscan` or `vulners` for service CVE mapping.
+Core: `nmap`, `nxc` (NetExec), `python3`, `jq`, `awk`.
 
-Optional but recommended: `testssl.sh`, `searchsploit`, `onesixtyone`.
+Also used: `nuclei` (web), `wes` (WES-NG, Windows patch inference),
+`vulscan` or `vulners` (service-version CVE mapping), `curl`.
 
-For the NVT engine: a synced Greenbone backend, plus the `python-gvm`
-library and `kameki_gmp.py` from this repository. The helper has to sit
-beside `kameki.sh` — `./kameki.sh doctor` says so plainly when it does not.
+Optional: `testssl.sh`, `searchsploit`, `onesixtyone`.
+
+`kameki_msrc.py` from this repository has to sit beside `kameki.sh`. It is
+stdlib-only — no third-party library, which is the point: on a client box
+behind a filtering proxy, `pip install` is exactly what does not work.
+
+No server, no daemon, no database, no feed sync.
 
 `./kameki.sh install` handles all of it.
 

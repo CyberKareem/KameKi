@@ -2,8 +2,8 @@
 #
 #  Bundle archive regression test
 #
-#  Slices the real tar_in / tar_out out of kameki.sh and drives them with and
-#  without zstd on PATH. Needs no root and no network.
+#  Slices the real tar_in out of kameki.sh and drives it with and without
+#  zstd on PATH. Needs no root and no network.
 #
 #    ./tests/bundle-archive.sh
 #
@@ -48,10 +48,8 @@ dim(){ printf '      %s\n' "$*"; }
 P
   sed -n '/^have(){/p'        "$SRC"
   sed -n '/^tar_in(){/,/^}$/p'  "$SRC"
-  sed -n '/^tar_out(){/,/^}$/p' "$SRC"
 } > "$HELPERS"
 grep -q 'tar_in' "$HELPERS"  || { echo "cannot find tar_in in $SRC" >&2;  exit 2; }
-grep -q 'tar_out' "$HELPERS" || { echo "cannot find tar_out in $SRC" >&2; exit 2; }
 
 HAVE_ZSTD=no; command -v zstd >/dev/null 2>&1 && HAVE_ZSTD=yes
 TARKIND=bsd; tar --version 2>/dev/null | head -1 | grep -qi 'gnu tar' && TARKIND=gnu
@@ -112,29 +110,29 @@ check "gzip bundle extracts with no zstd present" "$rc" "0"
 check "and the payload is really there" \
       "$(cat "$W/dest/payload/plugins.txt" 2>/dev/null)" "the feed"
 
-# --- tar_out picks a format and reports which ------------------------------
+# --- the bundle must name a format every box can open ----------------------
+# There are no inner feed tarballs any more, so there is no format choice to
+# make and no tar_out: cmd_bundle writes the one outer archive directly. If
+# that line ever goes back to zstd, the escape hatch shuts again.
 echo
-echo "tar_out picks the best format available and says which"
-got=$(cd "$W" && bash -c "source '$HELPERS'; tar_out inner -C payload ." 2>&1); rc=$?
-check "tar_out succeeds" "$rc" "0"
-if [ "$HAVE_ZSTD" = yes ]; then
-  check "names a zstd archive when zstd is present" "${got##*/}" "inner.tar.zst"
-else
-  check "names a gzip archive when zstd is absent" "${got##*/}" "inner.tar.gz"
-fi
-check "and the file it named exists" "$([ -f "$W/$(basename "$got")" ] && echo yes || echo no)" "yes"
+echo "the bundle writes gzip, unconditionally"
+BOUT=$(grep -n 'kameki-bundle-' "$SRC" | grep 'OUT=' | head -1)
+case "$BOUT" in
+  *'.tar.gz'*) check "cmd_bundle names a .tar.gz" yes yes ;;
+  *)           check "cmd_bundle names a .tar.gz" "$BOUT" "a .tar.gz name" ;;
+esac
+case "$(grep -c 'tar -czf "$OUT" -C "$B" \.' "$SRC")" in
+  1) check "and writes it with a plain tar -czf" yes yes ;;
+  *) check "and writes it with a plain tar -czf" no yes ;;
+esac
 
-got=$(cd "$W" && PATH="$W/plain:/usr/bin:/bin" bash -c \
-      "source '$HELPERS'; tar_out fallback -C payload ." 2>&1)
-check "falls back to gzip when zstd is not on PATH" "${got##*/}" "fallback.tar.gz"
-
-# --- round trip, both ways -------------------------------------------------
+# --- round trip through the command cmd_bundle actually runs ---------------
 echo
 echo "round trip"
 mkdir -p "$W/rt"
-a=$(cd "$W" && bash -c "source '$HELPERS'; tar_out rt-arch -C payload ." 2>&1)
-( cd "$W" && bash -c "source '$HELPERS'; tar_in '$(basename "$a")' -C rt" ) >/dev/null 2>&1
-check "what tar_out wrote, tar_in reads back" \
+( cd "$W/payload" && tar -czf "$W/rt-arch.tar.gz" -C "$W/payload" . )
+( cd "$W" && bash -c "source '$HELPERS'; tar_in rt-arch.tar.gz -C rt" ) >/dev/null 2>&1
+check "what cmd_bundle writes, tar_in reads back" \
       "$(cat "$W/rt/plugins.txt" 2>/dev/null)" "the feed"
 
 echo

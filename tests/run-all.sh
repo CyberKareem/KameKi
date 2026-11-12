@@ -4,8 +4,7 @@
 #
 #    ./tests/run-all.sh
 #
-#  None of them need Greenbone, root, or a network. The Python suites are
-#  skipped with a message, not a failure, when python-gvm is absent.
+#  None of them need root or a network.
 #
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -39,22 +38,13 @@ run(){ # $1 label, $2... command
 echo "kameKi regression suites"
 echo "shell:  $(bash --version | head -1)"
 echo "python: $(python3 --version 2>&1)"
-python3 -c 'import gvm, sys; sys.stdout.write("python-gvm: " + gvm.__version__ + "\n")' \
-  2>/dev/null || echo "python-gvm: not installed (the live transport suite will skip)"
 
 run "bash syntax"               bash -n "$SRC"
-run "Stage 3A"                  bash tests/stage3a.sh
-run "Stage 3B failure report"   bash tests/nse-failure.sh
+run "Stage 3 failure report"    bash tests/nse-failure.sh
 run "bundle archive"            bash tests/bundle-archive.sh
-run "GMP helper fetch"          bash tests/gmp-helper-fetch.sh
 run "win_facts registry read"   bash tests/win-facts.sh
 run "MSRC patch engine"         python3 tests/msrc.py
 run "protocol targets"          bash tests/protocol-targets.sh
-run "greenbone database"        bash tests/greenbone-db.sh
-run "greenbone feed"            bash tests/greenbone-feed.sh
-run "greenbone OCI transport"   bash tests/greenbone-oci.sh
-run "GMP client (stubbed)"      python3 tests/gmp-client.py
-run "GMP client (live socket)"  python3 tests/gmp-live.py
 
 printf '\n════════════════════════════════════════════════════════\n'
 if [ "$FAIL" -eq 0 ]; then

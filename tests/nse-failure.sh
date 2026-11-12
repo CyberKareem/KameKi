@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-#  Stage 3B failure-reporting regression test
+#  Stage 3 failure-reporting regression test
 #
-#  Slices the real Stage 3B out of kameki.sh and drives it against a stubbed
+#  Slices the real Stage 3 out of kameki.sh and drives it against a stubbed
 #  nmap. No network, no root, no nmap needed.
 #
 #    ./tests/nse-failure.sh
@@ -41,7 +41,7 @@ build(){ # $1 scenario, $2 workdir
   local sc="$1" w="$2" s e
   s=$(grep -n '^if \[ "\$RUN_SA" -eq 1 \]; then' "$SRC" | head -1 | cut -d: -f1)
   e=$(grep -n '#  Stage 4  Authentication' "$SRC" | head -1 | cut -d: -f1)
-  [ -n "$s" ] && [ -n "$e" ] || { echo "cannot locate Stage 3B in $SRC" >&2; exit 2; }
+  [ -n "$s" ] && [ -n "$e" ] || { echo "cannot locate Stage 3 in $SRC" >&2; exit 2; }
   mkdir -p "$w/bin" "$w/raw/nse" "$w/raw/ports"
   {
     cat <<'P'
@@ -147,7 +147,7 @@ checknot(){ if saw "$2"; then FAIL=$((FAIL+1)); printf '  FAIL  %s  (appeared)\n
        tail -14 "$OUTFILE" | sed 's/^/        | /'
   else PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; fi; }
 
-echo "Stage 3B failure reporting, file under test: $SRC"
+echo "Stage 3 failure reporting, file under test: $SRC"
 
 echo
 echo "a scan that works"
